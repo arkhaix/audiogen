@@ -109,6 +109,5 @@ As of 2026-11-08:
 
 * Whether Breeze voice design becomes the cast engine for The Hundred Reigns. Today `cast_engine` defaults to `qwen`.
 * Whether to re-render chapters 1 to 6 of The Hundred Reigns with Breeze, so Louis and Lauriane sound the same as in the later chapters. That takes about 85 minutes on the laptop. AJ was asked on 2026-11-07 and hasn't answered.
-* When the code reaches its remote. `origin` is https://github.com/arkhaix/audiogen. On 2026-11-08 nothing was pushed yet, so `D:\fish` and the deployed copy in `/opt/serial-audio/src` on containers were the only copies.
 * How the library is backed up. `/opt/serial-audio/library` on containers' local disk has no backup, and silver has no backup job.
 * Chapters 11 and 12 of The Hundred Reigns are scripted but not rendered, and chapter 12 needs two voices cast first. AJ cancelled both on 2026-11-07 for lack of time. `docs/casting.md` has the planned briefs.
