@@ -1,0 +1,90 @@
+{
+  "type": "object",
+  "properties": {
+    "narration": {
+      "type": "object",
+      "properties": {
+        "point_of_view": {"type": "string", "enum": ["first_person", "third_person", "mixed"]},
+        "narrator_character_id": {
+          "type": "string",
+          "description": "For first-person narration, the id of the narrating character (an existing id or one from new_characters). Empty string for third-person narration."
+        }
+      },
+      "required": ["point_of_view", "narrator_character_id"],
+      "additionalProperties": false
+    },
+    "present": {
+      "type": "array",
+      "description": "Characters already in the bible who appear in this chapter. Do not list new characters here.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string"},
+          "speaks": {"type": "boolean"},
+          "spoken_lines": {"type": "integer", "description": "Approximate count of their spoken lines in this chapter."}
+        },
+        "required": ["id", "speaks", "spoken_lines"],
+        "additionalProperties": false
+      }
+    },
+    "new_characters": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string", "description": "Stable kebab-case slug, e.g. ned-land. Never reuse an existing id."},
+          "name": {"type": "string", "description": "Canonical name as the story most often uses it."},
+          "aliases": {"type": "array", "items": {"type": "string"}, "description": "Every other way the text refers to them: titles, nicknames, epithets, surname alone."},
+          "gender": {"type": "string", "enum": ["male", "female", "other", "unknown"]},
+          "age_group": {"type": "string", "enum": ["child", "teen", "young_adult", "adult", "middle_aged", "elderly", "unknown"]},
+          "role": {"type": "string", "description": "One sentence: who they are in the story."},
+          "description": {"type": "string", "description": "Two or three sentences on identity and manner, using only what the text has revealed so far."},
+          "voice_brief": {"type": "string", "description": "How the voice should sound, as a text-to-speech voice-design description: sex, apparent age, pitch, timbre, pace, accent or register, mannerisms. Quote the textual cues it rests on."},
+          "importance": {"type": "string", "enum": ["major", "recurring", "minor", "one_off"]},
+          "speaks": {"type": "boolean"},
+          "spoken_lines": {"type": "integer"},
+          "evidence": {"type": "string", "description": "A short quote from the chapter establishing the character."}
+        },
+        "required": ["id", "name", "aliases", "gender", "age_group", "role", "description", "voice_brief", "importance", "speaks", "spoken_lines", "evidence"],
+        "additionalProperties": false
+      }
+    },
+    "updates": {
+      "type": "array",
+      "description": "Changes to characters already in the bible: new aliases, newly revealed facts, a revised voice brief.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string"},
+          "new_aliases": {"type": "array", "items": {"type": "string"}},
+          "new_facts": {"type": "array", "items": {"type": "string"}, "description": "Facts this chapter reveals that matter for casting or attribution."},
+          "voice_brief_update": {"type": "string", "description": "A full replacement voice brief if this chapter changes how the voice should sound; otherwise empty string."},
+          "importance_update": {"type": "string", "enum": ["", "major", "recurring", "minor", "one_off"]},
+          "role_update": {"type": "string", "description": "A replacement one-sentence role if the bible's is now wrong or stale (e.g. an unnamed narrator who has been named); otherwise empty string."},
+          "description_update": {"type": "string", "description": "A replacement two-or-three-sentence description if the bible's is now wrong or stale; otherwise empty string."},
+          "gender_update": {"type": "string", "enum": ["", "male", "female", "other", "unknown"]},
+          "age_group_update": {"type": "string", "enum": ["", "child", "teen", "young_adult", "adult", "middle_aged", "elderly", "unknown"]}
+        },
+        "required": ["id", "new_aliases", "new_facts", "voice_brief_update", "importance_update", "role_update", "description_update", "gender_update", "age_group_update"],
+        "additionalProperties": false
+      }
+    },
+    "pronunciations": {
+      "type": "array",
+      "description": "Names or terms an English text-to-speech voice would likely mispronounce, with a plain-syllable respelling.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "term": {"type": "string"},
+          "respelling": {"type": "string", "description": "Plain syllables with the stressed syllable in capitals, e.g. ah-roh-NAKS."},
+          "note": {"type": "string"}
+        },
+        "required": ["term", "respelling", "note"],
+        "additionalProperties": false
+      }
+    },
+    "summary": {"type": "string", "description": "Two or three sentences on what happens in this chapter, for the chapter log."}
+  },
+  "required": ["narration", "present", "new_characters", "updates", "pronunciations", "summary"],
+  "additionalProperties": false
+}

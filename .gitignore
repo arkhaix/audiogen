@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+library/
+incoming/
+.env
+*.log
+.webapp/

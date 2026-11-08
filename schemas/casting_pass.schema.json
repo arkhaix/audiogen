@@ -1,0 +1,26 @@
+{
+  "type": "object",
+  "properties": {
+    "voices": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string", "description": "The character id exactly as given."},
+          "instruct": {
+            "type": "string",
+            "description": "One or two declarative sentences describing the voice for a voice-design text-to-speech model: sex, apparent age, pitch, timbre, pace, accent or register, habitual mood. No quotes, no hedging, no character names, no plot."
+          },
+          "sample_text": {
+            "type": "string",
+            "description": "Two plain sentences, 18 to 30 words in total, that this character could say in an ordinary moment: their register and mood, but no proper nouns, numbers, abbreviations, or plot. This becomes the reference clip the voice is cloned from."
+          }
+        },
+        "required": ["id", "instruct", "sample_text"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["voices"],
+  "additionalProperties": false
+}

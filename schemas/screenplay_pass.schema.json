@@ -1,0 +1,22 @@
+{
+  "type": "object",
+  "properties": {
+    "lines": {
+      "type": "array",
+      "description": "The whole chapter, in order, as spoken lines. Nothing omitted, nothing added.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "speaker": {"type": "string", "description": "\"narrator\" for narration, otherwise the character id from the bible that speaks the line."},
+          "text": {"type": "string", "description": "The words to be spoken, verbatim from the chapter apart from the speech normalizations in the instructions. No quotation marks around dialogue."},
+          "direction": {"type": "string", "description": "A short performance note for this line when the text calls for one (\"shouting, panicked\"), otherwise empty string."}
+        },
+        "required": ["speaker", "text", "direction"],
+        "additionalProperties": false
+      }
+    },
+    "notes": {"type": "string", "description": "Anything the renderer or a human reviewer should know: an attribution you were unsure of, a passage that is a letter or a list, a term you normalized."}
+  },
+  "required": ["lines", "notes"],
+  "additionalProperties": false
+}

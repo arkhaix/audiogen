@@ -1,0 +1,202 @@
+Upstream ggml commit 46fc5b3b, "metal: support left and circular padding in GGML_OP_PAD",
+rebased onto 36da5713, the ggml that Breeze-TTS-2.cpp v0.1.6 pins. Without it the Metal backend
+rejects the left padding in Breeze's vocoder, and breeze-server aborts at warm-up with
+"unsupported op 'PAD'". Only the ggml-metal-impl.h hunk needed rebasing, and the patch touches
+only the Metal backend. Apply it in third_party/ggml with git apply. docs/machines.md has the build.
+
+diff --git a/src/ggml-metal/ggml-metal-device.cpp b/src/ggml-metal/ggml-metal-device.cpp
+index 4036cc21..8f00d880 100644
+--- a/src/ggml-metal/ggml-metal-device.cpp
++++ b/src/ggml-metal/ggml-metal-device.cpp
+@@ -2088,21 +2088,21 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_pad(ggml_metal_l
+     char base[256];
+     char name[256];
+ 
+-    // note: this is slower
+-    //const bool is_c4 = op->src[0]->ne[0] % 4 == 0 && op->ne[0] % 4 == 0;
+-    const bool is_c4 = false;
++    const bool circular = ggml_get_op_params_i32(op, 8) != 0;
+ 
+-    snprintf(base, 256, "kernel_pad_%s%s", ggml_type_name(op->src[0]->type), is_c4 ? "_4" : "");
+-    snprintf(name, 256, "%s", base);
++    snprintf(base, 256, "kernel_pad_%s", ggml_type_name(op->src[0]->type));
++    snprintf(name, 256, "%s_circular=%d", base, circular);
+ 
+     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+-    if (res.pipeline) {
+-        return res;
+-    }
++    if (!res.pipeline) {
++        ggml_metal_cv_t cv = ggml_metal_cv_init();
+ 
+-    res = ggml_metal_library_compile_pipeline(lib, base, name, nullptr);
++        ggml_metal_cv_set_bool(cv, circular, FC_PAD + 0);
+ 
+-    res.c4 = is_c4;
++        res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
++
++        ggml_metal_cv_free(cv);
++    }
+ 
+     return res;
+ }
+diff --git a/src/ggml-metal/ggml-metal-device.m b/src/ggml-metal/ggml-metal-device.m
+index 19c57820..9f873f88 100644
+--- a/src/ggml-metal/ggml-metal-device.m
++++ b/src/ggml-metal/ggml-metal-device.m
+@@ -1573,13 +1573,6 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
+         case GGML_OP_POOL_2D:
+             return op->src[0]->type == GGML_TYPE_F32;
+         case GGML_OP_PAD:
+-            // TODO: add circular padding support for metal, see https://github.com/ggml-org/llama.cpp/pull/16985
+-            if (ggml_get_op_params_i32(op, 8) != 0) {
+-                return false;
+-            }
+-
+-            return (ggml_get_op_params_i32(op, 0) == 0) && (ggml_get_op_params_i32(op, 2) == 0) &&
+-                   (ggml_get_op_params_i32(op, 4) == 0) && (ggml_get_op_params_i32(op, 6) == 0);
+         case GGML_OP_PAD_REFLECT_1D:
+         case GGML_OP_TIMESTEP_EMBEDDING:
+             return op->src[0]->type == GGML_TYPE_F32;
+diff --git a/src/ggml-metal/ggml-metal-impl.h b/src/ggml-metal/ggml-metal-impl.h
+index f0b77997..ba8c6a1d 100644
+--- a/src/ggml-metal/ggml-metal-impl.h
++++ b/src/ggml-metal/ggml-metal-impl.h
+@@ -107,6 +107,7 @@
+ #define FC_SUM_ROWS                    1400
+ #define FC_UPSCALE                     1500
+ #define FC_GATED_DELTA_NET             1600
++#define FC_PAD                         2100
+ 
+ // op-specific constants
+ #define OP_FLASH_ATTN_EXT_NQPSG 8
+@@ -1078,6 +1079,10 @@ typedef struct {
+     uint64_t nb1;
+     uint64_t nb2;
+     uint64_t nb3;
++    int32_t  lp0;
++    int32_t  lp1;
++    int32_t  lp2;
++    int32_t  lp3;
+ } ggml_metal_kargs_pad;
+ 
+ typedef struct {
+diff --git a/src/ggml-metal/ggml-metal-ops.cpp b/src/ggml-metal/ggml-metal-ops.cpp
+index 1c3bb936..59eaa27f 100644
+--- a/src/ggml-metal/ggml-metal-ops.cpp
++++ b/src/ggml-metal/ggml-metal-ops.cpp
+@@ -4790,16 +4790,15 @@ int ggml_metal_op_pad(ggml_metal_op_t ctx, int idx) {
+         /*.nb0  =*/ nb0,
+         /*.nb1  =*/ nb1,
+         /*.nb2  =*/ nb2,
+-        /*.nb3  =*/ nb3
++        /*.nb3  =*/ nb3,
++        /*.lp0  =*/ ggml_get_op_params_i32(op, 0),
++        /*.lp1  =*/ ggml_get_op_params_i32(op, 2),
++        /*.lp2  =*/ ggml_get_op_params_i32(op, 4),
++        /*.lp3  =*/ ggml_get_op_params_i32(op, 6),
+     };
+ 
+     auto pipeline = ggml_metal_library_get_pipeline_pad(lib, op);
+ 
+-    if (pipeline.c4) {
+-        args.ne00 = ne00/4;
+-        args.ne0  = ne0/4;
+-    }
+-
+     const int nth_max = MIN(64, ggml_metal_pipeline_max_theads_per_threadgroup(pipeline));
+     const int nth = MIN(args.ne0, nth_max);
+     const int nk0 = (args.ne0 + 1024 - 1)/1024; // note: 1024 is hardcoded in the kernel!
+diff --git a/src/ggml-metal/kernels/misc.metal b/src/ggml-metal/kernels/misc.metal
+index 11104b4d..374c60fd 100644
+--- a/src/ggml-metal/kernels/misc.metal
++++ b/src/ggml-metal/kernels/misc.metal
+@@ -114,8 +114,14 @@ kernel void kernel_roll_f32(
+     }
+ }
+ 
+-template <typename T>
+-kernel void kernel_pad_impl(
++constant bool FC_pad_circular [[function_constant(FC_PAD + 0)]];
++
++// circular means on a torus, so the coordinates wrap around
++static inline int32_t wrap_around(int32_t coord, int32_t size) {
++    return (coord + size) % size;
++}
++
++kernel void kernel_pad_f32(
+     constant ggml_metal_kargs_pad & args,
+     device  const char * src0,
+     device        char * dst,
+@@ -127,12 +133,40 @@ kernel void kernel_pad_impl(
+     const int32_t k0 = tgpig.x/args.ne1;
+     const int32_t i1 = tgpig.x - k0*args.ne1;
+ 
+-    const int32_t i03 = i3;
+-    const int32_t i02 = i2;
+-    const int32_t i01 = i1;
++    const int32_t ne00 = args.ne00;
++    const int32_t ne01 = args.ne01;
++    const int32_t ne02 = args.ne02;
++    const int32_t ne03 = args.ne03;
++
++    int32_t i01 = i1 - args.lp1;
++    int32_t i02 = i2 - args.lp2;
++    int32_t i03 = i3 - args.lp3;
+ 
+-    device const T * src0_ptr = (device const T *) (src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01);
+-    device       T * dst_ptr  = (device       T *) (dst  +  i3*args.nb3  +  i2*args.nb2  +  i1*args.nb1);
++    if (FC_pad_circular) {
++        i01 = wrap_around(i01, ne01);
++        i02 = wrap_around(i02, ne02);
++        i03 = wrap_around(i03, ne03);
++    }
++
++    device float * dst_ptr = (device float *) (dst + i3*args.nb3 + i2*args.nb2 + i1*args.nb1);
++
++    // the row lies in the padded region, so no source row backs it
++    if (i01 < 0 || i01 >= ne01 ||
++        i02 < 0 || i02 >= ne02 ||
++        i03 < 0 || i03 >= ne03) {
++        for (int32_t l0 = 0; l0 < 1024; l0 += ntg.x) {
++            const int32_t i0 = k0*1024 + tpitg.x + l0;
++            if (i0 >= args.ne0) {
++                break;
++            }
++
++            dst_ptr[i0] = 0.0f;
++        }
++
++        return;
++    }
++
++    device const char * src0_row = src0 + i03*args.nb03 + i02*args.nb02 + i01*args.nb01;
+ 
+     for (int32_t l0 = 0; l0 < 1024; l0 += ntg.x) {
+         const int32_t i0 = k0*1024 + tpitg.x + l0;
+@@ -140,19 +174,16 @@ kernel void kernel_pad_impl(
+             break;
+         }
+ 
+-        if (i0 < args.ne00 && i1 < args.ne01 && i2 < args.ne02 && i3 < args.ne03) {
+-            dst_ptr[i0] = src0_ptr[i0];
+-        } else {
+-            dst_ptr[i0] = 0.0f;
++        int32_t i00 = i0 - args.lp0;
++
++        if (FC_pad_circular) {
++            i00 = wrap_around(i00, ne00);
+         }
++
++        dst_ptr[i0] = i00 >= 0 && i00 < ne00 ? *((device const float *) (src0_row + i00*args.nb00)) : 0.0f;
+     }
+ }
+ 
+-typedef decltype(kernel_pad_impl<float>) kernel_pad_t;
+-
+-template [[host_name("kernel_pad_f32")]]   kernel kernel_pad_t kernel_pad_impl<float>;
+-template [[host_name("kernel_pad_f32_4")]] kernel kernel_pad_t kernel_pad_impl<float4>;
+-
+ // TODO: this is slow - optimize
+ kernel void kernel_pad_reflect_1d_f32(
+     constant   ggml_metal_kargs_pad_reflect_1d & args,

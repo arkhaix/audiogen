@@ -1,0 +1,48 @@
+# The serial_audio web app on containers, as its own compose project in
+# /opt/serial-audio beside the house's /opt/docker-compose.yml:
+#   /opt/serial-audio/compose.yml   this file
+#   /opt/serial-audio/src/          the repo's code (serial_audio, prompts, schemas, deploy)
+#   /opt/serial-audio/library/      the library, the one the app and its jobs read and write
+#   /opt/serial-audio/state/        job records and logs
+#   /opt/serial-audio/incoming/     uploaded EPUBs and saved pages
+#   /opt/serial-audio/secrets/nomad-token   the dispatch token, mode 600
+# Start or rebuild: cd /opt/serial-audio && docker compose up -d --build
+name: serial-audio
+
+services:
+  web:
+    build:
+      context: ./src
+      dockerfile: deploy/docker/Dockerfile
+    image: serial-audio:local
+    container_name: serial-audio
+    # Host networking: the app reaches Nomad and the workers reach the app by
+    # tailnet name, the way a process on the VM does.
+    network_mode: host
+    init: true
+    user: "1001:1001"
+    restart: unless-stopped
+    labels:
+      wud.watch: "false"
+    environment:
+      TZ: America/New_York
+    volumes:
+      - ./library:/app/library
+      - ./state:/app/.webapp
+      - ./incoming:/app/incoming
+      - ./secrets/nomad-token:/run/secrets/nomad-token:ro
+    command:
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8765"
+      - --executor
+      - nomad
+      - --nomad-addr
+      - http://containers.goblin-truck.ts.net:4646
+      - --nomad-token-file
+      - /run/secrets/nomad-token
+      - --allow-host
+      - containers.goblin-truck.ts.net
+      - --allow-host
+      - audiogen.grayfam.us
