@@ -4,7 +4,7 @@ For every character whose importance qualifies for a dedicated voice and who has
   1. A casting pass (LLM) turns the bible record into a voice-design instruction and a sample line.
   2. A designer makes N candidate clips of the sample line from the instruction. Engine "qwen" runs Qwen3-TTS
      Voice Design in ComfyUI and encodes each clip as a Drama 3 voice. Engine "breeze" runs Breeze TTS 2's voice
-     design in breeze-server, with no ComfyUI, and makes no Drama 3 voice, since Breeze renders clone the clip.
+     design in breeze-server, with no ComfyUI, and makes no Drama 3 voice.
   3. A speech recognizer (asr.py) transcribes the candidates. The one whose transcript best matches the sample
      line is chosen, copied into the library, and recorded in the bible with status "auto", to approve or recast
      after listening.
@@ -141,6 +141,12 @@ def generate_candidates(client: ComfyClient, *, slug: str, cid: str, brief: dict
                         log=print) -> list[dict]:
     """Designs `count` candidates with Qwen3-TTS Voice Design and encodes each as a Drama 3 voice.
 
+    client: the ComfyUI that designs and encodes.
+    slug: the serial.
+    cid: the voice id.
+    brief: holds instruct and sample_text.
+    count, seed0: the candidates use seeds seed0, seed0 + 1, ...
+    log: receives one line per candidate.
     Returns one record per candidate, {seed, clip, voice_file}, unscored. Raises ComfyError when ComfyUI fails or a
     clip or voice file does not appear.
     """
@@ -179,16 +185,18 @@ def _free_name(folder: Path, stem: str, suffix: str) -> Path:
 
 
 def design_breeze(slug: str, plan: list[tuple[str, dict]], *, count: int, seed0: int, comfy_url: str,
-                  log=print) -> dict[str, list[dict]]:
+                  log=print) -> tuple[dict[str, list[dict]], ComfyError | None]:
     """Designs `count` candidates per voice with Breeze TTS 2 in breeze-server, from each brief's instruction.
 
     slug: the serial.
     plan: (voice id, brief) pairs, the brief holding instruct and sample_text.
     count, seed0: the candidates use seeds seed0, seed0 + 1, ...
     comfy_url: the ComfyUI that is asked to free the card first.
-    Returns voice id -> one record per candidate, {seed, clip}, unscored, with each clip a 16-bit WAV under
-    BREEZE_CAST_OUTPUT. The server is stopped before this returns. Raises ComfyError when breeze-server cannot start,
-    another one runs, or a design fails twice.
+    log: receives one line per candidate.
+    Returns (designed, failure). designed maps each voice whose candidates all succeeded to one record per
+    candidate, {seed, clip}, unscored, with each clip a 16-bit WAV under BREEZE_CAST_OUTPUT. failure is the error
+    that stopped the designs, or None, and no voice after it is designed. The server is stopped before this returns.
+    Raises ComfyError when breeze-server cannot start or another one runs.
     """
     from .breeze import CPP_FIELDS, CppServer, free_comfy, wait_comfy_idle
 
@@ -203,27 +211,35 @@ def design_breeze(slug: str, plan: list[tuple[str, dict]], *, count: int, seed0:
 
     # Design
     out: dict[str, list[dict]] = {}
+    failure = None
     try:
         for cid, brief in plan:
-            out[cid] = []
+            cands = []
             for i in range(count):
                 seed = seed0 + i
                 t0 = time.time()
                 fields = {"text": brief["sample_text"], "instruction": brief["instruct"], "seed": seed,
                           "cfg_scale": DESIGN_CFG, **CPP_FIELDS}
-                pcm = server.take(fields, None, i, log)
+                try:
+                    pcm = server.take(fields, None, f"{cid} seed {seed}", log)
+                except ComfyError as e:
+                    failure = ComfyError(f"designing {cid} seed {seed} failed: {e}")
+                    break
                 clip = _free_name(folder, f"{cid}_s{seed}", ".wav")
                 with wave.open(str(clip), "wb") as w:
                     w.setnchannels(1)
                     w.setsampwidth(2)
                     w.setframerate(server.sample_rate)
                     w.writeframes(pcm)
-                out[cid].append({"seed": seed, "clip": str(clip)})
+                cands.append({"seed": seed, "clip": str(clip)})
                 log(f"   {cid} seed {seed}: designed {len(pcm) / 2 / server.sample_rate:.1f} s of audio in "
                     f"{time.time() - t0:.0f} s  {clip.name}")
+            if failure:
+                break
+            out[cid] = cands
     finally:
         server.stop()
-    return out
+    return out, failure
 
 
 def score_candidates(cid: str, brief: dict, candidates: list[dict], *, asr: str, comfy_url: str, log=print) -> None:
@@ -315,7 +331,8 @@ def cast(slug: str, *, only: list[str] | None = None, candidates: int = 3, seed0
     """Design and file voices. `recast` replaces the voices of `only` (the old record is kept under `history`);
     `instruct` overrides the voice description for a single id; `redo_brief` asks the casting pass again.
     `engine` is the designer, "qwen" or "breeze", from plan_cast_engine. `asr` is the recognizer that scores the
-    candidates, "qwen3" or "parakeet", from asr.choose."""
+    candidates, "qwen3" or "parakeet", from asr.choose. Both, and ComfyUI for qwen, are checked before the casting
+    pass runs. When a Breeze design fails, the voices designed before it are filed and then the error is raised."""
     serial = lib.load_serial(slug)
     bible = lib.load_bible(slug)
     if recast:
@@ -334,6 +351,12 @@ def cast(slug: str, *, only: list[str] | None = None, candidates: int = 3, seed0
         log("nothing to cast")
         return []
     log(f"casting {len(ids)}: {', '.join(ids)}")
+    if not dry_run:
+        engine = plan_cast_engine(serial, engine)
+        asr = recognizer.choose(asr)
+        recognizer.check_ready(asr, comfy_url)
+        if engine == "qwen":
+            ComfyClient(comfy_url).system_stats()
     # briefs are cached so a ComfyUI failure or a re-run does not repeat the LLM call
     briefs_path = lib.serial_dir(slug) / "voices" / "_briefs.yaml"
     briefs = lib.load_yaml(briefs_path, {}) or {}
@@ -357,22 +380,21 @@ def cast(slug: str, *, only: list[str] | None = None, candidates: int = 3, seed0
         return [briefs[c] for c in ids if c in briefs]
 
     # Design
-    engine = plan_cast_engine(serial, engine)
-    asr = recognizer.choose(asr)
     log(f"   designing with {engine}, checking with {asr}")
-    recognizer.check_ready(asr, comfy_url)
     plan = []
     for cid in ids:
         if briefs.get(cid):
             plan.append((cid, briefs[cid]))
         else:
             log(f"   {cid}: casting pass returned no brief, skipped")
-    designed, client = {}, None
+    designed, failure, client = {}, None, None
     if engine == "breeze":
-        designed = design_breeze(slug, plan, count=candidates, seed0=seed0, comfy_url=comfy_url, log=log)
+        designed, failure = design_breeze(slug, plan, count=candidates, seed0=seed0, comfy_url=comfy_url, log=log)
+        if failure:
+            log(f"   {failure}; filing the {len(designed)} voice(s) designed before it")
+            plan = [(cid, brief) for cid, brief in plan if cid in designed]
     else:
         client = ComfyClient(comfy_url, output_dir=COMFY_OUTPUT)
-        client.system_stats()  # fail early if ComfyUI is down
 
     # Score and file
     records = []
@@ -412,4 +434,6 @@ def cast(slug: str, *, only: list[str] | None = None, candidates: int = 3, seed0
                 lib.save_serial(slug, serial)
         log(f"   {cid}: chose seed {cands[chosen]['seed']} (match {cands[chosen]['score']:.2f}) -> voices/{cid}.yaml")
         records.append(record)
+    if failure:
+        raise failure
     return records

@@ -177,11 +177,26 @@ class SchedulingTest(unittest.TestCase):
         self.assertIn("--dry-run", cast[0]["args"])
         self.assertIn("--redo-brief", cast[0]["args"])
         self.assertNotIn("--redo-brief", cast[1]["args"])
-        self.assertEqual(cast[1]["args"][-2:], ["--engine", "qwen"])
+        # A serial the app can't read gets no --engine, so the CLI picks it. A readable one gets it explicitly.
+        self.assertNotIn("--engine", cast[1]["args"])
+        from unittest import mock
+        with mock.patch("serial_audio.library.load_serial", return_value={}):
+            qwen = job_stages(job("cast", args=["cast", "demo"]))
+        self.assertEqual(qwen[1]["args"][-2:], ["--engine", "qwen"])
+        self.assertEqual(qwen[1]["class"], "comfyui")
         breeze = job_stages(job("cast", args=["cast", "demo", "--engine", "breeze"]))
         self.assertEqual([s["class"] for s in breeze], ["llm", "breeze"])
         self.assertEqual(breeze[1]["args"].count("--engine"), 1)
         self.assertEqual(len(job_stages(job("cast", args=["cast", "demo", "--dry-run"]))), 1)
+
+    def test_an_unknown_cast_engine_reaches_the_cli_before_the_casting_pass(self):
+        from unittest import mock
+        with mock.patch("serial_audio.library.load_serial", return_value={"cast_engine": "breze"}):
+            stages = job_stages(job("cast", args=["cast", "demo"]))
+        self.assertEqual(stages[0]["args"], ["cast", "demo", "--engine", "breze", "--dry-run"])
+        self.assertEqual(stages[1]["args"][-2:], ["--engine", "breze"])
+        with mock.patch("serial_audio.library.load_serial", return_value={"cast_engine": "breeze"}):
+            self.assertEqual(job_stages(job("cast", args=["cast", "demo"]))[1]["class"], "breeze")
 
     def test_worker_summary(self):
         n = worker_summary({"Name": "box", "Status": "ready", "SchedulingEligibility": "eligible",

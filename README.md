@@ -30,13 +30,13 @@ python -m serial_audio.cli chapters <slug>
 python -m serial_audio.cli character-pass <slug> <1|1-5|all> [--backend auto|subscription|api] [--model opus|sonnet|haiku] [--on-limit api|wait|fail]
 python -m serial_audio.cli bible <slug> [-v]
 python -m serial_audio.cli reset-bible <slug>            # throw the bible away to re-run the pass
-python -m serial_audio.cli cast <slug> [--characters a,b] [--candidates 3] [--dry-run]
+python -m serial_audio.cli cast <slug> [--characters a,b] [--candidates 3] [--dry-run] [--engine qwen|breeze] [--asr qwen3|parakeet]
 python -m serial_audio.cli voices <slug> [-v]            # cast voices and their candidates
 python -m serial_audio.cli pick-voice <slug> <id> [--seed N]   # after listening: re-file / approve
 python -m serial_audio.cli cast <slug> --characters <id> --recast [--seed N] [--instruct "..."] [--redo-brief] [--note "..."]
 python -m serial_audio.cli screenplay <slug> <chapters>  # text -> script.json
 python -m serial_audio.cli render <slug> <chapters> [--engine drama3|breeze] [--runner cpp|comfyui] [--decode-only]   # script -> audio
-python -m serial_audio.cli check-takes <slug> <chapters> [--redo]     # flag Breeze takes that do not say their line
+python -m serial_audio.cli check-takes <slug> <chapters> [--asr qwen3|parakeet] [--redo]   # flag Breeze takes that do not say their line
 ```
 
 ## Web app
@@ -93,7 +93,9 @@ its override removes the entry.
    filed under `voices/` (status `auto` until you listen and `pick-voice`). A third-person serial also
    gets a narrator, cast first as the voice `narrator` from the blurb, tags, and opening of chapter 1
    (set `narrator_brief` in `serial.yaml` to steer it). Recurring characters who have not spoken yet
-   are cast once they do.
+   are cast once they do. With `cast_engine: breeze` in `serial.yaml`, or `--engine breeze`, breeze-server
+   designs each candidate from the brief instead, and no Drama 3 voice is encoded, so the voice serves only Breeze
+   renders. The candidate check uses the same recognizer as the take check (step 5).
 4. `screenplay` turns the chapter into ordered lines with speakers and sparse directions, verbatim
    apart from speech normalizations; a coverage check guards against dropped text; status `scripted`.
 5. `render` maps speakers to Drama 3 slots (narrator = 0, unvoiced speakers read by the narrator),
@@ -109,13 +111,16 @@ its override removes the entry.
    line. The `cpp` runner refuses to start while any other breeze-server runs, and a take whose length
    does not fit its line is taken again with new seeds, up to twice. `breeze_takes.json` in the chapter folder lists the
    takes, so a rerun renders only new or changed lines and `--decode-only` joins the saved takes again.
-   After the join, `render` checks the new takes: Qwen3-ASR in ComfyUI transcribes each one, the words are aligned
+   After the join, `render` checks the new takes: a speech recognizer transcribes each one, the words are aligned
    with the script line, and a take with three or more inserted or dropped words is flagged, in `take_check.json`
    beside the script and as `render.check` in `chapter.yaml`. A take with a high word error rate but fewer slips is
-   suspect, usually a name the recognizer spelled its own way. With ComfyUI down the check is skipped and recorded
-   as such. `check-takes <slug> <chapters>` runs it on its own and reuses the saved transcript of an unchanged take.
+   suspect, usually a name the recognizer spelled its own way. When the recognizer can't run, the check is skipped and
+   recorded as such. `check-takes <slug> <chapters>` runs it on its own and reuses the saved transcript of an unchanged take.
    `--redo` transcribes everything again. A take the length guard kept out of range is listed beside the flagged ones.
-   `breeze_join.py` joins them under ComfyUI's Python, applies voice effects, and matches the loudness
+   The recognizer is Parakeet TDT 0.6B v2 through sherpa-onnx when its model folder exists
+   (`SERIAL_AUDIO_PARAKEET_MODEL`), and Qwen3-ASR in ComfyUI otherwise. `--asr` or `SERIAL_AUDIO_ASR` picks one.
+   `docs/machines.md` has the Parakeet install on the Mac.
+   `breeze_join.py` joins them under the audio Python, which is ComfyUI's embedded Python on the laptop, applies voice effects, and matches the loudness
    of the Drama 3 chapters.
 
 ComfyUI (portable, `D:\comfy`) must be running with the ComfyUI-Drama3 and ComfyUI-Qwen-TTS node

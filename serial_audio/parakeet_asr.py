@@ -21,7 +21,8 @@ MODEL_FILES = ("encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "to
 
 
 def emit(record: dict) -> None:
-    sys.stdout.write(json.dumps(record, ensure_ascii=False) + "\n")
+    # ASCII only: under -I a piped stdout on Windows is cp1252, and the parent reads UTF-8.
+    sys.stdout.write(json.dumps(record) + "\n")
     sys.stdout.flush()
 
 

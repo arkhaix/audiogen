@@ -161,8 +161,8 @@ def check_after_render(slug: str, number: int, *, comfy_url: str, log=print, asr
     """Runs check_takes for a chapter that just rendered. Never raises: a failure is logged and recorded as skipped."""
     try:
         return check_takes(slug, number, comfy_url=comfy_url, log=log, asr=asr)
-    except ComfyError as e:
-        summary = {"at": lib.now_iso(), "skipped": str(e)}
+    except Exception as e:
+        summary = {"at": lib.now_iso(), "skipped": str(e) if isinstance(e, ComfyError) else f"{type(e).__name__}: {e}"}
         meta, _ = lib.load_chapter(slug, number)
         if isinstance(meta.get("render"), dict):
             meta["render"]["check"] = summary

@@ -17,6 +17,7 @@ from typing import Iterator
 
 from . import machine
 from .comfy import ComfyClient, ComfyError, transcribe_graph
+from .parakeet_asr import MODEL_FILES
 
 ENGINES = ("qwen3", "parakeet")
 QWEN3_MODEL = "qwen3_asr_1.7b_bf16.safetensors"
@@ -24,6 +25,8 @@ PARAKEET_SCRIPT = Path(__file__).with_name("parakeet_asr.py")
 PARAKEET_THREADS = 4
 FILE_TIMEOUT = 300
 LOAD_TIMEOUT = 600
+IMPORT_TIMEOUT = 120
+EXIT_TIMEOUT = 30
 
 
 def choose(engine: str | None = None) -> str:
@@ -44,17 +47,32 @@ def model_name(engine: str) -> str:
 
 
 def check_ready(engine: str, comfy_url: str) -> None:
-    """Raises ComfyError when the recognizer cannot run on this machine: ComfyUI does not answer for qwen3, or the
-    Parakeet model folder or the audio Python is missing for parakeet."""
+    """Raises ComfyError when the recognizer cannot run on this machine.
+
+    engine: "qwen3" or "parakeet".
+    comfy_url: the ComfyUI that runs Qwen3-ASR.
+    For qwen3, ComfyUI must answer. For parakeet, the model files must exist and the audio Python must import
+    sherpa-onnx, soundfile and scipy.
+    """
     if engine == "qwen3":
         try:
             ComfyClient(comfy_url).system_stats()
         except Exception as e:
             raise ComfyError(f"Qwen3-ASR needs ComfyUI at {comfy_url}, which did not answer: {e}") from None
         return
-    for path in (machine.PARAKEET_MODEL, machine.AUDIO_PYTHON):
-        if not path.exists():
-            raise ComfyError(f"Parakeet needs {path}; see SERIAL_AUDIO_PARAKEET_MODEL and SERIAL_AUDIO_AUDIO_PYTHON")
+    folder = machine.PARAKEET_MODEL
+    missing = [str(folder / name) for name in MODEL_FILES if not (folder / name).is_file()]
+    if missing:
+        raise ComfyError(f"Parakeet needs {', '.join(missing)}; see SERIAL_AUDIO_PARAKEET_MODEL")
+    kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW} if machine.WINDOWS else {}
+    try:
+        done = subprocess.run([str(machine.AUDIO_PYTHON), "-I", "-c", "import sherpa_onnx, soundfile, scipy.signal"],
+                              capture_output=True, text=True, timeout=IMPORT_TIMEOUT, **kwargs)
+    except (OSError, subprocess.SubprocessError) as e:
+        raise ComfyError(f"Parakeet could not run {machine.AUDIO_PYTHON}: {e}") from None
+    if done.returncode != 0:
+        raise ComfyError(f"Parakeet needs sherpa-onnx, soundfile and scipy in {machine.AUDIO_PYTHON}: "
+                         f"{(done.stderr or done.stdout).strip()[-500:]}")
 
 
 def transcripts(files: list[Path], *, engine: str, comfy_url: str) -> Iterator[tuple[int, str]]:
@@ -111,10 +129,14 @@ def _parakeet(files: list[Path]) -> Iterator[tuple[int, str]]:
                 lines.put(raw)
             lines.put(None)
 
-        threading.Thread(target=read, name="parakeet-output", daemon=True).start()
+        reader = threading.Thread(target=read, name="parakeet-output", daemon=True)
+        reader.start()
         try:
-            proc.stdin.write(json.dumps(job).encode("utf-8"))
-            proc.stdin.close()
+            try:
+                proc.stdin.write(json.dumps(job).encode("utf-8"))
+                proc.stdin.close()
+            except OSError:
+                pass  # the child exited before reading its job, and the count check below reports its stderr
             expected, wait = 0, LOAD_TIMEOUT
             while True:
                 try:
@@ -127,6 +149,8 @@ def _parakeet(files: list[Path]) -> Iterator[tuple[int, str]]:
                     record = json.loads(raw.decode("utf-8"))
                 except ValueError:
                     continue
+                if not isinstance(record, dict):
+                    continue
                 if "done" in record:
                     break
                 if record.get("index") != expected:
@@ -135,7 +159,11 @@ def _parakeet(files: list[Path]) -> Iterator[tuple[int, str]]:
                     raise ComfyError(f"Parakeet could not transcribe {files[expected]}: {record['error']}")
                 yield expected, str(record.get("text") or "")
                 expected, wait = expected + 1, FILE_TIMEOUT
-            proc.wait(timeout=30)
+            try:
+                proc.wait(timeout=EXIT_TIMEOUT)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
             if expected < len(files):
                 err.seek(0)
                 tail = err.read().decode("utf-8", "replace").strip()[-1500:]
@@ -145,6 +173,12 @@ def _parakeet(files: list[Path]) -> Iterator[tuple[int, str]]:
             if proc.poll() is None:
                 proc.kill()
                 proc.wait()
+            reader.join(timeout=EXIT_TIMEOUT)
+            for pipe in (proc.stdin, proc.stdout):
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
 
 
 # Word comparison

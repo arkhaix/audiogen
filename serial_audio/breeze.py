@@ -385,12 +385,13 @@ class CppServer:
             raise ComfyError(f"breeze-server returned {len(pcm)} bytes, not 16-bit audio")
         return pcm
 
-    def take(self, fields: dict, wav: bytes | None, line: int, log) -> bytes:
-        """One take's PCM, as speech() returns it. A failure restarts the server and is retried once."""
+    def take(self, fields: dict, wav: bytes | None, label: str, log) -> bytes:
+        """One take's PCM, as speech() returns it. A failure is logged with label, restarts the server, and is
+        retried once."""
         try:
             return self.speech(fields, wav)
         except ComfyError as e:
-            log(f"   line {line} failed, restarting breeze-server and retrying once: {str(e)[:500]}")
+            log(f"   {label} failed, restarting breeze-server and retrying once: {str(e)[:500]}")
             self.stop()
             self.start()
             return self.speech(fields, wav)
@@ -456,8 +457,8 @@ def render_breeze(slug: str, number: int, *, seed: int = 1, comfy_url: str = "ht
     join_only: join the saved takes again without generating any.
     runner: "cpp" or "comfyui". None uses the chapter's last runner on a join-only run, else serial.yaml
         breeze_runner, else cpp.
-    Returns the chapter's render record. New takes are then checked against the script with Qwen3-ASR when ComfyUI
-    answers, and the result is stored under render.check. Raises ComfyError when the runner cannot start, a take
+    Returns the chapter's render record. New takes are then checked against the script with this machine's speech
+    recognizer (asr.choose), and the result, or why the check was skipped, is stored under render.check. Raises ComfyError when the runner cannot start, a take
     fails twice, or a join-only run finds a take missing.
     """
     # Setup
@@ -558,7 +559,7 @@ def render_breeze(slug: str, number: int, *, seed: int = 1, comfy_url: str = "ht
                     tries = []
                     for attempt in range(RETAKES + 1):
                         fields["seed"] = 1 + (vseed - 1 + attempt * RETAKE_SEED_STEP) % (2**31 - 2)
-                        pcm = server.take(fields, wavs[voice], i, log)
+                        pcm = server.take(fields, wavs[voice], f"line {i}", log)
                         secs = len(pcm) / 2 / server.sample_rate
                         tries.append((secs, fields["seed"], pcm))
                         if low <= secs <= high:

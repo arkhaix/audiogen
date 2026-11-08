@@ -175,16 +175,25 @@ def conflicts(a: dict, b: dict) -> bool:
     return chapters_a is None or chapters_b is None or bool(chapters_a & chapters_b)
 
 
-def _cast_engine(job: dict) -> str:
-    """The voice design engine a cast job uses: its --engine flag, else the serial's cast_engine, else qwen."""
+def _cast_engine(job: dict) -> str | None:
+    """The voice design engine a cast job asks for: its --engine flag, else the serial's cast_engine, else qwen.
+
+    An unknown cast_engine comes back as written, so the CLI refuses it before the casting pass. None when the
+    serial can't be read.
+    """
     args = list(job.get("args") or [])
     if "--engine" in args and args.index("--engine") + 1 < len(args):
         return args[args.index("--engine") + 1]
+    from ..casting import plan_cast_engine
+    from ..comfy import ComfyError
     try:
-        from ..casting import plan_cast_engine
-        return plan_cast_engine(lib.load_serial(job.get("slug") or ""))
+        serial = lib.load_serial(job.get("slug") or "")
     except Exception:
-        return "qwen"
+        return None
+    try:
+        return plan_cast_engine(serial)
+    except ComfyError:
+        return str(serial.get("cast_engine"))
 
 
 def job_stages(job: dict) -> list[dict] | None:
@@ -199,11 +208,10 @@ def job_stages(job: dict) -> list[dict] | None:
     if kind == "cast":
         if "--dry-run" in args:
             return [{"class": "llm", "args": args}]
-        voices = [a for a in args if a != "--redo-brief"]
         engine = _cast_engine(job)
-        if "--engine" not in voices:
-            voices += ["--engine", engine]
-        return [{"class": "llm", "args": args + ["--dry-run"], "label": "casting briefs"},
+        flag = [] if engine is None or "--engine" in args else ["--engine", engine]
+        voices = [a for a in args if a != "--redo-brief"] + flag
+        return [{"class": "llm", "args": args + flag + ["--dry-run"], "label": "casting briefs"},
                 {"class": "breeze" if engine == "breeze" else "comfyui", "args": voices, "label": "voices"}]
     if kind in COMFY_KINDS:
         return [{"class": "comfyui", "args": args}]

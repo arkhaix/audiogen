@@ -1,7 +1,4 @@
-"""Tests for the Breeze voice design path of casting, with a fake breeze-server and a fake recognizer.
-
-    python -m unittest tests.test_casting
-"""
+"""Tests for the Breeze voice design path of casting, with a fake breeze-server and a fake recognizer."""
 from __future__ import annotations
 
 import tempfile
@@ -22,6 +19,7 @@ class FakeServer:
     """breeze-server that returns a second of silence per request and records what it was sent."""
 
     instances: list["FakeServer"] = []
+    fail_text = None
 
     def __init__(self, log_path, log):
         self.sample_rate = 24000
@@ -38,9 +36,11 @@ class FakeServer:
     def stop(self):
         self.running = False
 
-    def take(self, fields, wav, line, log):
+    def take(self, fields, wav, label, log):
         assert self.running
         self.requests.append((dict(fields), wav))
+        if fields["text"] == FakeServer.fail_text:
+            raise ComfyError(f"breeze-server answered 500 for {label}")
         return b"\x00\x00" * self.sample_rate
 
 
@@ -67,12 +67,15 @@ class BreezeCastTest(unittest.TestCase):
             self.addCleanup(p.stop)
         self.addCleanup(self.tmp.cleanup)
         FakeServer.instances.clear()
+        FakeServer.fail_text = None
         lib.save_serial(SLUG, {"title": "Design Test", "narration": {"point_of_view": "third_person"},
                                "narrator_voice_id": "narrator"})
-        lib.save_bible(SLUG, {"characters": {"meredith": {
-            "name": "Meredith", "gender": "female", "age_group": "young adult", "importance": "major", "role": "x",
-            "description": "x", "voice_brief": "x", "facts": [], "voice_id": ""}}, "pronunciations": {}})
-        lib.save_yaml(lib.serial_dir(SLUG) / "voices" / "_briefs.yaml", {"meredith": BRIEF})
+        character = {"gender": "female", "age_group": "young adult", "importance": "major", "role": "x",
+                     "description": "x", "voice_brief": "x", "facts": [], "voice_id": ""}
+        lib.save_bible(SLUG, {"characters": {"meredith": {"name": "Meredith", **character},
+                                             "ann": {"name": "Ann", **character}}, "pronunciations": {}})
+        lib.save_yaml(lib.serial_dir(SLUG) / "voices" / "_briefs.yaml",
+                      {"meredith": BRIEF, "ann": {"id": "ann", "instruct": "A low alto.", "sample_text": "Ann speaks."}})
 
     def cast(self, good_seed: int, seed0: int = 1000, **kwargs):
         with mock.patch.object(asr, "transcripts", heard_for(good_seed)):
@@ -137,6 +140,21 @@ class BreezeCastTest(unittest.TestCase):
         self.assertTrue(again["candidates"][1]["clip"].endswith("meredith_s1001_2.wav"), again["candidates"][1])
         self.assertTrue(Path(first_clip).is_file())
         self.assertEqual([h["seed"] for h in again["history"]], [2002, 1001])
+
+    def test_a_failed_design_files_the_voices_before_it(self):
+        # Design: ann's design fails after meredith's three succeed, and the server still stops.
+        FakeServer.fail_text = "Ann speaks."
+        with mock.patch.object(asr, "transcripts", heard_for(1001)), self.assertRaises(ComfyError) as e:
+            casting.cast(SLUG, only=["meredith", "ann"], candidates=3, engine="breeze", asr="parakeet",
+                         log=lambda *_: None)
+        self.assertIn("designing ann seed 1000 failed", str(e.exception))
+        self.assertFalse(FakeServer.instances[0].running)
+
+        # File: meredith is filed before the error is raised, and ann stays uncast for a rerun.
+        chars = lib.load_bible(SLUG)["characters"]
+        self.assertEqual((chars["meredith"]["voice_id"], chars["ann"]["voice_id"]), ("meredith", ""))
+        self.assertTrue((lib.serial_dir(SLUG) / "voices" / "meredith.yaml").is_file())
+        self.assertFalse((lib.serial_dir(SLUG) / "voices" / "ann.yaml").exists())
 
     def test_old_qwen_history_files_as_qwen(self):
         # A batch with no engine key comes from before Breeze design, so pick-voice files it as a Qwen voice.
