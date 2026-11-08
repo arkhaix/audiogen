@@ -382,6 +382,23 @@ def cmd_say_as(args) -> int:
     return 0
 
 
+def cmd_voice_effect(args) -> int:
+    from .render import set_voice_effect
+    if bool(args.effect) == args.clear:
+        print("voice-effect: name an effect, or pass --clear", file=sys.stderr)
+        return 2
+    try:
+        spec = set_voice_effect(args.slug, args.voice, None if args.clear else args.effect, args.level)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"voice-effect: {e}", file=sys.stderr)
+        return 2
+    if spec is None:
+        print(f"{args.voice}: no effect")
+    else:
+        print(f"{args.voice}: {spec['effect']} effect" + (f" at voice level {spec['voice']}" if "voice" in spec else ""))
+    return 0
+
+
 def main(argv=None) -> int:
     for stream in (sys.stdout, sys.stderr):   # UTF-8 and line-buffered even when redirected to a log file
         if hasattr(stream, "reconfigure"):
@@ -447,7 +464,7 @@ def main(argv=None) -> int:
     p.add_argument("--note", help="why the voice is being replaced, recorded with the old one")
     p.add_argument("--engine", choices=["qwen", "breeze"],
                    help="qwen: Qwen3-TTS Voice Design and a Drama 3 voice, in ComfyUI. breeze: Breeze TTS 2 voice "
-                        "design in breeze-server, no Drama 3 voice. Default: serial.yaml cast_engine, else qwen")
+                        "design in breeze-server, no Drama 3 voice. Default: serial.yaml cast_engine, else breeze")
     p.add_argument("--asr", choices=["qwen3", "parakeet"],
                    help="the recognizer that scores the candidates. Default: SERIAL_AUDIO_ASR, else parakeet when "
                         "its model is installed, else qwen3")
@@ -515,6 +532,15 @@ def main(argv=None) -> int:
     p.add_argument("--note", help="replace the entry's note, or remove it with an empty value")
     p.add_argument("--clear", action="store_true", help="remove the override")
     p.set_defaults(fn=cmd_say_as)
+
+    p = sub.add_parser("voice-effect", help="set or remove the effect that later renders apply to one voice")
+    p.add_argument("slug")
+    p.add_argument("voice", help="the voice id")
+    p.add_argument("effect", nargs="?", help="the effect: whisper")
+    p.add_argument("--level", type=float,
+                   help="whisper: how much of the dry voice stays under the effect, 0 to 1 (default 0.35)")
+    p.add_argument("--clear", action="store_true", help="remove the voice's effect")
+    p.set_defaults(fn=cmd_voice_effect)
 
     args = ap.parse_args(argv)
     return args.fn(args)

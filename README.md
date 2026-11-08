@@ -34,6 +34,7 @@ python -m serial_audio.cli cast <slug> [--characters a,b] [--candidates 3] [--dr
 python -m serial_audio.cli voices <slug> [-v]            # cast voices and their candidates
 python -m serial_audio.cli pick-voice <slug> <id> [--seed N]   # after listening: re-file / approve
 python -m serial_audio.cli cast <slug> --characters <id> --recast [--seed N] [--instruct "..."] [--redo-brief] [--note "..."]
+python -m serial_audio.cli voice-effect <slug> <voice> whisper [--level 0.35] | --clear   # effect on one voice in later renders
 python -m serial_audio.cli screenplay <slug> <chapters>  # text -> script.json
 python -m serial_audio.cli render <slug> <chapters> [--engine drama3|breeze] [--runner cpp|comfyui] [--decode-only]   # script -> audio
 python -m serial_audio.cli check-takes <slug> <chapters> [--asr qwen3|parakeet] [--redo]   # flag Breeze takes that do not say their line
@@ -87,15 +88,16 @@ its override removes the entry.
    ads are dropped, blockquotes (LitRPG system text, letters) become `> ` blocks, and the author's
    notes go to `author_notes.md`.
 2. `character-pass` updates the bible with who appears, who is new, voice briefs; status `characters`.
-3. `cast` designs a voice for each uncast major/recurring character: a casting pass writes a
-   voice-design instruction and sample line, ComfyUI makes N candidates with Qwen3-TTS Voice Design,
-   each is transcribed with Qwen3-ASR and encoded as a Drama 3 voice; the best transcript match is
-   filed under `voices/` (status `auto` until you listen and `pick-voice`). A third-person serial also
+3. `cast` designs a voice for each uncast major/recurring character. A casting pass writes a
+   voice-design instruction and sample line, and breeze-server designs N candidates from it with Breeze TTS 2
+   voice design. Each is transcribed with the same recognizer as the take check (step 5), and the best
+   transcript match is filed under `voices/` (status `auto` until you listen and `pick-voice`). A Breeze
+   voice has no Drama 3 voice file, so it serves only Breeze renders. A third-person serial also
    gets a narrator, cast first as the voice `narrator` from the blurb, tags, and opening of chapter 1
    (set `narrator_brief` in `serial.yaml` to steer it). Recurring characters who have not spoken yet
-   are cast once they do. With `cast_engine: breeze` in `serial.yaml`, or `--engine breeze`, breeze-server
-   designs each candidate from the brief instead, and no Drama 3 voice is encoded, so the voice serves only Breeze
-   renders. The candidate check uses the same recognizer as the take check (step 5).
+   are cast once they do. With `cast_engine: qwen` in `serial.yaml`, or `--engine qwen`, ComfyUI makes the
+   candidates with Qwen3-TTS Voice Design instead and encodes each as a Drama 3 voice. On the cluster a
+   Breeze cast takes a node without ComfyUI first, because that node checks the candidates with Parakeet.
 4. `screenplay` turns the chapter into ordered lines with speakers and sparse directions, verbatim
    apart from speech normalizations; a coverage check guards against dropped text; status `scripted`.
 5. `render` maps speakers to Drama 3 slots (narrator = 0, unvoiced speakers read by the narrator),
@@ -121,7 +123,9 @@ its override removes the entry.
    (`SERIAL_AUDIO_PARAKEET_MODEL`), and Qwen3-ASR in ComfyUI otherwise. `--asr` or `SERIAL_AUDIO_ASR` picks one.
    `docs/machines.md` has the Parakeet install on the Mac.
    `breeze_join.py` joins them under the audio Python, which is ComfyUI's embedded Python on the laptop, applies voice effects, and matches the loudness
-   of the Drama 3 chapters.
+   of the Drama 3 chapters. Before the join, each take's clicks are filled in from the audio around them, and each
+   take fades in and out over 3 ms, because Breeze sometimes starts a take at full level on its first sample. The
+   chapter's `render.clicks_filled` counts the clicks filled in.
 
 ComfyUI (portable, `D:\comfy`) must be running with the ComfyUI-Drama3 and ComfyUI-Qwen-TTS node
 packs. Every ComfyUI step runs as its own prompt with `POST /free` in between: on an 8 GB card the

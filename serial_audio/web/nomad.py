@@ -36,7 +36,7 @@ CLASSES = ("breeze", "comfyui", "llm")
 GPU_CLASSES = {"breeze", "comfyui"}
 LLM_KINDS = {"character-pass", "screenplay"}
 COMFY_KINDS = {"pick-voice", "check-takes"}
-SERIAL_WIDE = {"character-pass", "cast", "reset-bible", "pick-voice", "fetch", "say-as"}
+SERIAL_WIDE = {"character-pass", "cast", "reset-bible", "pick-voice", "fetch", "say-as", "voice-effect"}
 LLM_SLOTS = 1
 NODE_POLL = 15.0
 JOB_POLL = 5.0
@@ -175,8 +175,18 @@ def conflicts(a: dict, b: dict) -> bool:
     return chapters_a is None or chapters_b is None or bool(chapters_a & chapters_b)
 
 
+def _int_flag(args: list, flag: str) -> int | None:
+    """The integer that follows `flag` in args, or None when there is none."""
+    if flag in args and args.index(flag) + 1 < len(args):
+        try:
+            return int(args[args.index(flag) + 1])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def _cast_engine(job: dict) -> str | None:
-    """The voice design engine a cast job asks for: its --engine flag, else the serial's cast_engine, else qwen.
+    """The voice design engine a cast job asks for: its --engine flag, else the serial's cast_engine, else breeze.
 
     An unknown cast_engine comes back as written, so the CLI refuses it before the casting pass. None when the
     serial can't be read.
@@ -199,8 +209,8 @@ def _cast_engine(job: dict) -> str | None:
 def job_stages(job: dict) -> list[dict] | None:
     """The Nomad dispatches a job runs as, in order, or None when it runs on the app's machine.
 
-    A cast writes its casting briefs on a Claude node first and then designs the voices on a ComfyUI node, which
-    finds the briefs cached and calls no LLM.
+    A cast writes its casting briefs on a Claude node first and then designs the voices on a GPU node, which finds
+    the briefs cached and calls no LLM. Only a Qwen cast needs a ComfyUI node.
     """
     kind, args = job["kind"], list(job["args"])
     if kind in LLM_KINDS:
@@ -212,7 +222,7 @@ def job_stages(job: dict) -> list[dict] | None:
         flag = [] if engine is None or "--engine" in args else ["--engine", engine]
         voices = [a for a in args if a != "--redo-brief"] + flag
         return [{"class": "llm", "args": args + flag + ["--dry-run"], "label": "casting briefs"},
-                {"class": "breeze" if engine == "breeze" else "comfyui", "args": voices, "label": "voices"}]
+                {"class": "comfyui" if engine == "qwen" else "breeze", "args": voices, "label": "voices"}]
     if kind in COMFY_KINDS:
         return [{"class": "comfyui", "args": args}]
     if kind == "render":
@@ -312,6 +322,7 @@ class NomadJobManager(JobManager):
         """The node that holds the takes or candidates a job works on, or None, and whether the job must run there.
 
         A join, a take check and picking a voice must run there. A render would rather, so it can reuse its takes.
+        A pick goes to the node that made the candidate it files, because a recast may have run on another node.
         """
         slug, kind, meta = job.get("slug"), job["kind"], job.get("meta") or {}
         if kind in ("render", "check-takes") and meta.get("chapters"):
@@ -324,11 +335,20 @@ class NomadJobManager(JobManager):
             return node, kind == "check-takes" or bool(meta.get("decode_only"))
         if kind == "pick-voice" and meta.get("characters"):
             cid = meta["characters"][0]
-            node = ((self.placement.get("voices") or {}).get(slug) or {}).get(cid)
+            rec = lib.load_yaml(lib.serial_dir(slug) / "voices" / f"{cid}.yaml", {}) or {}
+            cands = [c for b in [rec] + list(rec.get("history") or []) for c in (b.get("candidates") or [])
+                     if isinstance(c, dict)]
+            seed = _int_flag(list(job.get("args") or []), "--seed")
+            if seed is None:
+                chosen = rec.get("chosen")
+                filed = (rec.get("candidates") or [])[chosen:chosen + 1] if isinstance(chosen, int) else []
+            else:
+                filed = [c for c in cands if c.get("seed") == seed][:1]
+            node = self._node_for_paths([c.get("clip") or "" for c in filed])
             if not node:
-                rec = lib.load_yaml(lib.serial_dir(slug) / "voices" / f"{cid}.yaml", {}) or {}
-                node = self._node_for_paths([c.get("clip") or "" for b in [rec] + list(rec.get("history") or [])
-                                             for c in (b.get("candidates") or []) if isinstance(c, dict)][:5])
+                node = ((self.placement.get("voices") or {}).get(slug) or {}).get(cid)
+            if not node:
+                node = self._node_for_paths([c.get("clip") or "" for c in cands][:5])
             return node, True
         return None, False
 
@@ -617,7 +637,7 @@ class NomadJobManager(JobManager):
 
         A node runs one GPU job at a time. A job that needs a node's files gets that node, and may switch to the
         other GPU class when that node offers only that one. Otherwise the holder of the files, then an NVIDIA
-        node, comes first among the free ones.
+        node, comes first among the free ones, except that a Breeze cast takes a node without ComfyUI first.
         """
         busy = {j["nomad"].get("target") or j["nomad"].get("node") for j in running
                 if j.get("nomad") and self.lane(j) in GPU_CLASSES}
@@ -644,7 +664,10 @@ class NomadJobManager(JobManager):
         free = [w for w in ready if w["name"] not in busy]
         if not free:
             return None, None, f"waiting for a free {lane} node ({', '.join(w['name'] for w in ready)} busy)"
-        free.sort(key=lambda w: (w["name"] != holder, w.get("gpu") != "nvidia", w["name"]))
+        # the ComfyUI node has no Parakeet, so it checks cast candidates with Qwen3-ASR, which needs ComfyUI up
+        own_check = job["kind"] == "cast" and lane == "breeze"
+        free.sort(key=lambda w: (w["name"] != holder, own_check and "comfyui" in w["classes"],
+                                 w.get("gpu") != "nvidia", w["name"]))
         return free[0]["name"], lane, None
 
     # Dispatch

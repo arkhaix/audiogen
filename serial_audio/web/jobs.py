@@ -36,6 +36,7 @@ COMFY_URL = "http://127.0.0.1:8188"
 
 HEAVY = {"render", "cast", "check-takes", "character-pass", "screenplay"}
 BIBLE_WRITERS = {"character-pass", "cast"}
+SERIAL_WRITERS = {"voice-effect"}    # rewrites serial.yaml in place, so it waits for any job on that serial
 FINISHED = {"done", "failed", "cancelled", "stopped", "skipped", "lost"}
 SETTLE_SECONDS = 15
 TICK_SECONDS = 2.0
@@ -284,6 +285,26 @@ def build(kind: str, p: dict, comfy_url: str = COMFY_URL) -> dict:
         title = f"Read {term} as written" if clear else f"Read {term} as {say}"
         return {"args": args, "heavy": False, "gpu": False, "comfy": False, "title": title, "slug": slug,
                 "meta": {"term": term}}
+
+    if kind == "voice-effect":
+        from ..render import VOICE_EFFECTS
+        slug = _slug(p)
+        voice = str(p.get("voice") or "")
+        if not SLUG_RE.match(voice):
+            raise ValueError(f"bad voice id {voice!r}")
+        clear = bool(p.get("clear"))
+        effect = None if clear else _text(p, "effect", 40)
+        if not clear and effect not in VOICE_EFFECTS:
+            raise ValueError(f"voice-effect needs clear or an effect from {', '.join(sorted(VOICE_EFFECTS))}")
+        args = ["voice-effect", slug, voice] + (["--clear"] if clear else [effect])
+        level = p.get("level")
+        if level is not None and not clear:
+            if isinstance(level, bool) or not isinstance(level, (int, float)) or not 0 <= level <= 1:
+                raise ValueError("level must be a number from 0 to 1")
+            args += ["--level", str(level)]
+        title = f"No effect on {voice}" if clear else f"{effect.capitalize()} effect on {voice}"
+        return {"args": args, "heavy": False, "gpu": False, "comfy": False, "title": title, "slug": slug,
+                "meta": {"voice": voice}}
 
     if kind == "fetch":
         slug = _slug(p)
@@ -910,6 +931,10 @@ class JobManager:
             return f"waiting for {writer['title']}, which rewrites the bible"
         if any(e["kind"] in BIBLE_WRITERS for e in self.external):
             return "waiting for an outside job that rewrites the bible"
+        if job["kind"] in SERIAL_WRITERS:
+            same = next((j for j in running if j.get("slug") == job.get("slug")), None)
+            if same:
+                return f"waiting for {same['title']}, which reads serial.yaml"
         return None
 
     def _already_done(self, job: dict) -> str | None:

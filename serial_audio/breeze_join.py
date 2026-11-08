@@ -47,10 +47,11 @@ def join(job: dict) -> dict:
     """Writes job["output"] from the takes.
 
     job: the output path, the take length limit in seconds, and the takes in script order.
-    Returns {"takes", "treated_lines", "raw_seconds", "seconds", "sample_rate", "capped"}, where capped lists the
-    lines whose take reached the length limit.
+    Each take has its clicks filled in and fades in and out at its trimmed edges.
+    Returns {"takes", "treated_lines", "raw_seconds", "seconds", "sample_rate", "capped", "clicks"}, where capped
+    lists the lines whose take reached the length limit and clicks counts the clicks filled in.
     """
-    parts, sr, treated, capped = [], None, 0, []
+    parts, sr, treated, capped, clicks = [], None, 0, [], 0
     cap = float(job.get("cap_seconds") or 0)
     for take in job["takes"]:
         audio, rate = sf.read(take["file"], dtype="float32", always_2d=True)
@@ -60,20 +61,22 @@ def join(job: dict) -> dict:
             raise SystemExit(f"take for line {take['line']} is {rate} Hz, the others are {sr} Hz")
         if cap and len(audio) >= (cap - 0.5) * sr:
             capped.append(take["line"])
-        x = edges(audio.mean(1), sr)
+        x, fixed = fx.declick(audio.mean(1), sr)
+        clicks += fixed
+        x = edges(x, sr)
         spec = take.get("effect")
         if spec:
             wet = fx.whisper_effect(x, sr, np.random.default_rng(take["line"]), voice=float(spec.get("voice", 0.35)))
             x = wet * np.sqrt(np.mean(x ** 2)) / (np.sqrt(np.mean(wet[: len(x)] ** 2)) + 1e-9)
             treated += 1
-        parts += [x, np.zeros(round(fx.TAKE_GAP * sr), dtype=np.float32)]
+        parts += [fx.fade_edges(x, sr), np.zeros(round(fx.TAKE_GAP * sr), dtype=np.float32)]
     if not parts:
         raise SystemExit("no takes to join")
     raw = np.concatenate(parts[:-1])
     final = level(fx.trim_pauses(raw, sr), sr)
     fx.write_audio(job["output"], final, sr)
     return {"takes": len(job["takes"]), "treated_lines": treated, "raw_seconds": round(len(raw) / sr, 2),
-            "seconds": round(len(final) / sr, 2), "sample_rate": sr, "capped": capped}
+            "seconds": round(len(final) / sr, 2), "sample_rate": sr, "capped": capped, "clicks": clicks}
 
 
 if __name__ == "__main__":

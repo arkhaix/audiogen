@@ -771,7 +771,7 @@ async function openProcess(slug) {
     <p class="small muted">Chapters ${esc(rangeText(sel))}. The jobs run one at a time, in this order. If one fails, the rest of the batch is skipped.</p>
     ${stage("characters", "Character pass", needChars.length, `${plural(needChars.length, "chapter")} still need it. It updates the bible with who appears.`,
       `<label class="inline"><input type="checkbox" name="redo_characters"> redo chapters that have one</label>`)}
-    ${stage("cast", "Cast new voices", castLikely, "Designs a voice for each major or recurring character who has spoken and has none. Runs ComfyUI.",
+    ${stage("cast", "Cast new voices", castLikely, "Designs a voice for each major or recurring character who has spoken and has none. Runs on a GPU node.",
       `<label class="inline">candidates <input type="number" name="candidates" value="3" min="1" max="12"></label>
        <label class="inline">first seed <input type="number" name="cast_seed" value="${nextSeed}" min="0"></label>`)}
     ${stage("script", "Screenplay", needScript.length, `${plural(needScript.length, "chapter")} still need one.`,
@@ -1151,7 +1151,7 @@ function openRecast(slug, x, nextSeed) {
     submit: "Queue recast",
     onInput: (form) => {
       field(form, "instruct").disabled = checked(form, "redo_brief");
-      $("#dlg-note").textContent = `ComfyUI makes ${field(form, "candidates").value} candidates from seed ${field(form, "seed").value}.`;
+      $("#dlg-note").textContent = `Makes ${field(form, "candidates").value} candidates from seed ${field(form, "seed").value}.`;
     },
     onSubmit: async (form) => {
       const redo = checked(form, "redo_brief");
@@ -1172,7 +1172,7 @@ function openCast(slug, ids, v) {
   openDialog({
     title: ids.length ? `Cast ${plural(ids.length, "character")}` : "Cast everyone who needs a voice",
     body: `<p class="small">${who}</p>
-      <p class="small muted">A casting pass writes a voice description and a sample line, then ComfyUI designs the candidates, transcribes each and files the best match with status auto.</p>
+      <p class="small muted">A casting pass writes a voice description and a sample line. Breeze then designs the candidates, unless the serial names another engine, and each is transcribed and the best match filed with status auto.</p>
       ${one ? `<label class="field"><span>Voice description (leave empty to let the casting pass write it)</span><textarea name="instruct">${esc(one.brief?.instruct || "")}</textarea></label>` : ""}
       <div class="fields">
         <label class="field"><span>Candidates</span><input type="number" name="candidates" value="3" min="1" max="12"></label>

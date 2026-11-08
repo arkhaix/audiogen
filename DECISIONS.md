@@ -47,6 +47,13 @@ existing entries for a conflict before adding one, and rewrite an entry when AJ 
 
 ---
 
+### Breeze joins fill clicks and fade every take
+**Date:** 2026-11-08
+**Context:** AJ heard occasional loud clicks and pops in the Breeze chapters 7 to 10. They come from Breeze, not from the join. Some takes hold bursts under 1 ms long, about 20 to 50 a chapter, and a few takes start at full level on their first sample. They don't sit on Breeze's 80 ms frame boundaries. AJ heard the ten most prominent repairs and said "repaired samples sound fine".
+**Decision:** The join fills each click from an autoregressive model of the 20 ms on each side of it and fades every take in and out over 3 ms. A burst counts as a click only while it is that short, so consonants are left alone. A review found that the detector also takes some sharp word-final stop releases, which the fill softens. That stays until AJ hears a dull consonant.
+
+---
+
 ### The library of record lives on containers
 **Date:** 2026-11-07
 **Context:** AJ wanted one entry point usable from any tailnet machine, with jobs running on whichever node is set up for them. He approved moving the library on 2026-11-07 at 22:08.
@@ -78,7 +85,7 @@ existing entries for a conflict before adding one, and rewrite an entry when AJ 
 ### jsc-m1 renders Breeze, and the laptop is preferred
 **Date:** 2026-11-07
 **Context:** AJ asked for jsc-m1 to be usable as a worker. Its patched Metal breeze-server runs at about 0.4x realtime, against the laptop's 2x. The CPU backend and Vulkan through MoltenVK were slower, at 0.26x and 0.28x.
-**Decision:** jsc-m1 offers the `breeze` class. The app sends a GPU job to a free NVIDIA node first and to any free node second, one GPU job per node. A job that needs a node's saved files goes back to that node.
+**Decision:** jsc-m1 offers the `breeze` class. The app sends a GPU job to a free NVIDIA node first and to any free node second, one GPU job per node. A Breeze cast is the exception and takes a node without ComfyUI first, as the entry on the cast engine says. A job that needs a node's saved files goes back to that node, and a voice pick goes to the node that made the candidate it files.
 
 ---
 
@@ -86,6 +93,13 @@ existing entries for a conflict before adding one, and rewrite an entry when AJ 
 **Date:** 2026-11-07
 **Context:** jsc-m1 has no ComfyUI for Qwen3-ASR. AJ preferred Parakeet to whisper, and his meetings project had already chosen Parakeet TDT 0.6B v2 int8 through sherpa-onnx.
 **Decision:** The take check and the casting check use Parakeet when its model folder exists and Qwen3-ASR otherwise. `SERIAL_AUDIO_ASR` overrides the choice.
+
+---
+
+### Breeze voice design is the default cast engine
+**Date:** 2026-11-08
+**Context:** AJ heard a Breeze cast of the Keeper and Lauriane beside their Qwen voices and picked a Breeze candidate for both. He said "i think we should make breeze voices the default for new casting going forward". A Breeze cast needs no ComfyUI, and on jsc-m1 breeze-server designs the same clip again from the same brief and seed.
+**Decision:** `cast` uses Breeze voice design unless `serial.yaml` sets `cast_engine: qwen` or the cast passes `--engine qwen`. On the cluster a Breeze cast takes a node without ComfyUI first, because a ComfyUI node checks the candidates with Qwen3-ASR, which fails while ComfyUI is down. Voices cast before this keep their Qwen clips and Drama 3 voice files.
 
 ---
 
@@ -107,7 +121,6 @@ existing entries for a conflict before adding one, and rewrite an entry when AJ 
 
 As of 2026-11-08:
 
-* Whether Breeze voice design becomes the cast engine for The Hundred Reigns. Today `cast_engine` defaults to `qwen`.
-* Whether to re-render chapters 1 to 6 of The Hundred Reigns with Breeze, so Louis and Lauriane sound the same as in the later chapters. That takes about 85 minutes on the laptop. AJ was asked on 2026-11-07 and hasn't answered.
+* Whether to re-render the chapters of The Hundred Reigns that use old voices. Chapters 1 to 6 are Drama 3 renders, so Louis and Lauriane sound different there, and they take about 85 minutes on the laptop. AJ was asked about them on 2026-11-07 and hasn't answered. Chapter 11 has the Keeper's old Qwen voice and chapter 12 has Lauriane's, because both were rendered before the recasts on 2026-11-08.
 * How the library is backed up. `/opt/serial-audio/library` on containers' local disk has no backup, and silver has no backup job.
-* Chapters 11 and 12 of The Hundred Reigns are scripted but not rendered, and chapter 12 needs two voices cast first. AJ cancelled both on 2026-11-07 for lack of time. `docs/casting.md` has the planned briefs.
+* lorimor-ancitif and eole have no voices yet, so the narrator reads their lines in chapter 12, which was rendered on 2026-11-08. `docs/casting.md` has the planned briefs.

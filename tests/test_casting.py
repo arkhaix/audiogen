@@ -83,8 +83,9 @@ class BreezeCastTest(unittest.TestCase):
                                 log=lambda *_: None, **kwargs)
 
     def test_engine_choice(self):
-        # The flag wins, then serial.yaml cast_engine, then qwen. An unknown engine is refused.
-        self.assertEqual(casting.plan_cast_engine({}), "qwen")
+        # The flag wins, then serial.yaml cast_engine, then breeze. An unknown engine is refused.
+        self.assertEqual(casting.plan_cast_engine({}), "breeze")
+        self.assertEqual(casting.plan_cast_engine({"cast_engine": "qwen"}), "qwen")
         self.assertEqual(casting.plan_cast_engine({"cast_engine": "breeze"}), "breeze")
         self.assertEqual(casting.plan_cast_engine({"cast_engine": "breeze"}, "qwen"), "qwen")
         with self.assertRaises(ComfyError):

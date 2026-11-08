@@ -173,14 +173,19 @@ class SchedulingTest(unittest.TestCase):
         self.assertIsNone(job_stages(job("fetch")))
         self.assertIsNone(job_stages(job("reset-bible")))
         cast = job_stages(job("cast", args=["cast", "demo", "--redo-brief", "--candidates", "3"]))
-        self.assertEqual([s["class"] for s in cast], ["llm", "comfyui"])
+        self.assertEqual([s["class"] for s in cast], ["llm", "breeze"])
         self.assertIn("--dry-run", cast[0]["args"])
         self.assertIn("--redo-brief", cast[0]["args"])
         self.assertNotIn("--redo-brief", cast[1]["args"])
-        # A serial the app can't read gets no --engine, so the CLI picks it. A readable one gets it explicitly.
+        # A serial the app can't read gets no --engine, so the CLI picks its default, breeze, on a breeze node.
+        # A readable one gets the engine explicitly, breeze by default, and only a qwen cast takes a comfyui node.
         self.assertNotIn("--engine", cast[1]["args"])
         from unittest import mock
         with mock.patch("serial_audio.library.load_serial", return_value={}):
+            default = job_stages(job("cast", args=["cast", "demo"]))
+        self.assertEqual(default[1]["args"][-2:], ["--engine", "breeze"])
+        self.assertEqual(default[1]["class"], "breeze")
+        with mock.patch("serial_audio.library.load_serial", return_value={"cast_engine": "qwen"}):
             qwen = job_stages(job("cast", args=["cast", "demo"]))
         self.assertEqual(qwen[1]["args"][-2:], ["--engine", "qwen"])
         self.assertEqual(qwen[1]["class"], "comfyui")
@@ -244,6 +249,13 @@ class NodeChoiceTest(unittest.TestCase):
         self.assertIsNone(node)
         self.assertIn("free breeze node", why)
 
+    def test_a_breeze_cast_takes_a_node_without_comfyui_first(self):
+        cast = job("cast", args=["cast", "demo", "--engine", "breeze"])
+        self.assertEqual(self.m._pick_node(cast, "breeze", [])[:2], ("mac", "breeze"))
+        self.assertEqual(self.m._pick_node(cast, "breeze", [self.running_on("mac")])[:2], ("laptop", "breeze"))
+        self.assertEqual(self.m._pick_node(job("cast", args=["cast", "demo"]), "comfyui", [])[:2],
+                         ("laptop", "comfyui"))
+
     def test_a_job_that_needs_a_node_waits_for_it_and_may_switch_class(self):
         self.m.placement = {"chapters": {"demo": {"1": "mac"}}}
         check = job("check-takes", chapters=[1], args=["check-takes", "demo", "1"])
@@ -260,6 +272,25 @@ class NodeChoiceTest(unittest.TestCase):
         self.assertIsNone(self.m._node_for_paths(["/home/aj/a.wav"]))
         self.m.workers.append(worker("laptop2", ["breeze"], "windows"))
         self.assertIsNone(self.m._node_for_paths(["D:\\comfy\\out\\a.wav"]))
+
+    def test_a_voice_pick_runs_where_its_candidate_was_made(self):
+        from unittest import mock
+        rec = {"chosen": 0, "candidates": [{"seed": 13000, "clip": "/Users/aj/serial-audio/output/k_s13000.wav"}],
+               "history": [{"candidates": [{"seed": 5002, "clip": "D:\\comfy\\out\\k_00006.flac"}]}]}
+        self.m.placement = {"voices": {"demo": {"keeper": "mac"}}}
+
+        def pick(*extra):
+            return {"kind": "pick-voice", "slug": "demo", "meta": {"characters": ["keeper"]},
+                    "args": ["pick-voice", "demo", "keeper", *extra]}
+
+        with mock.patch("serial_audio.library.load_yaml", return_value=rec):
+            # A pick by seed goes to the node that wrote that candidate, even after a recast on another node.
+            self.assertEqual(self.m.holder(pick("--seed", "5002")), ("laptop", True))
+            self.assertEqual(self.m.holder(pick("--seed", "13000")), ("mac", True))
+            # An approval of the current voice goes to the node that wrote its chosen candidate.
+            self.assertEqual(self.m.holder(pick()), ("mac", True))
+            # A seed that no candidate has falls back to the node that last wrote the voice.
+            self.assertEqual(self.m.holder(pick("--seed", "9")), ("mac", True))
 
     def test_a_restart_during_a_dispatch_dispatches_again_with_the_same_token(self):
         from serial_audio.web.nomad import NomadClient, NomadJobManager
@@ -325,6 +356,67 @@ class KeyAndLockTest(unittest.TestCase):
             again = w.gpu_lock(Log(), threading.Event(), path)
             self.assertIsNotNone(again)
             again.close()
+
+
+class VoiceEffectTest(unittest.TestCase):
+    def setUp(self):
+        from unittest import mock
+        from serial_audio import library as lib
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.lib = lib
+        patch = mock.patch.object(lib, "LIBRARY", Path(self.tmp.name) / "library")
+        patch.start()
+        self.addCleanup(patch.stop)
+        folder = lib.serial_dir("demo")
+        (folder / "voices").mkdir(parents=True)
+        (folder / "voices" / "keeper.yaml").write_text("id: keeper\n", encoding="utf-8")
+        lib.save_serial("demo", {"title": "Demo", "voice_effects": {"keeper": {"effect": "whisper", "voice": 0.35}}})
+
+    def test_set_and_remove_an_effect(self):
+        from serial_audio.render import set_voice_effect
+
+        # Removing the last effect drops voice_effects, and removing it again leaves the file as it was.
+        self.assertIsNone(set_voice_effect("demo", "keeper", None))
+        self.assertNotIn("voice_effects", self.lib.load_serial("demo"))
+        self.assertIsNone(set_voice_effect("demo", "keeper", None))
+
+        # Setting one writes the spec, with the level only when given.
+        self.assertEqual(set_voice_effect("demo", "keeper", "whisper", 0.5), {"effect": "whisper", "voice": 0.5})
+        self.assertEqual(set_voice_effect("demo", "keeper", "whisper"), {"effect": "whisper"})
+        self.assertEqual(self.lib.load_serial("demo")["voice_effects"], {"keeper": {"effect": "whisper"}})
+
+        # An unknown effect, a level out of range, a voice with no cast record and a malformed id are refused.
+        for effect, level, voice in (("echo", None, "keeper"), ("whisper", 1.5, "keeper"), ("whisper", None, "kepper"),
+                                     ("whisper", None, "../voices/keeper")):
+            with self.assertRaises(ValueError):
+                set_voice_effect("demo", voice, effect, level)
+        self.assertEqual(self.lib.load_serial("demo")["voice_effects"], {"keeper": {"effect": "whisper"}})
+
+    def test_the_job_builds_cli_args_and_waits_for_the_serial(self):
+        from serial_audio.web.jobs import JobManager, build
+
+        # The job passes --clear, or the effect and its level, to the CLI as a quick job.
+        clear = build("voice-effect", {"slug": "demo", "voice": "keeper", "clear": True})
+        self.assertEqual(clear["args"], ["voice-effect", "demo", "keeper", "--clear"])
+        self.assertFalse(clear["heavy"])
+        whisper = build("voice-effect", {"slug": "demo", "voice": "keeper", "effect": "whisper", "level": 0.4})
+        self.assertEqual(whisper["args"], ["voice-effect", "demo", "keeper", "whisper", "--level", "0.4"])
+
+        # A flag in place of an effect, a missing effect, a malformed id and a level out of range are refused.
+        for bad in ({"voice": "keeper", "effect": "--clear"}, {"voice": "keeper"}, {"voice": "Bad Id", "clear": True},
+                    {"voice": "keeper", "effect": "whisper", "level": 2}):
+            with self.assertRaises(ValueError):
+                build("voice-effect", {"slug": "demo", **bad})
+
+        # On the cluster and on one machine, it waits for a running job on its serial and not for another serial's.
+        effect = {"kind": "voice-effect", "slug": "demo", "meta": {}, "heavy": False}
+        self.assertTrue(conflicts(effect, job("render", chapters=[3])))
+        m = JobManager(state_dir=Path(self.tmp.name) / "state", autostart=False)
+        self.addCleanup(m._lock_file.close)
+        render = {**job("render", chapters=[3]), "heavy": True, "title": "Render · ch 3"}
+        self.assertIn("Render · ch 3", m._blocker(effect, [render], [], False, 0.0))
+        self.assertIsNone(m._blocker(effect, [{**render, "slug": "other"}], [], False, 0.0))
 
 
 if __name__ == "__main__":

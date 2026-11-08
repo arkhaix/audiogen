@@ -42,9 +42,9 @@ def plan_cast_engine(serial: dict, engine: str | None = None) -> str:
 
     serial: the serial.yaml record.
     engine: "qwen" or "breeze" to force one.
-    Returns engine, else serial.yaml cast_engine, else qwen. Raises ComfyError when it is unknown.
+    Returns engine, else serial.yaml cast_engine, else breeze. Raises ComfyError when it is unknown.
     """
-    engine = engine or serial.get("cast_engine") or "qwen"
+    engine = engine or serial.get("cast_engine") or "breeze"
     if engine not in ENGINES:
         raise ComfyError(f"unknown cast engine {engine!r}; known: {', '.join(ENGINES)}")
     return engine

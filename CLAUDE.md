@@ -14,7 +14,7 @@ home Nomad cluster.
 * `docs/machines.md`: what each machine holds and how to rebuild it.
 * `docs/casting.md`: how to write a voice brief that works, the cast so far and the voices still to cast.
 * `deploy/macos/ggml-metal-left-pad.patch`: the ggml fix the Mac's Metal breeze-server needs.
-* `tests/`: the cluster tests. The pipeline itself has none.
+* `tests/`: unit tests for the cluster, casting, the speech recognizers and the Breeze join's click repair, and a fake Nomad end-to-end test.
 
 ## Where things run
 
@@ -56,7 +56,8 @@ is deployed to containers.
 
 ## Testing
 
-* `python -m unittest tests.test_cluster` and `python tests/e2e_fake_nomad.py` cover the cluster exchange and scheduling.
+* Run `python -m unittest tests.test_cluster tests.test_casting tests.test_asr` and `python tests/e2e_fake_nomad.py` after any change. The end-to-end test covers the cluster exchange and scheduling.
+* After a change to `fx.py` or `breeze_join.py`, also run `tests/test_fx.py` under the audio Python, with `D:\comfy\python_embeded\python.exe -I tests/test_fx.py` on the laptop. The plain Python skips it.
 * Check a pipeline change in a scratch copy with the layout a worker gets: the code, and one serial's folder without its audio, copied from containers. Point the output folder at the scratch copy too, so its takes can't land beside the node's real ones. On the Mac, from the clone:
 
 ```

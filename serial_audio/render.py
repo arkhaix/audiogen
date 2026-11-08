@@ -21,6 +21,7 @@ FX_SCRIPT = Path(__file__).with_name("fx.py")
 AUDIO_SUFFIX = ".opus"
 # must match fx.py EFFECTS
 VOICE_EFFECTS = {"whisper"}
+VOICE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,80}$")
 MAX_SLOTS = 16
 GENERATE_TIMEOUT = 6 * 3600
 
@@ -69,6 +70,45 @@ def slot_effects(serial: dict, slot_voice: dict[int, str]) -> dict[int, dict]:
             raise ComfyError(f"serial.yaml voice_effects.{voice}: unknown effect {(spec or {}).get('effect')!r}; "
                              f"known: {sorted(VOICE_EFFECTS)}")
     return {slot: dict(wanted[voice]) for slot, voice in slot_voice.items() if voice in wanted}
+
+
+def set_voice_effect(slug: str, voice: str, effect: str | None, level: float | None = None) -> dict | None:
+    """Sets or removes the effect that serial.yaml voice_effects gives one voice in every later render.
+
+    slug: the serial.
+    voice: the voice id. Setting an effect needs a cast voice of that id.
+    effect: an effect in VOICE_EFFECTS, or None to remove the voice's effect.
+    level: whisper only, how much of the dry voice stays under the effect, from 0 to 1. None stores no level, so the
+        render uses 0.35.
+    Returns the voice's effect spec, or None when it has none. Removing the effect of a voice without one leaves
+    serial.yaml as it was. Raises ValueError on a malformed voice id, an unknown effect, a level outside 0 to 1, or
+    a voice with no cast record. Raises FileNotFoundError when the serial does not exist.
+    """
+    if not VOICE_ID_RE.match(voice):
+        raise ValueError(f"bad voice id {voice!r}")
+    serial = lib.load_serial(slug)
+    effects = dict(serial.get("voice_effects") or {})
+    if effect is None:
+        if voice not in effects:
+            return None
+        effects.pop(voice)
+    else:
+        if effect not in VOICE_EFFECTS:
+            raise ValueError(f"unknown effect {effect!r}; known: {', '.join(sorted(VOICE_EFFECTS))}")
+        if not (lib.serial_dir(slug) / "voices" / f"{voice}.yaml").exists():
+            raise ValueError(f"{slug} has no cast voice {voice!r}")
+        spec = {"effect": effect}
+        if level is not None:
+            if not 0 <= level <= 1:
+                raise ValueError(f"the level is from 0 to 1, not {level}")
+            spec["voice"] = level
+        effects[voice] = spec
+    if effects:
+        serial["voice_effects"] = effects
+    else:
+        serial.pop("voice_effects", None)
+    lib.save_serial(slug, serial)
+    return effects.get(voice)
 
 
 def encode_audio(src: Path, dst: Path) -> None:

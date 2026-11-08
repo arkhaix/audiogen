@@ -618,7 +618,8 @@ def render_breeze(slug: str, number: int, *, seed: int = 1, comfy_url: str = "ht
     audio_dir.mkdir(parents=True, exist_ok=True)
     dst = audio_dir / f"{stem}{src.suffix}"
     shutil.copy2(src, dst)
-    log(f"   joined {summary['takes']} takes into {summary['seconds']} s at {summary['sample_rate']} Hz")
+    log(f"   joined {summary['takes']} takes into {summary['seconds']} s at {summary['sample_rate']} Hz, "
+        f"{summary.get('clicks', 0)} clicks filled in")
     if summary.get("capped"):
         log(f"   warning: lines {summary['capped']} reached the {MAX_TAKE_SECONDS} s take limit and may be cut off")
 
@@ -626,7 +627,8 @@ def render_breeze(slug: str, number: int, *, seed: int = 1, comfy_url: str = "ht
     meta["render"] = {"engine": "breeze", "runner": runner, "model": model, "takes_file": TAKES_FILE,
                       "comfy_audio": str(src), "audio": f"audio/{dst.name}", "seed": seed,
                       "slots": {str(s): v for s, v in slot_voice.items()}, "notes": notes,
-                      "generated_takes": len(stale), "generate_seconds": round(generated_seconds), "at": lib.now_iso()}
+                      "generated_takes": len(stale), "generate_seconds": round(generated_seconds),
+                      "clicks_filled": summary.get("clicks", 0), "at": lib.now_iso()}
     if summary.get("capped"):
         meta["render"]["capped_lines"] = summary["capped"]
     if effects:
