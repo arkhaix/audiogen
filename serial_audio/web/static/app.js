@@ -1132,7 +1132,7 @@ function candidates(x, list, current) {
     if (!isCurrent || x.status !== "approved") btns.push(`<button class="sm" data-act="pick" data-id="${esc(x.id)}" data-seed="${c.seed}" data-approve="1">${isCurrent ? "Approve" : "File and approve"}</button>`);
     return `<div class="cand${isCurrent ? " chosen" : ""}">
       ${c.media ? playBtn(c.media.url, `${x.name}, seed ${c.seed}`) : `<span class="small muted">no clip</span>`}
-      <div><div>seed ${esc(c.seed)} · match ${Number(c.score).toFixed(2)}${isCurrent ? " · filed" : ""}</div>
+      <div><div>seed ${esc(c.seed)} · match ${Number(c.score).toFixed(2)}${c.clipped ? " · clipped" : ""}${isCurrent ? " · filed" : ""}</div>
         ${Number(c.score) < 0.999 ? `<div class="tr">heard: ${esc(c.transcript)}</div>` : ""}</div>
       <div class="btns">${btns.join("")}</div></div>`;
   }).join("");

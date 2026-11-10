@@ -136,7 +136,7 @@ existing entries for a conflict before adding one, and rewrite an entry when AJ 
 As of 2026-11-08:
 
 
-* Whether to re-render the chapters of The Hundred Reigns that use old voices. Chapters 1 to 6 are Drama 3 renders, so Louis and Lauriane sound different there, and they take about 85 minutes on the laptop. AJ was asked about them on 2026-11-07 and hasn't answered. Chapter 11 has the Keeper's old Qwen voice and chapter 12 has Lauriane's, because both were rendered before the recasts on 2026-11-08.
+* Whether to re-render the chapters of The Hundred Reigns that use old voices. Chapters 1 to 6 are Drama 3 renders, so Louis and Lauriane sound different there, and they take about 85 minutes on the laptop. AJ was asked about them on 2026-11-07 and hasn't answered. Chapter 12 has Lauriane's old Qwen voice, because it was rendered before the recast on 2026-11-08.
 * Whether to recast the other academy-age voices that were cast with aged-up Qwen briefs: simon, leonard-decarabia, meredith-dose, cassandra, antonine-de-shax and tiella-decarabia. Casval and Anna were recast with Breeze at their story age on 2026-11-09 (`docs/casting.md`), and AJ was asked about the rest that day.
 * Whether to render chapters 7, 8 and 10 of The Hundred Reigns again. They have the Qwen voices of Casval and Anna that AJ replaced on 2026-11-09, and they were joined before the join leveled each voice. AJ had finished them, so they were left alone.
 * How the library is backed up. `/opt/serial-audio/library` on containers' local disk has no backup, and silver has no backup job.

@@ -6,7 +6,7 @@
 * `breeze`, the default since 2026-11-08: breeze-server designs each candidate from the brief with no reference clip. There is no Drama 3 voice file, so the voice can't be used for a Drama 3 render.
 * `qwen`: Qwen3-TTS VoiceDesign in ComfyUI designs the candidates, and each is also encoded as a Drama 3 voice.
 
-Each candidate is transcribed and compared with its sample line, and the best match is filed with status `auto`
+Each candidate is transcribed and compared with its sample line, and the best match that isn't clipped is filed with status `auto`
 until AJ listens and runs `pick-voice`.
 
 ---
@@ -30,6 +30,7 @@ until AJ listens and runs `pick-voice`.
 * The share of speech frames that pyin calls voiced tells a whisper from a voice. Normal speech scores about 0.65, the Keeper's Qwen clip with the whisper effect 0.14, and a true Breeze whisper 0.11 to 0.13.
 * A Breeze take comes out at the level of its voice's cast clip, and cast clips run from -11 to -29 dB of active speech RMS. Since 2026-11-09 the join levels each voice, so a chapter doesn't show the difference, but raw candidate clips do. Bring candidates to one level before AJ compares them by ear, or a quiet clip sounds worse than it is.
 * The casting check files the candidate whose transcript matches best. For a whisper brief that is the most voiced candidate, so pick a whispered one by seed.
+* Breeze clones the distortion of a clipped cast clip into every take, and the join can only turn it down. The Keeper's seed 13000 had a longest run of 6 full-scale samples at -10.9 dB RMS, and its chapter 11 lines sounded clipped after the join leveled them. Since 2026-11-10 the cast marks a candidate with 3 or more full-scale samples in a row as clipped, files it only when every candidate is clipped, and the casting page shows the mark. `pick-voice` still files a clipped seed when asked.
 * Use a new seed range for each round, so `pick-voice --seed` names exactly one candidate. Used so far: 1000, 4000, 5000, 6000, 7000, 9000, 10000, 11000, 12000 in a throwaway serial, and 13000, 13100, 13200 and 13300 in a scratch copy, 17000 and 18000 in the library (eole and lorimor-ancitif), and 18000, 18100, 18200 and 18300 in a scratch copy (casval and anna-paimon), 19000, 19100 and 19200 in a scratch copy (lorimor-ancitif), and 20000, 21000, 21100, 21200, 22000, 22100, 22200 and 22300 in a scratch copy (casval). The next round should start at 23000.
 
 ---

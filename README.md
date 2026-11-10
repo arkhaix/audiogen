@@ -91,7 +91,7 @@ its override removes the entry.
 3. `cast` designs a voice for each uncast major/recurring character. A casting pass writes a
    voice-design instruction and sample line, and breeze-server designs N candidates from it with Breeze TTS 2
    voice design. Each is transcribed with the same recognizer as the take check (step 5), and the best
-   transcript match is filed under `voices/` (status `auto` until you listen and `pick-voice`). A Breeze
+   transcript match that isn't clipped is filed under `voices/` (status `auto` until you listen and `pick-voice`). A Breeze
    voice has no Drama 3 voice file, so it serves only Breeze renders. A third-person serial also
    gets a narrator, cast first as the voice `narrator` from the blurb, tags, and opening of chapter 1
    (set `narrator_brief` in `serial.yaml` to steer it). Recurring characters who have not spoken yet

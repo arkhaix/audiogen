@@ -16,10 +16,14 @@ BRIEF = {"id": "meredith", "instruct": "A woman in her late twenties with a low 
 
 
 class FakeServer:
-    """breeze-server that returns a second of silence per request and records what it was sent."""
+    """breeze-server that returns a second of silence per request and records what it was sent.
+
+    A request whose seed is in clipped_seeds gets a second at full scale instead.
+    """
 
     instances: list["FakeServer"] = []
     fail_text = None
+    clipped_seeds: frozenset[int] = frozenset()
 
     def __init__(self, log_path, log):
         self.sample_rate = 24000
@@ -41,7 +45,7 @@ class FakeServer:
         self.requests.append((dict(fields), wav))
         if fields["text"] == FakeServer.fail_text:
             raise ComfyError(f"breeze-server answered 500 for {label}")
-        return b"\x00\x00" * self.sample_rate
+        return (b"\xff\x7f" if fields["seed"] in FakeServer.clipped_seeds else b"\x00\x00") * self.sample_rate
 
 
 def heard_for(good_seed: int):
@@ -68,6 +72,7 @@ class BreezeCastTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         FakeServer.instances.clear()
         FakeServer.fail_text = None
+        FakeServer.clipped_seeds = frozenset()
         lib.save_serial(SLUG, {"title": "Design Test", "narration": {"point_of_view": "third_person"},
                                "narrator_voice_id": "narrator"})
         character = {"gender": "female", "age_group": "young adult", "importance": "major", "role": "x",
@@ -141,6 +146,24 @@ class BreezeCastTest(unittest.TestCase):
         self.assertTrue(again["candidates"][1]["clip"].endswith("meredith_s1001_2.wav"), again["candidates"][1])
         self.assertTrue(Path(first_clip).is_file())
         self.assertEqual([h["seed"] for h in again["history"]], [2002, 1001])
+
+    def test_a_clipped_candidate_is_chosen_last(self):
+        # The best match is clipped, so the next candidate is filed and the clipped one is marked.
+        FakeServer.clipped_seeds = frozenset({1001})
+        [record] = self.cast(good_seed=1001)
+        self.assertNotEqual(record["seed"], 1001)
+        self.assertEqual(record["status"], "review")
+        self.assertEqual([bool(c.get("clipped")) for c in record["candidates"]], [False, True, False])
+
+        # A clean candidate that matches still files as auto beside a clipped one.
+        FakeServer.clipped_seeds = frozenset({2000})
+        [record] = self.cast(good_seed=2001, seed0=2000, recast=True)
+        self.assertEqual((record["seed"], record["status"]), (2001, "auto"))
+
+        # When every candidate is clipped the best match is filed for review.
+        FakeServer.clipped_seeds = frozenset({3000, 3001, 3002})
+        [record] = self.cast(good_seed=3001, seed0=3000, recast=True)
+        self.assertEqual((record["seed"], record["status"]), (3001, "review"))
 
     def test_a_failed_design_files_the_voices_before_it(self):
         # Design: ann's design fails after meredith's three succeed, and the server still stops.

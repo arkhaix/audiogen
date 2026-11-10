@@ -7,12 +7,14 @@ For every character whose importance qualifies for a dedicated voice and who has
      design in breeze-server, with no ComfyUI, and makes no Drama 3 voice.
   3. A speech recognizer (asr.py) transcribes the candidates. The one whose transcript best matches the sample
      line is chosen, copied into the library, and recorded in the bible with status "auto", to approve or recast
-     after listening.
+     after listening. A candidate whose clip is clipped is chosen only when every candidate is clipped.
 """
 from __future__ import annotations
 
+import array
 import difflib
 import shutil
+import sys
 import time
 import wave
 from pathlib import Path
@@ -32,6 +34,7 @@ ENGINES = ("qwen", "breeze")
 SOURCES = {"qwen": "qwen3-tts-12hz-1.7b-voicedesign", "breeze": "breeze-tts-2-voicedesign"}
 DESIGN_CFG = 4.0
 MATCH_THRESHOLD = 0.85
+CLIP_RUN = 3
 NARRATOR_ID = "narrator"       # the voice of a third-person serial's narration; not a bible character
 TONE_SAMPLE_WORDS = 400
 BATCH_KEYS = ("instruct", "sample_text", "seed", "status", "created_at", "candidates", "engine", "asr")
@@ -242,10 +245,38 @@ def design_breeze(slug: str, plan: list[tuple[str, dict]], *, count: int, seed0:
     return out, failure
 
 
+def full_scale_run(clip: Path) -> int:
+    """The longest run of consecutive full-scale samples in a clip.
+
+    clip: a 16-bit PCM WAV.
+    Returns the run length in samples, or 0 for any file that is not a readable 16-bit PCM WAV.
+    """
+    if clip.suffix.lower() != ".wav":
+        return 0
+    try:
+        with wave.open(str(clip), "rb") as w:
+            if w.getsampwidth() != 2:
+                return 0
+            frames = w.readframes(w.getnframes())
+    except (wave.Error, EOFError):
+        return 0
+    samples = array.array("h", frames[: len(frames) // 2 * 2])
+    if sys.byteorder == "big":
+        samples.byteswap()
+    longest = run = 0
+    for s in samples:
+        run = run + 1 if s >= 32767 or s <= -32767 else 0
+        if run > longest:
+            longest = run
+    return longest
+
+
 def score_candidates(cid: str, brief: dict, candidates: list[dict], *, asr: str, comfy_url: str, log=print) -> None:
     """Transcribes each candidate's clip and adds its transcript and its match with the sample line, in place.
 
     asr: the recognizer, "qwen3" or "parakeet".
+    A candidate whose clip has CLIP_RUN or more full-scale samples in a row also gets the key clipped, set to the
+    length of its longest run.
     Raises ComfyError when the recognizer fails.
     """
     files = [Path(c["clip"]) for c in candidates]
@@ -253,7 +284,10 @@ def score_candidates(cid: str, brief: dict, candidates: list[dict], *, asr: str,
         c = candidates[i]
         score = transcript_match(brief["sample_text"], heard)
         c.update(transcript=heard, score=round(score, 3))
-        log(f"   {cid} seed {c['seed']}: match {score:.2f}  {Path(c['clip']).name}")
+        run = full_scale_run(files[i])
+        if run >= CLIP_RUN:
+            c["clipped"] = run
+        log(f"   {cid} seed {c['seed']}: match {score:.2f}{'  clipped' if run >= CLIP_RUN else ''}  {files[i].name}")
 
 
 def file_voice(slug: str, cid: str, brief: dict, candidates: list[dict], chosen: int, engine: str = "qwen") -> dict:
@@ -404,15 +438,18 @@ def cast(slug: str, *, only: list[str] | None = None, candidates: int = 3, seed0
         else:
             cands = generate_candidates(client, slug=slug, cid=cid, brief=brief, count=candidates, seed0=seed0, log=log)
         score_candidates(cid, brief, cands, asr=asr, comfy_url=comfy_url, log=log)
-        order = sorted(range(len(cands)), key=lambda i: cands[i]["score"], reverse=True)
+        order = sorted(range(len(cands)), key=lambda i: (not cands[i].get("clipped"), cands[i]["score"]), reverse=True)
         chosen = order[0]
-        if cands[chosen]["score"] < MATCH_THRESHOLD:
-            log(f"   {cid}: best transcript match {cands[chosen]['score']:.2f} is below {MATCH_THRESHOLD}; "
-                f"filed anyway, flagged for review")
+        if cands[chosen].get("clipped"):
+            log(f"   {cid}: every candidate is clipped; filed anyway, flagged for review")
+        elif cands[chosen]["score"] < MATCH_THRESHOLD:
+            log(f"   {cid}: best transcript match among the unclipped candidates, {cands[chosen]['score']:.2f}, is "
+                f"below {MATCH_THRESHOLD}; filed anyway, flagged for review")
         record_path = lib.serial_dir(slug) / "voices" / f"{cid}.yaml"
         previous = lib.load_yaml(record_path) if recast else None
         record = file_voice(slug, cid, brief, cands, chosen, engine=engine)
-        record["status"] = "auto" if cands[chosen]["score"] >= MATCH_THRESHOLD else "review"
+        record["status"] = ("auto" if cands[chosen]["score"] >= MATCH_THRESHOLD and not cands[chosen].get("clipped")
+                            else "review")
         record["asr"] = asr
         if previous:
             old = {k: previous.get(k) for k in BATCH_KEYS}
