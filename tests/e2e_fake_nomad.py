@@ -1,9 +1,9 @@
 """End-to-end test of the Nomad executor against a fake Nomad.
 
-Copies the code and one serial into a temporary folder and runs the web app's NomadJobManager and HTTP server
-there. A fake Nomad HTTP server starts deploy/nomad/bootstrap.py as a local process for each dispatch, the way a
-raw_exec task would, so the real bootstrap, worker, bundle, log stream and result upload all run.
-Run from the repo root: python tests/e2e_fake_nomad.py [slug]
+Copies the code into a temporary folder, writes a small serial there, and runs the web app's NomadJobManager and
+HTTP server there. A fake Nomad HTTP server starts deploy/nomad/bootstrap.py as a local process for each dispatch,
+the way a raw_exec task would, so the real bootstrap, worker, bundle, log stream and result upload all run.
+Run from the repo root: python tests/e2e_fake_nomad.py
 """
 from __future__ import annotations
 
@@ -26,6 +26,25 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parent.parent
 REGISTERED = {"serial-audio-breeze", "serial-audio-comfyui", "serial-audio-llm", "serial-audio-breeze-fake-node",
               "serial-audio-comfyui-fake-node"}
+SLUG = "demo"
+SERIAL = {
+    "serial.yaml": "title: Demo\nauthor: Test\nsource:\n  type: epub\nnarration:\n  point_of_view: third_person\n"
+                   "  narrator_character_id: ''\n",
+    "bible/characters.yaml": "captain:\n  name: The Captain\n  importance: major\n  gender: male\n  age_group: adult\n"
+                             "  role: Commands the ship.\n  voice_brief: A deep, calm voice.\n  speaks: true\n"
+                             "  chapters_present: [1]\n",
+    "chapters/0001/chapter.yaml": "number: 1\nlabel: Chapter 1\ntitle: The Ship\nword_count: 12\nstatus: characters\n"
+                                  "characters_present: [captain]\n",
+    "chapters/0001/text.md": "The captain looked out at the sea.\n\n\"We sail at dawn,\" he said.\n",
+}
+
+
+def make_serial(folder: Path) -> None:
+    """Writes the SERIAL files under folder: one chapter after the character pass, with a bible."""
+    for rel, text in SERIAL.items():
+        path = folder / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
 
 
 def free_port() -> int:
@@ -310,13 +329,12 @@ def inside(slug: str) -> int:
 def main() -> int:
     if len(sys.argv) > 1 and sys.argv[1] == "--inside":
         return inside(sys.argv[2])
-    slug = sys.argv[1] if len(sys.argv) > 1 else "twenty-thousand-leagues"
     with tempfile.TemporaryDirectory(prefix="serial-audio-e2e-") as tmp:
         root = Path(tmp)
         for top in ("serial_audio", "prompts", "schemas", "deploy", "tests"):
             shutil.copytree(REPO / top, root / top, ignore=shutil.ignore_patterns("__pycache__"))
-        shutil.copytree(REPO / "library" / slug, root / "library" / slug)
-        return subprocess.call([sys.executable, "-u", str(root / "tests" / "e2e_fake_nomad.py"), "--inside", slug],
+        make_serial(root / "library" / SLUG)
+        return subprocess.call([sys.executable, "-u", str(root / "tests" / "e2e_fake_nomad.py"), "--inside", SLUG],
                                cwd=str(root))
 
 

@@ -165,6 +165,21 @@ class SchedulingTest(unittest.TestCase):
         self.assertTrue(conflicts(job("render", chapters=[7]), job("character-pass", chapters=[1])))
         self.assertFalse(conflicts(job("render", chapters=[7]), job("cast", slug="other")))
         self.assertFalse(conflicts(job("add-epub", slug=None), job("add-epub", slug=None)))
+        # A render waits for a cast, a pick, a say-as or a voice effect on its serial, which change what it reads.
+        # None of them waits for a render, a screenplay or a take check, and they still wait for each other and for
+        # a character pass.
+        self.assertTrue(conflicts(job("render", chapters=[7]), job("cast")))
+        self.assertTrue(conflicts(job("render", chapters=[7]), job("pick-voice")))
+        self.assertFalse(conflicts(job("cast"), job("render", chapters=[7])))
+        self.assertFalse(conflicts(job("pick-voice"), job("screenplay", chapters=[7])))
+        self.assertFalse(conflicts(job("cast"), job("check-takes", chapters=[7])))
+        self.assertTrue(conflicts(job("cast"), job("pick-voice")))
+        self.assertTrue(conflicts(job("cast"), job("character-pass", chapters=[1])))
+        self.assertFalse(conflicts(job("say-as"), job("render", chapters=[7])))
+        self.assertFalse(conflicts(job("voice-effect"), job("render", chapters=[7])))
+        self.assertTrue(conflicts(job("render", chapters=[7]), job("say-as")))
+        self.assertTrue(conflicts(job("voice-effect"), job("cast")))
+        self.assertTrue(conflicts(job("cast"), job("add-epub")))
 
     def test_stages(self):
         self.assertEqual(job_stages(job("render", args=["render", "demo", "7"]))[0]["class"], "breeze")
@@ -244,19 +259,73 @@ class NodeChoiceTest(unittest.TestCase):
     def test_a_gpu_job_takes_the_nvidia_node_first_and_one_job_per_node(self):
         render = job("render", chapters=[1], args=["render", "demo", "1"])
         self.assertEqual(self.m._pick_node(render, "breeze", [])[:2], ("laptop", "breeze"))
-        self.assertEqual(self.m._pick_node(render, "breeze", [self.running_on("laptop")])[:2], ("mac", "breeze"))
+        # With the laptop busy, a render waits for it rather than take the Mac, which is six times slower.
+        node, cls, why = self.m._pick_node(render, "breeze", [self.running_on("laptop")])
+        self.assertIsNone(node)
+        self.assertTrue(why.startswith("waiting for laptop, about"), why)
+        self.assertIn("on mac now", why)
         node, cls, why = self.m._pick_node(render, "breeze", [self.running_on("laptop"), self.running_on("mac")])
         self.assertIsNone(node)
-        self.assertIn("free breeze node", why)
+        self.assertTrue(why.startswith("waiting for laptop, about"), why)
+        self.assertIn("busy", why)
 
-    def test_a_breeze_cast_takes_a_node_without_comfyui_first(self):
+    def test_a_cast_starts_beside_a_render_of_its_serial_and_a_render_waits_for_a_cast(self):
+        self.m.workers.append(worker("dev", ["llm"], "linux"))
+        self.m.nomad_state["up"] = True
+        render = {"kind": "render", "slug": "demo", "meta": {"chapters": [12]}, "args": ["render", "demo", "12"],
+                  "title": "Render · ch 12",
+                  "nomad": {"target": "mac", "stage": 0, "stages": [{"class": "breeze", "args": []}], "contact": "t"}}
+        cast = {"kind": "cast", "slug": "demo", "meta": {"characters": ["eole"]}, "args": ["cast", "demo"],
+                "title": "Cast · eole"}
+        # Running: the render does not hold the cast once it has its bundle, and the cast holds a render.
+        self.assertIsNone(self.m._blocker_for(cast, "llm", [render]))
+        unfetched = {**render, "nomad": {**render["nomad"], "contact": None}}
+        self.assertEqual(self.m._blocker_for(cast, "llm", [unfetched]),
+                         "waiting for Render · ch 12 to fetch its bundle")
+        self.assertEqual(self.m._blocker_for(render, "breeze", [cast]),
+                         "waiting for Cast · eole, which changes the whole serial")
+        # Queued ahead: the same, in queue order.
+        self.m.jobs = {"r": {**render, "id": "r", "seq": 1, "status": "queued"},
+                       "c": {**cast, "id": "c", "seq": 2, "status": "queued"}}
+        self.assertIsNone(self.m._blocker_for(self.m.jobs["c"], "llm", []))
+        self.m.jobs["c"]["seq"], self.m.jobs["r"]["seq"] = 1, 2
+        self.assertEqual(self.m._blocker_for(self.m.jobs["r"], "breeze", []),
+                         "waiting for Cast · eole, queued ahead of it on the same serial")
+
+    def test_a_cast_passes_a_chapter_job_that_waits_ahead_of_it_in_its_lane(self):
+        self.m.nomad_state["up"] = True
+        stage = {"class": "breeze", "args": []}
+        running = {"id": "r1", "seq": 1, "status": "running", "kind": "render", "slug": "demo",
+                   "meta": {"chapters": [12]}, "args": ["render", "demo", "12"], "title": "Render · ch 12",
+                   "nomad": {"target": "mac", "node": "mac", "stage": 0, "stages": [stage], "contact": "t"}}
+        again = {**running, "id": "r2", "seq": 2, "status": "queued", "title": "Render · ch 12 again", "nomad": None}
+        cast = {"id": "c", "seq": 3, "status": "queued", "kind": "cast", "slug": "demo", "heavy": True,
+                "meta": {"characters": ["eole"]}, "args": ["cast", "demo"], "title": "Cast · eole",
+                "nomad": {"key": "k", "stage": 1, "stages": [{"class": "llm", "args": []}, dict(stage)]}}
+        self.m.jobs = {j["id"]: j for j in (running, again, cast)}
+        dispatch = []
+        # The second render waits for the running one and holds the breeze lane. The cast's voices stage passes it
+        # to the free laptop.
+        self.assertTrue(self.m._schedule(0.0, dispatch))
+        self.assertIn("Render · ch 12", self.m.wait_reasons["r2"])
+        self.assertEqual(dispatch, ["c"])
+        self.assertEqual((cast["status"], cast["nomad"]["target"]), ("running", "laptop"))
+        # A cast queued after it still waits for it.
+        self.m.jobs["c2"] = {**cast, "id": "c2", "seq": 4, "status": "queued", "title": "Cast · lorimor-ancitif",
+                             "nomad": {"key": "k2", "stage": 1, "stages": [{"class": "llm", "args": []}, dict(stage)]}}
+        self.m._schedule(0.0, dispatch)
+        self.assertEqual(dispatch, ["c"])
+        self.assertIn("Cast · eole", self.m.wait_reasons["c2"])
+
+    def test_a_breeze_cast_takes_the_nvidia_node_first(self):
         cast = job("cast", args=["cast", "demo", "--engine", "breeze"])
-        self.assertEqual(self.m._pick_node(cast, "breeze", [])[:2], ("mac", "breeze"))
-        self.assertEqual(self.m._pick_node(cast, "breeze", [self.running_on("mac")])[:2], ("laptop", "breeze"))
+        self.assertEqual(self.m._pick_node(cast, "breeze", [])[:2], ("laptop", "breeze"))
+        self.assertEqual(self.m._pick_node(cast, "breeze", [self.running_on("laptop")])[:2], ("mac", "breeze"))
         self.assertEqual(self.m._pick_node(job("cast", args=["cast", "demo"]), "comfyui", [])[:2],
                          ("laptop", "comfyui"))
 
     def test_a_job_that_needs_a_node_waits_for_it_and_may_switch_class(self):
+        from unittest import mock
         self.m.placement = {"chapters": {"demo": {"1": "mac"}}}
         check = job("check-takes", chapters=[1], args=["check-takes", "demo", "1"])
         self.assertEqual(self.m._pick_node(check, "comfyui", [])[:2], ("mac", "breeze"))
@@ -264,7 +333,89 @@ class NodeChoiceTest(unittest.TestCase):
         self.assertIsNone(node)
         self.assertIn("mac, which holds the files", why)
         render = job("render", chapters=[1], args=["render", "demo", "1"])
-        self.assertEqual(self.m._pick_node(render, "breeze", [])[:2], ("mac", "breeze"))
+        render["meta"]["engine"] = "breeze"
+        with mock.patch("serial_audio.web.nomad.reusable_takes", return_value=(200, 200)):
+            self.assertEqual(self.m._pick_node(render, "breeze", [])[:2], ("mac", "breeze"))
+
+    def test_a_render_goes_where_it_finishes_first_counting_the_takes_a_node_holds(self):
+        from unittest import mock
+        self.m.placement = {"chapters": {"demo": {"1": "mac"}}}
+        render = {"kind": "render", "slug": "demo", "args": ["render", "demo", "1", "--seed", "2"],
+                  "meta": {"chapters": [1], "engine": "breeze", "runner": "cpp", "lines": 255}}
+        # 25 takes on the Mac beat 255 on the laptop, and 252 on the Mac do not.
+        with mock.patch("serial_audio.web.nomad.reusable_takes", return_value=(230, 255)) as reuse:
+            self.assertEqual(self.m._pick_node(render, "breeze", [])[:2], ("mac", "breeze"))
+        reuse.assert_called_once_with("demo", 1, 2, "cpp")
+        with mock.patch("serial_audio.web.nomad.reusable_takes", return_value=(3, 255)):
+            self.assertEqual(self.m._pick_node(render, "breeze", [])[:2], ("laptop", "breeze"))
+            # With the laptop busy, waiting for it still beats a full render on the Mac.
+            node, cls, why = self.m._pick_node(render, "breeze", [self.running_on("laptop")])
+            self.assertIsNone(node)
+            self.assertTrue(why.startswith("waiting for laptop, about"), why)
+        # When the reuse cannot be worked out, the render is costed at all its takes, so it goes to the fast node.
+        with mock.patch("serial_audio.web.nomad.reusable_takes", side_effect=FileNotFoundError("no script")):
+            self.assertEqual(self.m._pick_node(render, "breeze", [])[:2], ("laptop", "breeze"))
+
+    def test_a_job_waits_for_a_busy_node_only_when_that_saves_more_than_the_margin(self):
+        from unittest import mock
+        render = job("render", chapters=[2], args=["render", "demo", "2"])
+        render["meta"]["lines"] = 200
+        busy = {**self.running_on("laptop"), "status": "running"}
+        rates = {"laptop": 2.0, "mac": 2.9}
+        with mock.patch.object(self.m, "progress", return_value={"phase": "checking", "eta": 30}), \
+                mock.patch.object(self.m, "_rate", side_effect=rates.get):
+            # The laptop frees in 30 s and renders in 590 s. The Mac renders now in 770 s. Waiting saves 150 s.
+            node, cls, why = self.m._pick_node(render, "breeze", [busy])
+            self.assertIsNone(node)
+            self.assertEqual(why, "waiting for laptop, about 10 min, instead of about 13 min on mac now")
+            # At 2.7 s per take the Mac renders now in 730 s. Waiting saves 110 s, under the margin, so the Mac starts.
+            rates["mac"] = 2.7
+            self.assertEqual(self.m._pick_node(render, "breeze", [busy])[:2], ("mac", "breeze"))
+
+    def test_queued_jobs_fill_the_fast_node_before_the_slow_one_takes_any(self):
+        from unittest import mock
+        self.m.nomad_state["up"] = True
+        running = {**self.running_on("laptop"), "id": "r0", "seq": 0, "status": "running", "title": "Render · ch 9"}
+        queued = [{"id": f"r{n}", "seq": n, "status": "queued", "kind": "render", "slug": "demo", "heavy": True,
+                   "created": "2026-11-08T15:00:00", "title": f"Render · ch {n}",
+                   "meta": {"chapters": [n], "lines": 100}, "args": ["render", "demo", str(n)]}
+                  for n in (1, 2)]
+        self.m.jobs = {j["id"]: j for j in [running, *queued]}
+        dispatch = []
+        with mock.patch.object(self.m, "progress", return_value={"phase": "checking", "eta": 30}), \
+                mock.patch.object(self.m, "_rate", side_effect={"laptop": 3.0, "mac": 5.0}.get):
+            self.m._schedule(0.0, dispatch)
+        # Chapter 1 waits for the laptop: 30 s plus 440 s against 640 s on the Mac. Chapter 2 would wait behind it
+        # as well, 910 s, so it takes the Mac now.
+        self.assertEqual(self.m.wait_reasons["r1"], "waiting for laptop, about 8 min, instead of about 11 min on mac now")
+        self.assertEqual(dispatch, ["r2"])
+        self.assertEqual(self.m.jobs["r2"]["nomad"]["target"], "mac")
+
+    def test_a_node_s_take_rate_comes_from_the_renders_it_finished(self):
+        from unittest import mock
+        from serial_audio import library as lib
+        with mock.patch.object(lib, "LIBRARY", Path(self.tmp.name) / "library"):
+            def finish(n, node, takes, secs, success=True):
+                lib.save_yaml(lib.chapter_dir("demo", n) / "chapter.yaml",
+                              {"render": {"engine": "breeze", "runner": "cpp", "generated_takes": takes,
+                                          "generate_seconds": secs}})
+                render = {**job("render", chapters=[n], args=["render", "demo", str(n)]), "id": f"r{n}"}
+                self.m._record_placement(render, node, {"applied": [f"chapters/{n:04d}/chapter.yaml"]}, success)
+
+            finish(1, "mac", 255, 4468)
+            finish(2, "mac", 3, 60)
+            finish(3, "laptop", 246, 689)
+            finish(4, "laptop", 231, 2000, success=False)
+            # A record of fewer than 20 takes and a failed render are skipped, and a node without records gets its
+            # GPU type's default.
+            self.assertAlmostEqual(self.m._rate("mac"), 4468 / 255, places=2)
+            self.assertAlmostEqual(self.m._rate("laptop"), 689 / 246, places=2)
+            self.m.workers.append(worker("box", ["breeze"], "linux", "none"))
+            self.assertEqual(self.m._rate("box"), 60.0)
+            # Only the last three records of a node count.
+            for n in (5, 6, 7):
+                finish(n, "laptop", 100, 100 * n)
+            self.assertAlmostEqual(self.m._rate("laptop"), 6.0, places=2)
 
     def test_paths_name_their_node_when_one_node_runs_that_os(self):
         self.assertEqual(self.m._node_for_paths(["D:\\comfy\\out\\a.wav"]), "laptop")
@@ -293,7 +444,15 @@ class NodeChoiceTest(unittest.TestCase):
             self.assertEqual(self.m.holder(pick("--seed", "9")), ("mac", True))
 
     def test_a_restart_during_a_dispatch_dispatches_again_with_the_same_token(self):
+        from unittest import mock
+        from serial_audio import library as lib
         from serial_audio.web.nomad import NomadClient, NomadJobManager
+
+        patch = mock.patch.object(lib, "LIBRARY", Path(self.tmp.name) / "library")
+        patch.start()
+        self.addCleanup(patch.stop)
+        lib.save_serial("demo", {"title": "Demo"})
+        lib.chapter_dir("demo", 1).mkdir(parents=True)
 
         class Client(NomadClient):
             calls = []
@@ -315,7 +474,7 @@ class NodeChoiceTest(unittest.TestCase):
             def evaluations(self, job_id):
                 return []
 
-        j = self.m.submit([{"kind": "screenplay", "params": {"slug": "twenty-thousand-leagues", "chapters": "1"}}])[0]
+        j = self.m.submit([{"kind": "screenplay", "params": {"slug": "demo", "chapters": "1"}}])[0]
         self.m._mark_dispatch(j)
         self.m._save()
         self.m._lock_file.close()
@@ -409,9 +568,12 @@ class VoiceEffectTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 build("voice-effect", {"slug": "demo", **bad})
 
-        # On the cluster and on one machine, it waits for a running job on its serial and not for another serial's.
+        # On the cluster it starts beside a running render of its serial, which took its copy of serial.yaml in its
+        # bundle, and waits for a cast. On one machine it waits for a running job on its serial and not for another
+        # serial's.
         effect = {"kind": "voice-effect", "slug": "demo", "meta": {}, "heavy": False}
-        self.assertTrue(conflicts(effect, job("render", chapters=[3])))
+        self.assertFalse(conflicts(effect, job("render", chapters=[3])))
+        self.assertTrue(conflicts(effect, job("cast")))
         m = JobManager(state_dir=Path(self.tmp.name) / "state", autostart=False)
         self.addCleanup(m._lock_file.close)
         render = {**job("render", chapters=[3]), "heavy": True, "title": "Render · ch 3"}

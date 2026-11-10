@@ -1100,6 +1100,7 @@ function voiceCard(x, slug) {
     x.rendered_in.length && `rendered in ${esc(rangeText(x.rendered_in))}`,
     x.effect && `<span class="tag">${esc(x.effect.effect)} effect</span>`,
   ].filter(Boolean).join(" · ");
+  const bio = [x.role, x.description].filter(Boolean).join(" ");
   const rounds = x.history.slice().reverse().map((h) => `<div class="round">
       <div class="small muted">Earlier round${h.replaced_at ? `, replaced ${esc(when(h.replaced_at))}` : ""}${h.why_replaced ? `: ${esc(h.why_replaced)}` : ""}</div>
       <div class="instruct small">${esc(h.instruct)}</div>
@@ -1110,6 +1111,7 @@ function voiceCard(x, slug) {
         <div class="grow"><h3>${esc(x.name)}</h3><div class="mono small muted">${esc(x.id)}</div></div>
         <span class="pill ${esc(x.status)}">${esc(x.status)}</span></div>
       <div class="small muted">${facts}</div>
+      ${bio ? `<div class="bio" data-act="expand" title="Click to expand">${esc(bio)}</div>` : ""}
       <div class="instruct" data-act="expand" title="Click to expand">${esc(x.instruct)}</div>
       <div class="sample">“${esc(x.sample_text)}”</div>
       <details class="cands" data-key="cands:${esc(x.id)}"><summary>${plural(count, "candidate")}${x.history.length ? ` across ${x.history.length + 1} rounds` : ""}</summary>

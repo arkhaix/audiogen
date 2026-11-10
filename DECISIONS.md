@@ -83,30 +83,37 @@ existing entries for a conflict before adding one, and rewrite an entry when AJ 
 ---
 
 ### jsc-m1 renders Breeze, and the laptop is preferred
-**Date:** 2026-11-07
-**Context:** AJ asked for jsc-m1 to be usable as a worker. Its patched Metal breeze-server runs at about 0.4x realtime, against the laptop's 2x. The CPU backend and Vulkan through MoltenVK were slower, at 0.26x and 0.28x.
-**Decision:** jsc-m1 offers the `breeze` class. The app sends a GPU job to a free NVIDIA node first and to any free node second, one GPU job per node. A Breeze cast is the exception and takes a node without ComfyUI first, as the entry on the cast engine says. A job that needs a node's saved files goes back to that node, and a voice pick goes to the node that made the candidate it files.
+**Date:** 2026-11-07, revised 2026-11-08
+**Context:** AJ asked for jsc-m1 to be usable as a worker. Its patched Metal breeze-server runs at about 0.4x realtime, against the laptop's 2x. The CPU backend and Vulkan through MoltenVK were slower, at 0.26x and 0.28x. In the render records of 2026-11-08 the Mac made a take in 17.5 s and the laptop in 2.8 s, about 6x faster.
+**Decision:** jsc-m1 offers the `breeze` class, one GPU job per node. A job that needs a node's saved files goes back to that node, and a voice pick goes to the node that made the candidate it files. Any other GPU job goes to the ready node where its estimated finish is earliest: the node's running job's remaining time from its progress log, plus the queued jobs already waiting for that node, plus the job's own estimate, which is its takes times the node's seconds per take (the mean of the last three Breeze renders of twenty takes or more that finished on the node, kept in `placement.json`, else 3 s for NVIDIA and 18 s for Metal), counting only the takes the holder lacks, plus the join and the check. A render whose reuse cannot be worked out is costed at all its takes, because sending it to the slow node by mistake costs an hour and the other mistake costs ten minutes. It waits for a busy node when that beats every free one by two minutes or more, and a GPU job no longer waits behind a blocked job in its lane. With the join and the check the same on both nodes and the margin, the Mac wins a fresh 255-line render only when four or five are ahead of it on the laptop. AJ set the conditions: estimate the completion times, wait only when it saves time, and account for the other queued jobs. Rejected on 2026-11-08: sending a render back to the node that holds its takes whatever it would reuse there, and then the 90% reuse threshold that replaced it for a few hours, because both ignore how long the fast node stays busy (JOURNAL.md, 2026-11-08).
 
 ---
 
-### Parakeet checks takes and casting candidates where ComfyUI is missing
-**Date:** 2026-11-07
-**Context:** jsc-m1 has no ComfyUI for Qwen3-ASR. AJ preferred Parakeet to whisper, and his meetings project had already chosen Parakeet TDT 0.6B v2 int8 through sherpa-onnx.
-**Decision:** The take check and the casting check use Parakeet when its model folder exists and Qwen3-ASR otherwise. `SERIAL_AUDIO_ASR` overrides the choice.
+### Parakeet checks takes and casting candidates
+**Date:** 2026-11-07, extended to the laptop 2026-11-08
+**Context:** jsc-m1 has no ComfyUI for Qwen3-ASR, and on the laptop a check failed whenever ComfyUI was down. AJ preferred Parakeet to whisper, and his meetings project had already chosen Parakeet TDT 0.6B v2 int8 through sherpa-onnx.
+**Decision:** The take check and the casting check use Parakeet when its model folder exists and Qwen3-ASR otherwise. `SERIAL_AUDIO_ASR` overrides the choice. Both `breeze` nodes have Parakeet, so no check needs ComfyUI.
 
 ---
 
 ### Breeze voice design is the default cast engine
 **Date:** 2026-11-08
 **Context:** AJ heard a Breeze cast of the Keeper and Lauriane beside their Qwen voices and picked a Breeze candidate for both. He said "i think we should make breeze voices the default for new casting going forward". A Breeze cast needs no ComfyUI, and on jsc-m1 breeze-server designs the same clip again from the same brief and seed.
-**Decision:** `cast` uses Breeze voice design unless `serial.yaml` sets `cast_engine: qwen` or the cast passes `--engine qwen`. On the cluster a Breeze cast takes a node without ComfyUI first, because a ComfyUI node checks the candidates with Qwen3-ASR, which fails while ComfyUI is down. Voices cast before this keep their Qwen clips and Drama 3 voice files.
+**Decision:** `cast` uses Breeze voice design unless `serial.yaml` sets `cast_engine: qwen` or the cast passes `--engine qwen`. On the cluster a Breeze cast takes the NVIDIA node first, like any GPU job. Voices cast before this keep their Qwen clips and Drama 3 voice files. Rejected on 2026-11-08: sending a Breeze cast to a node without ComfyUI first. It only kept the check off Qwen3-ASR, and the laptop checks with Parakeet now (JOURNAL.md, 2026-11-08).
 
 ---
 
-### Cast voices older and lower than the story says
-**Date:** 2026-11-05
-**Context:** AJ found the first Qwen VoiceDesign cast too young across the board, including characters of 20.
-**Decision:** Briefs name an age older than the character's story age and a low register. `docs/casting.md` has the details.
+### Breeze briefs use the story age, and Qwen briefs an older one
+**Date:** 2026-11-05, revised 2026-11-09
+**Context:** AJ found the first Qwen VoiceDesign cast too young across the board, including characters of 20, so briefs named an older age and a low register. Breeze became the default cast engine on 2026-11-08. On 2026-11-09 the aged-up Qwen voices of Casval and Anna sounded too old to AJ for the academy arc, and he picked Breeze candidates from "about twenty" briefs for both.
+**Decision:** A brief for a Breeze cast names the character's story age. AJ said "use the story age from now on". A brief for a Qwen cast still names an older age and a low register. `docs/casting.md` has the details.
+
+---
+
+### The Breeze join levels each voice
+**Date:** 2026-11-09
+**Context:** AJ found a new Lorimor candidate quiet beside the other characters. A Breeze take comes out at the level of its voice's cast clip, the cast clips ran from -11 to -29 dB of active speech RMS, and the join leveled only the chapter as a whole. In chapter 17 the old Lorimor takes had a median of -12.6 dB against -26.1 dB for the narrator.
+**Decision:** `breeze_join.py` gives each voice one gain per chapter, which brings the median level of its takes to the chapter target of -18 dB. One gain per voice keeps the distance between a voice's loud and soft lines. The level comes from the chapter's takes and not from the cast clip, because an older chapter's takes can come from a clip that has since been recast. A voice with one or two lines in a chapter is leveled from those lines alone, so a single whispered line comes out at full level. The pauses to trim are found before the gains are applied, because a gain moves soft speech and room noise across the silence threshold.
 
 ---
 
@@ -117,10 +124,20 @@ existing entries for a conflict before adding one, and rewrite an entry when AJ 
 
 ---
 
+### A cast, a pick, a say-as or a voice effect starts beside a chapter job of its serial
+**Date:** 2026-11-08
+**Context:** A cast of eole and lorimor-ancitif sat queued behind the chapter 12 render on the Mac for over an hour while the laptop was idle, because every serial-wide job waited for any running job on its serial. AJ asked why a cast should ever wait for the Mac. A cast, a pick, a say-as or a voice effect writes `voices/`, the bible or `serial.yaml`, a render, screenplay or take check writes its chapter's files, and a cluster worker takes the voices, pronunciations and effects in its bundle when it starts, so neither changes a file the other sends back.
+**Decision:** On the cluster a cast, a voice pick, a say-as or a voice effect does not wait for a render, a screenplay or a take check of its serial, whether running, queued ahead of it, or waiting ahead of it in its lane. It waits only until a running chapter job has fetched its bundle, because the app builds the bundle outside its lock and a result landing during the build could tear it. A chapter job still waits for any of them, so "cast, then render" renders with the new voice, and a cast's briefs stage still waits for a running screenplay, because the app runs one Claude job at a time. The one-machine executor is unchanged. The rule first covered casts and picks, and AJ extended it to say-as and voice-effect the same day.
+
+---
+
 ## Not decided yet
 
 As of 2026-11-08:
 
+
 * Whether to re-render the chapters of The Hundred Reigns that use old voices. Chapters 1 to 6 are Drama 3 renders, so Louis and Lauriane sound different there, and they take about 85 minutes on the laptop. AJ was asked about them on 2026-11-07 and hasn't answered. Chapter 11 has the Keeper's old Qwen voice and chapter 12 has Lauriane's, because both were rendered before the recasts on 2026-11-08.
+* Whether to recast the other academy-age voices that were cast with aged-up Qwen briefs: simon, leonard-decarabia, meredith-dose, cassandra, antonine-de-shax and tiella-decarabia. Casval and Anna were recast with Breeze at their story age on 2026-11-09 (`docs/casting.md`), and AJ was asked about the rest that day.
+* Whether to render chapters 7, 8 and 10 of The Hundred Reigns again. They have the Qwen voices of Casval and Anna that AJ replaced on 2026-11-09, and they were joined before the join leveled each voice. AJ had finished them, so they were left alone.
 * How the library is backed up. `/opt/serial-audio/library` on containers' local disk has no backup, and silver has no backup job.
-* lorimor-ancitif and eole have no voices yet, so the narrator reads their lines in chapter 12, which was rendered on 2026-11-08. `docs/casting.md` has the planned briefs.
+* lorimor-ancitif and eole were cast on 2026-11-08 (Breeze seeds 17000 to 17002, 17000 filed with status auto for both) from the cached briefs, not the older, lower descriptions planned in `docs/casting.md`, and wait for AJ's pick or a recast. The narrator reads their lines in chapter 12, rendered before the cast, so it needs a render afterwards, which remakes only their 3 lines.

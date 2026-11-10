@@ -27,6 +27,7 @@ import urllib.request
 from pathlib import Path
 
 from .. import library as lib
+from ..breeze import reusable_takes
 from . import exchange
 from .jobs import FINISHED, ROOT, JobManager, now_iso, read_tail
 
@@ -37,6 +38,22 @@ GPU_CLASSES = {"breeze", "comfyui"}
 LLM_KINDS = {"character-pass", "screenplay"}
 COMFY_KINDS = {"pick-voice", "check-takes"}
 SERIAL_WIDE = {"character-pass", "cast", "reset-bible", "pick-voice", "fetch", "say-as", "voice-effect"}
+# serial-wide jobs that write only voices/, the bible and serial.yaml, which a chapter job took in its bundle
+CONFIG_WRITERS = {"cast", "pick-voice", "say-as", "voice-effect"}
+# jobs that write only their chapters' files
+CHAPTER_KINDS = {"render", "screenplay", "check-takes"}
+# seconds per Breeze take by GPU type, until a node's own render records give its rate
+RATE_DEFAULT = {"nvidia": 3.0, "metal": 18.0, "none": 60.0}
+RATE_MIN_TAKES = 20
+RATE_KEEP = 3
+TAKES_CACHE_SECONDS = 600.0
+STALE_LOG_SECONDS = 600.0
+JOIN_ESTIMATE = 90.0
+CHECK_PER_TAKE = 0.5
+# a cast candidate is about nine seconds of audio, two takes' worth
+CAST_TAKES = 2
+DEFAULT_LINES = 200
+WAIT_MARGIN = 120.0
 LLM_SLOTS = 1
 NODE_POLL = 15.0
 JOB_POLL = 5.0
@@ -159,6 +176,15 @@ def placement_wait(evals: list[dict]) -> str | None:
     return None
 
 
+def _mins(seconds: float) -> int:
+    return max(1, round(seconds / 60))
+
+
+def _overhead(lines: int) -> float:
+    """Seconds a Breeze render spends after its takes, joining and checking them."""
+    return JOIN_ESTIMATE + CHECK_PER_TAKE * lines
+
+
 def _touches(job: dict) -> tuple[str | None, set[int] | None]:
     """The serial a job works on and its chapters, or None for chapters when it affects the whole serial."""
     if job["kind"] in SERIAL_WIDE:
@@ -166,13 +192,21 @@ def _touches(job: dict) -> tuple[str | None, set[int] | None]:
     return job.get("slug"), set((job.get("meta") or {}).get("chapters") or [])
 
 
-def conflicts(a: dict, b: dict) -> bool:
-    """Whether two jobs must not run at the same time."""
-    slug_a, chapters_a = _touches(a)
-    slug_b, chapters_b = _touches(b)
-    if not slug_a or slug_a != slug_b:
+def conflicts(job: dict, other: dict) -> bool:
+    """Whether job must wait for other.
+
+    job: the job that would start, a record with kind, slug and meta.
+    other: a job that runs or was queued ahead of it.
+    Returns True when both work on one serial and either changes the whole serial or they share a chapter, except
+    that a CONFIG_WRITERS job never waits for a CHAPTER_KINDS job. Raises KeyError on a record without kind.
+    """
+    slug, chapters = _touches(job)
+    slug_other, chapters_other = _touches(other)
+    if not slug or slug != slug_other:
         return False
-    return chapters_a is None or chapters_b is None or bool(chapters_a & chapters_b)
+    if job["kind"] in CONFIG_WRITERS and other["kind"] in CHAPTER_KINDS:
+        return False
+    return chapters is None or chapters_other is None or bool(chapters & chapters_other)
 
 
 def _int_flag(args: list, flag: str) -> int | None:
@@ -244,6 +278,8 @@ class NomadJobManager(JobManager):
         self._io_lock = threading.Lock()
         self._in_flight: set[str] = set()
         self._picked: dict[str, tuple[str, str]] = {}
+        self._plan: dict[str, float] = {}
+        self._takes_cache: dict[str, tuple[float, int]] = {}
         super().__init__(**kwargs)
         self.media_dir = self.state_dir / "media"
         self.placement_file = self.state_dir / PLACEMENT_FILE
@@ -300,6 +336,9 @@ class NomadJobManager(JobManager):
             takes = f"chapters/{int(n):04d}/breeze_takes.json"
             if job["kind"] in ("render", "check-takes") and (success or takes in touched):
                 chapters[str(n)] = node
+            if success and job["kind"] == "render" and f"chapters/{int(n):04d}/chapter.yaml" in touched:
+                self._record_rate(slug, int(n), node)
+        self._takes_cache.clear()
         voices = self.placement.setdefault("voices", {}).setdefault(slug, {})
         for rel in touched:
             if rel.startswith("voices/") and rel.endswith(".yaml") and rel != "voices/_briefs.yaml":
@@ -552,6 +591,7 @@ class NomadJobManager(JobManager):
     def _finish(self, job: dict, status: str, note: str, code: int | None = None) -> None:
         job.update({"status": status, "finished": now_iso(), "note": note, "exit_code": code})
         job.pop("stopping", None)
+        self._takes_cache.clear()
         self._append_log(job, f"\n[web] {note}\n")
         if status != "done":
             self._skip_batch(job, f"an earlier job in the batch {status}")
@@ -563,12 +603,16 @@ class NomadJobManager(JobManager):
         running = [j for j in self.jobs.values() if j["status"] == "running"]
         queued = sorted((j for j in self.jobs.values() if j["status"] == "queued"), key=lambda j: j["seq"])
         self.wait_reasons = {}
+        self._plan = {}
         blocked: dict[str, dict] = {}
         changed = False
         for job in queued:
             lane = self.lane(job)
             first = blocked.get(lane)
-            reason = f"queued behind {first['title']}" if first else self._blocker_for(job, lane, running)
+            if first and lane not in GPU_CLASSES and (job["kind"] not in CONFIG_WRITERS or conflicts(job, first)):
+                reason = f"queued behind {first['title']}"
+            else:
+                reason = self._blocker_for(job, lane, running)
             if reason:
                 self.wait_reasons[job["id"]] = reason
                 blocked.setdefault(lane, job)
@@ -607,6 +651,10 @@ class NomadJobManager(JobManager):
                 wide = other["kind"] in SERIAL_WIDE or job["kind"] in SERIAL_WIDE
                 return f"waiting for {other['title']}" + (", which changes the whole serial" if wide else
                                                           ", which works on the same chapter")
+            # a chapter job reads the serial's files when it builds its bundle, not when it is dispatched
+            if (job["kind"] in CONFIG_WRITERS and job.get("slug") and other.get("slug") == job["slug"]
+                    and not (other.get("nomad") or {}).get("contact")):
+                return f"waiting for {other['title']} to fetch its bundle"
         if lane not in CLASSES:
             return None
         if not self.nomad.token:
@@ -636,8 +684,10 @@ class NomadJobManager(JobManager):
         """The node and class a GPU job runs on, as (node, class, None), or (None, None, why it waits).
 
         A node runs one GPU job at a time. A job that needs a node's files gets that node, and may switch to the
-        other GPU class when that node offers only that one. Otherwise the holder of the files, then an NVIDIA
-        node, comes first among the free ones, except that a Breeze cast takes a node without ComfyUI first.
+        other GPU class when that node offers only that one. Any other job goes to the ready node where its
+        estimated finish is earliest, counting the node's running job and the queued jobs already waiting for it,
+        and waits for a busy node when that beats every free one by WAIT_MARGIN. A job that waits adds its estimate
+        to the node's timeline for the rest of the pass.
         """
         busy = {j["nomad"].get("target") or j["nomad"].get("node") for j in running
                 if j.get("nomad") and self.lane(j) in GPU_CLASSES}
@@ -650,6 +700,7 @@ class NomadJobManager(JobManager):
             if not w["ready"]:
                 return None, None, f"waiting for {need}: {_why_not(w)}"
             if holder in busy:
+                self._plan[holder] = self._plan.get(holder, 0.0) + self._duration(job, holder, holder)
                 return None, None, f"waiting for {need} and is running another GPU job"
             cls = lane if lane in w["classes"] else next((c for c in ("comfyui", "breeze") if c in w["classes"]), None)
             if cls is None:
@@ -661,14 +712,130 @@ class NomadJobManager(JobManager):
         ready = [w for w in offering if w["ready"]]
         if not ready:
             return None, None, f"no {lane} node is ready: " + ", ".join(_why_not(w) for w in offering)
-        free = [w for w in ready if w["name"] not in busy]
-        if not free:
-            return None, None, f"waiting for a free {lane} node ({', '.join(w['name'] for w in ready)} busy)"
-        # the ComfyUI node has no Parakeet, so it checks cast candidates with Qwen3-ASR, which needs ComfyUI up
-        own_check = job["kind"] == "cast" and lane == "breeze"
-        free.sort(key=lambda w: (w["name"] != holder, own_check and "comfyui" in w["classes"],
-                                 w.get("gpu") != "nvidia", w["name"]))
-        return free[0]["name"], lane, None
+        free = {w["name"]: self._free_at(w["name"], running) for w in ready}
+        est = {w["name"]: free[w["name"]] + self._duration(job, w["name"], holder) for w in ready}
+        order = [w["name"] for w in sorted(ready, key=lambda w: (est[w["name"]], w.get("gpu") != "nvidia", w["name"]))]
+        best = order[0]
+        if best not in busy:
+            return best, lane, None
+        idle = [name for name in order if name not in busy]
+        if idle and est[best] + WAIT_MARGIN > est[idle[0]]:
+            return idle[0], lane, None
+        self._plan[best] = self._plan.get(best, 0.0) + self._duration(job, best, holder)
+        if idle:
+            return None, None, (f"waiting for {best}, about {_mins(est[best])} min, instead of about "
+                                f"{_mins(est[idle[0]])} min on {idle[0]} now")
+        others = ", ".join(sorted(name for name in order if name in busy and name != best))
+        return None, None, (f"waiting for {best}, about {_mins(est[best])} min"
+                            + (f" ({others} busy too)" if others else ""))
+
+    def _free_at(self, node: str, running: list[dict]) -> float:
+        """Seconds until node can take a job: its running GPU job's remaining estimate, plus the queued jobs that
+        chose to wait for it earlier in this pass."""
+        mine = [self._remaining(j) for j in running if j.get("nomad") and self.lane(j) in GPU_CLASSES
+                and (j["nomad"].get("target") or j["nomad"].get("node")) == node]
+        return max(mine, default=0.0) + self._plan.get(node, 0.0)
+
+    def _remaining(self, job: dict) -> float:
+        """Seconds a running job is estimated to keep its node.
+
+        job: a running job record.
+        Returns the progress log's ETA plus the check still to come, the full estimate when the log has no ETA yet,
+        and a day when the log has not changed for STALE_LOG_SECONDS, so no job waits for a node that may be hung.
+        """
+        n = job.get("nomad") or {}
+        node = n.get("target") or n.get("node") or ""
+        try:
+            p = self.progress(job) if job.get("status") == "running" else None
+        except OSError:
+            p = None
+        if not p or p.get("eta") is None:
+            holder = self.holder(job)[0] if job["kind"] == "render" else None
+            return self._duration(job, node, holder)
+        try:
+            mtime = self.log_path(job).stat().st_mtime
+        except (OSError, KeyError, TypeError):
+            mtime = None
+        if mtime and time.time() - mtime > STALE_LOG_SECONDS:
+            return 86400.0
+        eta = float(p["eta"])
+        if job["kind"] == "render" and p.get("phase") not in ("checking", "done"):
+            eta += 30 + CHECK_PER_TAKE * ((job.get("meta") or {}).get("lines") or DEFAULT_LINES)
+        return eta
+
+    def _duration(self, job: dict, node: str, holder: str | None) -> float:
+        """Seconds a job is estimated to take on node.
+
+        job: the job record, whose meta gives its lines, engine, candidates and characters.
+        node: the node it would run on.
+        holder: the node that holds its saved takes, or None.
+        Returns the estimate. A Breeze render on its holder counts only the takes the holder lacks.
+        """
+        meta = job.get("meta") or {}
+        lines = meta.get("lines") or DEFAULT_LINES
+        rate = self._rate(node)
+        kind = job["kind"]
+        if kind == "render":
+            if meta.get("decode_only"):
+                return JOIN_ESTIMATE
+            takes = self._takes_needed(job, lines) if meta.get("engine") == "breeze" and node == holder else lines
+            return takes * rate + _overhead(lines)
+        if kind == "check-takes":
+            return 30 + CHECK_PER_TAKE * lines
+        if kind == "cast":
+            count = (meta.get("candidates") or 3) * (len(meta.get("characters") or []) or 3)
+            return 60 + count * CAST_TAKES * rate
+        if kind == "pick-voice":
+            return 15.0
+        return 120.0
+
+    def _takes_needed(self, job: dict, lines: int) -> int:
+        """The takes a Breeze render would make on the node that holds its saved takes.
+
+        job: the render job.
+        lines: the chapter's line count, which is the answer when the count cannot be worked out, so an unknown
+            reuse never sends a render to the slow node.
+        Returns the count, cached per job until a job finishes or TAKES_CACHE_SECONDS pass.
+        """
+        meta = job.get("meta") or {}
+        if not meta.get("chapters"):
+            return lines
+        cached = self._takes_cache.get(job.get("id") or "")
+        if cached and time.time() - cached[0] < TAKES_CACHE_SECONDS:
+            return cached[1]
+        try:
+            seed = _int_flag(list(job.get("args") or []), "--seed")
+            reused, spoken = reusable_takes(job["slug"], int(meta["chapters"][0]), 1 if seed is None else seed,
+                                            meta.get("runner"))
+            needed = spoken - reused
+        except Exception:
+            needed = lines
+        if job.get("id"):
+            self._takes_cache[job["id"]] = (time.time(), needed)
+        return needed
+
+    def _rate(self, node: str) -> float:
+        """Seconds per Breeze take on node: the mean of the rates recorded for it, else RATE_DEFAULT for its GPU type."""
+        recorded = [v for v in ((self.placement.get("rates") or {}).get(node) or [])
+                    if isinstance(v, (int, float)) and v > 0]
+        if recorded:
+            return sum(recorded) / len(recorded)
+        w = next((w for w in self.workers if w["name"] == node), None)
+        return RATE_DEFAULT.get((w or {}).get("gpu") or "none", RATE_DEFAULT["none"])
+
+    def _record_rate(self, slug: str, n: int, node: str) -> None:
+        """Adds a finished render's seconds per take to the last RATE_KEEP recorded for node. Never raises."""
+        try:
+            meta = lib.load_yaml(lib.chapter_dir(slug, n) / "chapter.yaml", {}) or {}
+            r = meta.get("render") if isinstance(meta.get("render"), dict) else {}
+            takes, secs = int(r.get("generated_takes") or 0), float(r.get("generate_seconds") or 0)
+            if r.get("engine") != "breeze" or r.get("runner") != "cpp" or takes < RATE_MIN_TAKES or secs <= 0:
+                return
+        except Exception:
+            return
+        rates = self.placement.setdefault("rates", {}).setdefault(node, [])
+        rates.append(round(secs / takes, 3))
+        del rates[:-RATE_KEEP]
 
     # Dispatch
 

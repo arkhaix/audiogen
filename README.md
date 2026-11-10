@@ -96,8 +96,7 @@ its override removes the entry.
    gets a narrator, cast first as the voice `narrator` from the blurb, tags, and opening of chapter 1
    (set `narrator_brief` in `serial.yaml` to steer it). Recurring characters who have not spoken yet
    are cast once they do. With `cast_engine: qwen` in `serial.yaml`, or `--engine qwen`, ComfyUI makes the
-   candidates with Qwen3-TTS Voice Design instead and encodes each as a Drama 3 voice. On the cluster a
-   Breeze cast takes a node without ComfyUI first, because that node checks the candidates with Parakeet.
+   candidates with Qwen3-TTS Voice Design instead and encodes each as a Drama 3 voice.
 4. `screenplay` turns the chapter into ordered lines with speakers and sparse directions, verbatim
    apart from speech normalizations; a coverage check guards against dropped text; status `scripted`.
 5. `render` maps speakers to Drama 3 slots (narrator = 0, unvoiced speakers read by the narrator),
@@ -121,9 +120,10 @@ its override removes the entry.
    `--redo` transcribes everything again. A take the length guard kept out of range is listed beside the flagged ones.
    The recognizer is Parakeet TDT 0.6B v2 through sherpa-onnx when its model folder exists
    (`SERIAL_AUDIO_PARAKEET_MODEL`), and Qwen3-ASR in ComfyUI otherwise. `--asr` or `SERIAL_AUDIO_ASR` picks one.
-   `docs/machines.md` has the Parakeet install on the Mac.
+   `docs/machines.md` has the Parakeet install on the Mac and on the laptop.
    `breeze_join.py` joins them under the audio Python, which is ComfyUI's embedded Python on the laptop, applies voice effects, and matches the loudness
-   of the Drama 3 chapters. Before the join, each take's clicks are filled in from the audio around them, and each
+   of the Drama 3 chapters. It gives each voice one gain, so that the median take of every voice in the chapter sits
+   at the same level, because a Breeze take comes out at the level of its voice's cast clip. Before the join, each take's clicks are filled in from the audio around them, and each
    take fades in and out over 3 ms, because Breeze sometimes starts a take at full level on its first sample. The
    chapter's `render.clicks_filled` counts the clicks filled in.
 

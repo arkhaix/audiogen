@@ -233,6 +233,16 @@ def fade_edges(x: np.ndarray, sr: int) -> np.ndarray:
 
 def trim_pauses(x: np.ndarray, sr: int) -> np.ndarray:
     """drama3/audio.py trim_pauses on mono audio: no silence before the first sound, pauses cut to MAX_PAUSE, TAIL at the end."""
+    return np.concatenate([x[start:end] for start, end in pause_pieces(x, sr)])
+
+
+def pause_pieces(x: np.ndarray, sr: int) -> list[tuple[int, int]]:
+    """The sample ranges of mono audio that trim_pauses keeps, in order.
+
+    x: mono audio.
+    sr: its sample rate.
+    Returns [(start, end), ...]. All of x when it has no sound.
+    """
     window = max(1, int(SILENCE_WINDOW * sr))
     count = -(-len(x) // window)
     padded = np.pad(x, (0, count * window - len(x)))
@@ -241,7 +251,7 @@ def trim_pauses(x: np.ndarray, sr: int) -> np.ndarray:
     sizes[-1] = len(x) - (count - 1) * window
     quiet = np.sqrt(sums / sizes) < SILENCE_RMS
     if quiet.all():
-        return x
+        return [(0, len(x))]
     pieces, held, started = [], 0, False
     for index, silent in enumerate(quiet):
         start = index * window
@@ -255,7 +265,7 @@ def trim_pauses(x: np.ndarray, sr: int) -> np.ndarray:
             held += keep
     last = int(np.nonzero(~quiet)[0][-1])
     limit = (last + 1) * window + int(TAIL * sr)
-    return np.concatenate([x[start:min(end, limit)] for start, end in pieces if start < limit])
+    return [(start, min(end, limit)) for start, end in pieces if start < limit]
 
 
 def apply(job: dict) -> dict:

@@ -58,7 +58,18 @@ fingerprint before the node shows ready.
 
 ### Parakeet
 
-The laptop has no Parakeet, so its checks need ComfyUI and Qwen3-ASR.
+Since 2026-11-08 the laptop checks takes and casting candidates with Parakeet, so its checks no longer need ComfyUI.
+sherpa-onnx 2.0.0 and sherpa-onnx-core 2.0.0 are pip-installed in the embedded Python. The model is in
+`D:\comfy\models\parakeet-tdt-0.6b-v2-int8`, the default `SERIAL_AUDIO_PARAKEET_MODEL`, so the node config sets
+nothing. It was copied from the Mac, and its sha256 hashes match:
+
+* `encoder.int8.onnx`: a32b12d17bbbc309d0686fbbcc2987b5e9b8333a7da83fa6b089f0a2acd651ab
+* `decoder.int8.onnx`: b6bb64963457237b900e496ee9994b59294526439fbcc1fecf705b31a15c6b4e
+* `joiner.int8.onnx`: 7946164367946e7f9f29a122407c3252b680dbae9a51343eb2488d057c3c43d2
+* `tokens.txt`: ec182b70dd42113aff6c5372c75cac58c952443eb22322f57bbd7f53977d497d
+
+To check that it runs, transcribe a few takes with `serial_audio.asr.transcripts(files, engine="parakeet",
+comfy_url="")`. Three takes took 4.8 s, including the model load.
 
 ---
 

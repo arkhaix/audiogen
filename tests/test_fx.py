@@ -1,4 +1,4 @@
-"""Tests for the click repair and edge fades in fx.py and breeze_join.py. They need the audio Python, which has numpy,
+"""Tests for the click repair, edge fades and voice leveling in fx.py and breeze_join.py. They need the audio Python, which has numpy,
 scipy, librosa and soundfile, and are skipped elsewhere. Run: <audio python> -I tests/test_fx.py"""
 from __future__ import annotations
 
@@ -131,6 +131,50 @@ class JoinTest(unittest.TestCase):
             ends = [i for i in range(1000, len(out)) if silent[i - 1] and not silent[i] and silent[i - 1000:i].all()]
             self.assertEqual(len(ends), 1)
             self.assertLess(abs(out[ends[0]]), 0.01)
+
+    def test_join_levels_each_voice_and_keeps_its_dynamics(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # A loud voice with one line 6 dB over its median, then a quiet voice 12 dB below that median
+            scales = [("loud", 4.0), ("loud", 2.0), ("loud", 2.0), ("quiet", 0.5), ("quiet", 0.5), ("quiet", 0.5)]
+            takes = []
+            for i, (name, scale) in enumerate(scales):
+                path = str(Path(tmp) / f"l{i:04d}.wav")
+                sf.write(path, voice(1.0, seed=10 + i) * np.float32(scale), SR)
+                takes.append({"line": i, "file": path, "voice": name, "effect": None})
+            job = {"output": str(Path(tmp) / "out.wav"), "cap_seconds": 120, "takes": takes}
+
+            # The summary gives the quiet voice 12 dB more gain than the loud one
+            summary = breeze_join.join(json.loads(json.dumps(job)))
+            gains = summary["voice_gains"]
+            self.assertAlmostEqual(gains["quiet"] - gains["loud"], 12.0, delta=0.3)
+
+            # Both voices' median lines come out at one level, and the loud voice's loud line stays 6 dB over them
+            out, sr = sf.read(job["output"], dtype="float32")
+            sound = np.nonzero(np.abs(out) > 1e-6)[0]
+            starts = [sound[0]] + [b for a, b in zip(sound, sound[1:]) if b - a > 1000]
+            self.assertEqual(len(starts), 6)
+            db = [20 * np.log10(np.sqrt((out[s + SR // 4: s + 3 * SR // 4] ** 2).mean())) for s in starts]
+            for i in (2, 3, 4, 5):
+                self.assertAlmostEqual(db[i], db[1], delta=0.5)
+            self.assertAlmostEqual(db[0] - db[1], 6.0, delta=0.5)
+
+    def test_a_voice_gain_does_not_change_which_pauses_are_cut(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # A loud voice whose 2 s soft line is above the silence threshold before its -7 dB gain and below it after
+            takes = []
+            for i, (seconds, scale) in enumerate(((1.0, 8.0), (2.0, 0.1), (1.0, 8.0), (1.0, 8.0))):
+                path = str(Path(tmp) / f"l{i:04d}.wav")
+                sf.write(path, voice(seconds, seed=20 + i) * np.float32(scale), SR, subtype="FLOAT")
+                takes.append({"line": i, "file": path, "voice": "loud", "effect": None})
+            job = {"output": str(Path(tmp) / "out.wav"), "cap_seconds": 120, "takes": takes}
+            soft, _ = sf.read(takes[1]["file"], dtype="float32")
+            self.assertGreater(np.sqrt((soft ** 2).mean()), fx.SILENCE_RMS)
+            summary = breeze_join.join(json.loads(json.dumps(job)))
+            self.assertLess(summary["voice_gains"]["loud"], -5.0)
+            self.assertLess(np.sqrt((soft ** 2).mean()) * 10 ** (summary["voice_gains"]["loud"] / 20), fx.SILENCE_RMS)
+
+            # The soft line is kept whole: 5 s of takes and three 0.3 s gaps
+            self.assertAlmostEqual(summary["seconds"], 5.9, delta=0.1)
 
 
 if __name__ == "__main__":

@@ -103,14 +103,18 @@ packs.
 5. Stop in the app asks the worker to stop. It kills the CLI within a few seconds, cancels the job's ComfyUI prompts and reports. A job no node has started yet is cancelled at once, and its dispatch exits as soon as a node starts it. A dispatch that fails or times out is tried again with the same idempotency token, so Nomad never runs it twice.
 
 Jobs on different chapters, serials or nodes run at the same time. Jobs on the same chapter wait for each other, and
-so does any job beside one that changes a whole serial (the character pass, a cast, picking a voice, fetching). The
-app runs one Claude job at a time. A laptop that sleeps through part of a render has 2 hours to come back before Nomad
+so does any job beside one that changes a whole serial (the character pass, a cast, picking a voice, fetching), with
+one exception: a cast, a voice pick, a say-as or a voice effect starts beside a running render, screenplay or take
+check of its serial once that job has fetched its bundle, because it writes no chapter file and the bundle holds the
+chapter job's copy of the voices, pronunciations and effects. It also passes a chapter job that waits ahead of it in
+its lane. A render queued after one of them still waits for it, and a cast's briefs stage still waits for a running
+screenplay, because the app runs one Claude job at a time. A laptop that sleeps through part of a render has 2 hours to come back before Nomad
 gives the allocation up.
 
 The app picks the node for a GPU job, one GPU job per node:
 
 * A join, a take check and picking a voice need files that live on one node, so they run there and wait for it. A take check or a pick on a node without ComfyUI runs as a `breeze` job.
-* A render goes to the node that holds its saved takes when that node is free, so it reuses them. Otherwise it takes a free NVIDIA node, then any free node.
+* Any other GPU job goes to the ready node where its estimated finish is earliest. The estimate is the node's running job's remaining time, from its progress log, plus the queued jobs already waiting for that node, plus the job itself: its takes times the node's seconds per take, the mean of the last three Breeze renders of twenty takes or more that finished on that node, kept in `placement.json` (3 s for NVIDIA and 18 s for Metal until then), counting only the takes the holder lacks, plus the join and the check. A render whose reuse cannot be worked out is costed at all its takes. The job waits for a busy node when that beats every free node by two minutes or more, and its wait reason shows both estimates. A node whose running job's log has not changed for ten minutes counts as busy for a day, so nothing waits for it. A GPU job does not wait behind a blocked job in its lane.
 * The app records the node of each chapter's takes and each voice's candidates in `state/placement.json` as results come back. For a chapter or voice from before that record, it reads the node from the path style of its files, which works while one node runs each OS.
 
 The static port 19137 that GPU jobs reserve doesn't keep them apart, because Nomad checks it per address and the
@@ -137,5 +141,5 @@ python -m unittest tests.test_cluster
 python tests/e2e_fake_nomad.py
 ```
 
-The second test copies the code and one serial into a temporary folder and runs the app against a fake Nomad that
-starts `bootstrap.py` as a local process for each dispatch.
+The second test copies the code into a temporary folder, writes a one-chapter serial there, and runs the app against
+a fake Nomad that starts `bootstrap.py` as a local process for each dispatch. Neither test needs a library.

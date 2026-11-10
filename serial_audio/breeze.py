@@ -445,6 +445,66 @@ def choose_runner(serial: dict, last: dict | None, *, join_only: bool = False, r
     return runner
 
 
+def take_model(runner: str) -> str:
+    """The model name that a runner's takes record and that their keys include."""
+    return MODEL if runner == "comfyui" else f"cpp:{CPP_MODEL.name}"
+
+
+def plan_takes(lines: list[dict], speaker_slot: dict, slot_voice: dict, say: dict, seed: int,
+               ref_sha1: dict[str, str], runner: str) -> list[tuple]:
+    """The take each script line needs, in script order, as (line, voice, text, direction, voice seed, key).
+
+    lines: the script lines.
+    speaker_slot: speaker -> slot, from plan_slots.
+    slot_voice: slot -> voice id, from plan_slots.
+    say: the bible's say-as map.
+    seed: the render's base seed.
+    ref_sha1: voice id -> the sha1 of its cast clip.
+    runner: "cpp" or "comfyui".
+    Returns one entry per line. A saved take with the same key can stand in for a new one.
+    """
+    model, controls = take_model(runner), CONTROLS if runner == "comfyui" else CPP_FIELDS
+    plan = []
+    for i, line in enumerate(lines):
+        voice = slot_voice[speaker_slot[line["speaker"]]]
+        text = speakable(apply_say_as(line["text"], say))
+        direction = " ".join((line.get("direction") or "").split())
+        vseed = voice_seed(seed, voice)
+        parts = dict(text=text, voice=voice, ref=ref_sha1[voice], direction=direction, seed=vseed,
+                     model=model, controls=controls, clone_cfg=CLONE_CFG, direction_cfg=DIRECTION_CFG)
+        if runner != "comfyui":
+            parts["runner"] = runner
+        plan.append((i, voice, text, direction, vseed, take_key(**parts)))
+    return plan
+
+
+def reusable_takes(slug: str, number: int, seed: int, runner: str | None = None) -> tuple[int, int]:
+    """How many of a chapter's spoken lines a render could take from its saved takes, and how many it speaks.
+
+    slug: the serial.
+    number: the chapter.
+    seed: the render's base seed.
+    runner: "cpp" or "comfyui". None picks it the way a render does.
+    Returns (reusable, spoken). Reads only the library, so a take counts when its key matches, even if its file is
+    gone from the node that made it. Raises when the chapter cannot be planned, for example when it has no script.
+    """
+    serial = lib.load_serial(slug)
+    meta, _ = lib.load_chapter(slug, number)
+    folder = lib.chapter_dir(slug, number)
+    lines = lib.load_json(folder / "script.json")["lines"]
+    bible = lib.load_bible(slug)
+    speaker_slot, slot_voice, _ = plan_slots(serial, bible, lines)
+    runner = choose_runner(serial, meta.get("render") if isinstance(meta.get("render"), dict) else {}, runner=runner)
+    vdir = lib.serial_dir(slug) / "voices"
+    ref_sha1 = {v: hashlib.sha1((vdir / (lib.load_yaml(vdir / f"{v}.yaml") or {})["clip"]).read_bytes()).hexdigest()
+                for v in set(slot_voice.values())}
+    plan = plan_takes(lines, speaker_slot, slot_voice, say_as_map(bible), seed, ref_sha1, runner)
+    takes_path = folder / TAKES_FILE
+    saved = (lib.load_json(takes_path).get("takes") or {}) if takes_path.exists() else {}
+    spoken = [p for p in plan if re.search(r"\w", p[2])]
+    return sum(1 for p in spoken if (saved.get(str(p[0])) or {}).get("key") == p[5]), len(spoken)
+
+
 def render_breeze(slug: str, number: int, *, seed: int = 1, comfy_url: str = "http://127.0.0.1:8188", log=print,
                   join_only: bool = False, runner: str | None = None) -> dict:
     """Renders a chapter with Breeze TTS 2 to audio/chNNNN.opus and marks it rendered.
@@ -487,21 +547,10 @@ def render_breeze(slug: str, number: int, *, seed: int = 1, comfy_url: str = "ht
     takes_path = folder / TAKES_FILE
     saved = load_takes(takes_path, log)
     refs = stage_references(slug, set(slot_voice.values()), runner)
-    model = MODEL if runner == "comfyui" else f"cpp:{CPP_MODEL.name}"
-    controls = CONTROLS if runner == "comfyui" else CPP_FIELDS
+    model = take_model(runner)
 
     # Plan
-    plan = []
-    for i, line in enumerate(lines):
-        voice = slot_voice[speaker_slot[line["speaker"]]]
-        text = speakable(apply_say_as(line["text"], say))
-        direction = " ".join((line.get("direction") or "").split())
-        vseed = voice_seed(seed, voice)
-        parts = dict(text=text, voice=voice, ref=refs[voice]["sha1"], direction=direction, seed=vseed,
-                     model=model, controls=controls, clone_cfg=CLONE_CFG, direction_cfg=DIRECTION_CFG)
-        if runner != "comfyui":
-            parts["runner"] = runner
-        plan.append((i, voice, text, direction, vseed, take_key(**parts)))
+    plan = plan_takes(lines, speaker_slot, slot_voice, say, seed, {v: r["sha1"] for v, r in refs.items()}, runner)
     spoken = [p for p in plan if re.search(r"\w", p[2])]
 
     def usable(p) -> bool:
@@ -607,7 +656,8 @@ def render_breeze(slug: str, number: int, *, seed: int = 1, comfy_url: str = "ht
     out_dir.mkdir(parents=True, exist_ok=True)
     src = out_dir / f"{stem}_breeze{AUDIO_SUFFIX}"
     job = {"output": str(src), "cap_seconds": MAX_TAKE_SECONDS,
-           "takes": [{"line": i, "file": saved[str(i)]["file"], "effect": effects.get(voice)} for i, voice, *_ in spoken]}
+           "takes": [{"line": i, "file": saved[str(i)]["file"], "voice": voice, "effect": effects.get(voice)}
+                     for i, voice, *_ in spoken]}
     job_path = folder / "breeze_join_job.json"
     lib.save_json(job_path, job)
     done = subprocess.run([str(COMFY_PYTHON), "-I", str(JOIN_SCRIPT), str(job_path)], capture_output=True, text=True)
@@ -622,6 +672,8 @@ def render_breeze(slug: str, number: int, *, seed: int = 1, comfy_url: str = "ht
         f"{summary.get('clicks', 0)} clicks filled in")
     if summary.get("capped"):
         log(f"   warning: lines {summary['capped']} reached the {MAX_TAKE_SECONDS} s take limit and may be cut off")
+    if summary.get("voice_gains"):
+        log("   voice gains in dB: " + ", ".join(f"{v} {g:+.1f}" for v, g in summary["voice_gains"].items()))
 
     # Record
     meta["render"] = {"engine": "breeze", "runner": runner, "model": model, "takes_file": TAKES_FILE,

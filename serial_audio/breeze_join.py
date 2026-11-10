@@ -1,8 +1,8 @@
 """Join a chapter's Breeze TTS 2 takes into one audio file.
 
 Run as `python -I breeze_join.py <job.json>` under ComfyUI's embedded Python, which has numpy and soundfile.
-The job is {"output": path, "cap_seconds": s, "takes": [{"line": n, "file": path, "effect": spec or null}, ...]}
-with the takes in script order. Prints a JSON summary on its last line.
+The job is {"output": path, "cap_seconds": s, "takes": [{"line": n, "file": path, "voice": id, "effect": spec or
+null}, ...]} with the takes in script order. Prints a JSON summary on its last line.
 """
 from __future__ import annotations
 
@@ -34,24 +34,53 @@ def edges(x: np.ndarray, sr: int) -> np.ndarray:
     return x[loud[0] * w: (loud[-1] + 1) * w]
 
 
-def level(x: np.ndarray, sr: int) -> np.ndarray:
-    """x with its active speech at TARGET_DB RMS, the Drama 3 chapters' level, and peaks bent under full scale."""
+def active_db(x: np.ndarray, sr: int) -> float | None:
+    """The RMS of the active speech in dB.
+
+    x: mono audio.
+    sr: its sample rate.
+    Returns the level, or None when x has no active speech.
+    """
     rms = windows_rms(x, sr)
     active = rms[rms >= fx.SILENCE_RMS]
     if active.size == 0:
+        return None
+    return float(10 * np.log10((active ** 2).mean()))
+
+
+def level(x: np.ndarray, sr: int) -> np.ndarray:
+    """x with its active speech at TARGET_DB RMS, the Drama 3 chapters' level, and peaks bent under full scale."""
+    db = active_db(x, sr)
+    if db is None:
         return x
-    return fx.soft_limit(x * (10 ** (TARGET_DB / 20) / np.sqrt((active ** 2).mean())))
+    return fx.soft_limit(x * 10 ** ((TARGET_DB - db) / 20))
+
+
+def voice_gains(levels: list[tuple[str | None, float | None]]) -> dict[str, float]:
+    """The gain in dB that brings each voice's median take to TARGET_DB.
+
+    levels: one (voice, active_db) per take. A take with no voice or no active speech is not counted.
+    Returns voice -> gain in dB.
+    """
+    by_voice: dict[str, list[float]] = {}
+    for voice, db in levels:
+        if voice and db is not None:
+            by_voice.setdefault(voice, []).append(db)
+    return {voice: TARGET_DB - float(np.median(dbs)) for voice, dbs in by_voice.items()}
 
 
 def join(job: dict) -> dict:
     """Writes job["output"] from the takes.
 
     job: the output path, the take length limit in seconds, and the takes in script order.
-    Each take has its clicks filled in and fades in and out at its trimmed edges.
-    Returns {"takes", "treated_lines", "raw_seconds", "seconds", "sample_rate", "capped", "clicks"}, where capped
-    lists the lines whose take reached the length limit and clicks counts the clicks filled in.
+    Each take has its clicks filled in and fades in and out at its trimmed edges. Each voice gets one gain that
+    brings its median take to TARGET_DB. A take without a voice gets no voice gain.
+    Returns {"takes", "treated_lines", "raw_seconds", "seconds", "sample_rate", "capped", "clicks", "voice_gains"},
+    where capped lists the lines whose take reached the length limit, clicks counts the clicks filled in and
+    voice_gains maps each voice to its gain in dB.
     """
-    parts, sr, treated, capped, clicks = [], None, 0, [], 0
+    # Read and repair each take
+    cleaned, sr, treated, capped, clicks = [], None, 0, [], 0
     cap = float(job.get("cap_seconds") or 0)
     for take in job["takes"]:
         audio, rate = sf.read(take["file"], dtype="float32", always_2d=True)
@@ -69,14 +98,26 @@ def join(job: dict) -> dict:
             wet = fx.whisper_effect(x, sr, np.random.default_rng(take["line"]), voice=float(spec.get("voice", 0.35)))
             x = wet * np.sqrt(np.mean(x ** 2)) / (np.sqrt(np.mean(wet[: len(x)] ** 2)) + 1e-9)
             treated += 1
-        parts += [fx.fade_edges(x, sr), np.zeros(round(fx.TAKE_GAP * sr), dtype=np.float32)]
-    if not parts:
+        cleaned.append((take.get("voice"), x))
+    if not cleaned:
         raise SystemExit("no takes to join")
+
+    # Level each voice
+    gains = voice_gains([(voice, active_db(x, sr)) for voice, x in cleaned])
+    gap = round(fx.TAKE_GAP * sr)
+    parts, factors = [], []
+    for voice, x in cleaned:
+        parts += [fx.fade_edges(x, sr), np.zeros(gap, dtype=np.float32)]
+        factors += [np.full(len(x), 10 ** (gains.get(voice, 0.0) / 20), dtype=np.float32), np.ones(gap, dtype=np.float32)]
+
+    # Join and level the chapter. The pauses are found before the gains, which would move speech across the threshold.
     raw = np.concatenate(parts[:-1])
-    final = level(fx.trim_pauses(raw, sr), sr)
+    gained = raw * np.concatenate(factors[:-1])
+    final = level(np.concatenate([gained[start:end] for start, end in fx.pause_pieces(raw, sr)]), sr)
     fx.write_audio(job["output"], final, sr)
     return {"takes": len(job["takes"]), "treated_lines": treated, "raw_seconds": round(len(raw) / sr, 2),
-            "seconds": round(len(final) / sr, 2), "sample_rate": sr, "capped": capped, "clicks": clicks}
+            "seconds": round(len(final) / sr, 2), "sample_rate": sr, "capped": capped, "clicks": clicks,
+            "voice_gains": {voice: round(db, 1) for voice, db in sorted(gains.items())}}
 
 
 if __name__ == "__main__":
