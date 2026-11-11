@@ -369,8 +369,8 @@ def voices(slug: str) -> dict:
                    if vid in ((_chapter_meta(slug, n).get("render") or {}).get("slots") or {}).values()]
         out.append({**rec, "name": "Narrator" if vid == NARRATOR_ID else c.get("name") or vid,
                     "importance": "narrator" if vid == NARRATOR_ID else c.get("importance"),
-                    "role": c.get("role"), "description": c.get("description"),
-                    "voice_brief": c.get("voice_brief"), "chapters": len(c.get("chapters_present") or []),
+                    "role": c.get("role"), "description": c.get("description"), "bio": c.get("bio"),
+                    "in_bible": bool(c), "voice_brief": c.get("voice_brief"), "chapters": len(c.get("chapters_present") or []),
                     "media": lib_media(clip) if rec.get("clip") else None,
                     "candidates": _with_media(rec.get("candidates")), "history": history,
                     "effect": (serial.get("voice_effects") or {}).get(vid), "rendered_in": used_in})
@@ -383,7 +383,7 @@ def voices(slug: str) -> dict:
         uncast.append({"id": cid, "name": c.get("name"), "importance": c.get("importance"),
                        "speaks": c.get("speaks", True), "chapters": len(c.get("chapters_present") or []),
                        "first_seen": c.get("first_seen"), "last_seen": c.get("last_seen"), "role": c.get("role"),
-                       "voice_brief": c.get("voice_brief"),
+                       "bio": c.get("bio"), "voice_brief": c.get("voice_brief"),
                        "policy": c.get("importance") in policy and c.get("speaks", True),
                        "brief": briefs.get(cid)})
     uncast.sort(key=lambda u: (not u["policy"], IMPORTANCE_ORDER.get(u["importance"], 9), -(u["chapters"] or 0)))

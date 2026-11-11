@@ -276,6 +276,18 @@ def cmd_cast(args) -> int:
     return 0
 
 
+def cmd_bios(args) -> int:
+    from .casting import write_bios
+    only = [s.strip() for s in args.characters.split(",") if s.strip()] if args.characters else None
+    try:
+        write_bios(args.slug, only=only, redo=args.redo, backend=args.backend, model=args.model, effort=args.effort,
+                   on_limit=args.on_limit)
+    except LLMError as e:
+        print(f"bios: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_voices(args) -> int:
     folder = lib.serial_dir(args.slug) / "voices"
     for path in sorted(folder.glob("*.yaml")):
@@ -358,6 +370,8 @@ def cmd_bible(args) -> int:
         if args.verbose:
             print(f"    aliases: {', '.join(c.get('aliases') or [])}")
             print(f"    role: {c['role']}")
+            if c.get("bio"):
+                print(f"    bio: {c['bio']}")
             print(f"    voice: {c['voice_brief']}")
     if bible["pronunciations"]:
         print("pronunciations: " + ", ".join(
@@ -469,6 +483,17 @@ def main(argv=None) -> int:
                    help="the recognizer that scores the candidates. Default: SERIAL_AUDIO_ASR, else parakeet when "
                         "its model is installed, else qwen3")
     p.set_defaults(fn=cmd_cast)
+
+    p = sub.add_parser("bios", help="write the casting bio of each voiced character that doesn't have one: who "
+                                    "they are, without the plot")
+    p.add_argument("slug")
+    p.add_argument("--characters", help="comma-separated ids (default: every character that has a voice)")
+    p.add_argument("--redo", action="store_true", help="write a bio again where the character already has one")
+    p.add_argument("--backend", choices=["auto", "subscription", "api"], default="auto")
+    p.add_argument("--model", choices=["opus", "sonnet", "haiku"], default="opus")
+    p.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
+    p.add_argument("--on-limit", choices=["api", "wait", "fail"], default="api")
+    p.set_defaults(fn=cmd_bios)
 
     p = sub.add_parser("screenplay", help="run the screenplay pass over chapters (text -> script.json)")
     p.add_argument("slug")

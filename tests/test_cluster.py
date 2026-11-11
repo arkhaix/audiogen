@@ -716,5 +716,48 @@ class VoiceEffectTest(unittest.TestCase):
         self.assertIsNone(m._blocker(effect, [{**render, "slug": "other"}], [], False, 0.0))
 
 
+class BiosJobTest(unittest.TestCase):
+    def test_the_job_builds_cli_args_and_runs_as_one_claude_stage(self):
+        from unittest import mock
+        from serial_audio import library as lib
+        from serial_audio.web.jobs import build
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(lib, "LIBRARY", Path(tmp) / "library"):
+            lib.save_serial("demo", {"title": "Demo"})
+
+            # Default: every voice without a bio, as a heavy job off the GPU, with the LLM settings.
+            every = build("bios", {"slug": "demo", "model": "sonnet"})
+            self.assertEqual(every["args"], ["bios", "demo", "--backend", "auto", "--model", "sonnet", "--on-limit", "api"])
+            self.assertEqual((every["heavy"], every["gpu"], every["comfy"]), (True, False, False))
+            self.assertEqual(every["title"], "Casting bios · every voice without one")
+
+            # Named characters with redo. The title names up to three ids and counts more.
+            one = build("bios", {"slug": "demo", "characters": ["eole"], "redo": True})
+            self.assertEqual(one["args"][-3:], ["--characters", "eole", "--redo"])
+            self.assertEqual((one["title"], one["meta"]), ("Casting bios · eole", {"characters": ["eole"]}))
+            four = build("bios", {"slug": "demo", "characters": ["a", "b", "c", "d"]})
+            self.assertEqual((four["args"][-2:], four["title"]), (["--characters", "a,b,c,d"], "Casting bios · 4 characters"))
+
+            # A malformed id and an unknown serial are refused.
+            for bad in ({"slug": "demo", "characters": ["../x"]}, {"slug": "demo", "characters": "eole"},
+                        {"slug": "nope"}):
+                with self.assertRaises(ValueError):
+                    build("bios", bad)
+
+        # On the cluster it is one dispatch to a Claude node with the args as queued.
+        self.assertEqual(job_stages(job("bios", args=every["args"])), [{"class": "llm", "args": every["args"]}])
+
+        # It writes only the bible, so it does not wait for a chapter job of its serial. A render waits for it, and
+        # it waits for a cast, a character pass and another bios job, which write the bible too.
+        self.assertFalse(conflicts(job("bios"), job("render", chapters=[7])))
+        self.assertFalse(conflicts(job("bios"), job("screenplay", chapters=[7])))
+        self.assertTrue(conflicts(job("render", chapters=[7]), job("bios")))
+        self.assertTrue(conflicts(job("bios"), job("cast")))
+        self.assertTrue(conflicts(job("cast"), job("bios")))
+        self.assertTrue(conflicts(job("bios"), job("character-pass", chapters=[1])))
+        self.assertTrue(conflicts(job("bios"), job("bios")))
+        self.assertFalse(conflicts(job("bios"), job("cast", slug="other")))
+
+
 if __name__ == "__main__":
     unittest.main()

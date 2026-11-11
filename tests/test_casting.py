@@ -1,6 +1,8 @@
-"""Tests for the Breeze voice design path of casting, with a fake breeze-server and a fake recognizer."""
+"""Tests for the Breeze voice design path of casting, with a fake breeze-server and a fake recognizer, and for the
+casting bios, with a fake LLM."""
 from __future__ import annotations
 
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,10 +11,32 @@ from unittest import mock
 from serial_audio import asr, breeze, casting
 from serial_audio import library as lib
 from serial_audio.comfy import ComfyError
+from serial_audio.llm import LLMError, PassResult
 
 SLUG = "design-test"
 SAMPLE = "I have waited a hundred and fifty years for this."
 BRIEF = {"id": "meredith", "instruct": "A woman in her late twenties with a low alto voice.", "sample_text": SAMPLE}
+
+
+class FakeLLM:
+    """run_pass that answers the casting pass and the bio pass for the ids in its input and records each call.
+
+    A bio names the call that wrote it. An id in drop doesn't get a bio.
+    """
+
+    def __init__(self):
+        self.calls: list[tuple[str, list[str], str]] = []
+        self.drop: set[str] = set()
+
+    def __call__(self, system_prompt, user_text, schema, **kwargs):
+        ids = re.findall(r"^## (\S+)$", user_text, re.M)
+        kind = "bios" if "bios" in schema["properties"] else "voices"
+        self.calls.append((kind, ids, user_text))
+        if kind == "bios":
+            data = {"bios": [{"id": i, "bio": f"Bio {len(self.calls)} of {i}."} for i in ids if i not in self.drop]}
+        else:
+            data = {"voices": [{"id": i, "instruct": f"The voice of {i}.", "sample_text": SAMPLE} for i in ids]}
+        return PassResult(data=data, backend="fake", model="fake", cost_estimate_usd=0.0)
 
 
 class FakeServer:
@@ -180,6 +204,44 @@ class BreezeCastTest(unittest.TestCase):
         self.assertTrue((lib.serial_dir(SLUG) / "voices" / "meredith.yaml").is_file())
         self.assertFalse((lib.serial_dir(SLUG) / "voices" / "ann.yaml").exists())
 
+    def test_the_casting_pass_brings_a_bio_and_a_cached_brief_does_not_call_the_llm(self):
+        llm = FakeLLM()
+        with mock.patch.object(casting, "run_pass", llm):
+            # Cached brief: the cast designs from it. It doesn't call the LLM or write a bio.
+            self.cast(good_seed=1001)
+            self.assertEqual(llm.calls, [])
+            self.assertNotIn("bio", lib.load_bible(SLUG)["characters"]["meredith"])
+
+            # Briefs stage of a recast with a fresh brief: the casting pass runs, then the bio pass. The bio is saved,
+            # and the bible on disk keeps the voice the recast has not replaced yet.
+            casting.cast(SLUG, only=["meredith"], recast=True, redo_brief=True, dry_run=True, log=lambda *_: None)
+            self.assertEqual([(kind, ids) for kind, ids, _ in llm.calls],
+                             [("voices", ["meredith"]), ("bios", ["meredith"])])
+            saved = lib.load_bible(SLUG)["characters"]["meredith"]
+            self.assertEqual((saved["bio"], saved["voice_id"]), ("Bio 2 of meredith.", "meredith"))
+
+            # Voices stage: the brief is cached, so the LLM isn't called, and filing the voice keeps the bio.
+            self.cast(good_seed=2001, seed0=2000, recast=True)
+            self.assertEqual(len(llm.calls), 2)
+            self.assertEqual(lib.load_bible(SLUG)["characters"]["meredith"]["bio"], "Bio 2 of meredith.")
+
+            # Both stages in one process: the bible that filing saves holds the new bio.
+            self.cast(good_seed=3001, seed0=3000, recast=True, redo_brief=True)
+            self.assertEqual([kind for kind, _, _ in llm.calls[2:]], ["voices", "bios"])
+            saved = lib.load_bible(SLUG)["characters"]["meredith"]
+            self.assertEqual((saved["bio"], saved["voice_id"]), ("Bio 4 of meredith.", "meredith"))
+
+            # A bio pass that leaves the character out is logged and doesn't stop the cast. The voice is filed and
+            # the bio stays as it was.
+            llm.drop = {"meredith"}
+            lines = []
+            with mock.patch.object(asr, "transcripts", heard_for(4001)):
+                [record] = casting.cast(SLUG, only=["meredith"], candidates=3, seed0=4000, engine="breeze",
+                                        asr="parakeet", recast=True, redo_brief=True, log=lines.append)
+            self.assertEqual(record["seed"], 4001)
+            self.assertTrue(any("the bio pass failed" in line for line in lines), lines)
+            self.assertEqual(lib.load_bible(SLUG)["characters"]["meredith"]["bio"], "Bio 4 of meredith.")
+
     def test_old_qwen_history_files_as_qwen(self):
         # A batch with no engine key comes from before Breeze design, so pick-voice files it as a Qwen voice.
         out = Path(self.tmp.name) / "output"
@@ -197,6 +259,62 @@ class BreezeCastTest(unittest.TestCase):
             picked = casting.pick_voice(SLUG, "meredith", seed=9000)
         self.assertEqual((picked["engine"], picked["drama3_voice"]), ("qwen", "meredith.safetensors"))
         self.assertTrue((lib.serial_dir(SLUG) / "voices" / "meredith.safetensors").is_file())
+
+
+class BioTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.llm = FakeLLM()
+        for p in (mock.patch.object(lib, "LIBRARY", Path(self.tmp.name) / "library"),
+                  mock.patch.object(casting, "run_pass", self.llm)):
+            p.start()
+            self.addCleanup(p.stop)
+        lib.save_serial(SLUG, {"title": "Design Test"})
+        character = {"gender": "female", "age_group": "adult", "importance": "major", "role": "x",
+                     "description": "x", "voice_brief": "x", "facts": [], "voice_id": ""}
+        lib.save_bible(SLUG, {"characters": {
+            "meredith": {"name": "Meredith", **character, "voice_id": "meredith",
+                         "facts": [{"chapter": 3, "text": "She is an elf."}]},
+            "ann": {"name": "Ann", **character, "voice_id": "ann", "bio": "An old bio."},
+            "tom": {"name": "Tom", **character}}, "pronunciations": {}})
+
+    def write(self, **kwargs):
+        return casting.write_bios(SLUG, log=lambda *_: None, **kwargs)
+
+    def bios(self):
+        return {cid: c.get("bio") for cid, c in lib.load_bible(SLUG)["characters"].items()}
+
+    def test_bios_go_to_the_voiced_characters_without_one(self):
+        # Default: only the voiced character with no bio is sent, with its facts, and the bible gets its bio.
+        self.assertEqual(self.write(), {"meredith": "Bio 1 of meredith."})
+        [(kind, ids, text)] = self.llm.calls
+        self.assertEqual((kind, ids), ("bios", ["meredith"]))
+        self.assertIn("- chapter 3: She is an elf.", text)
+        self.assertEqual(self.bios(), {"meredith": "Bio 1 of meredith.", "ann": "An old bio.", "tom": None})
+
+        # With every voiced character written, a second run doesn't call the LLM.
+        self.assertEqual(self.write(), {})
+        self.assertEqual(len(self.llm.calls), 1)
+
+        # Named ids with redo: a bio is written again, an uncast character gets one, and an id that is not in the
+        # bible is skipped.
+        self.assertEqual(self.write(only=["ann", "tom", "narrator"], redo=True),
+                         {"ann": "Bio 2 of ann.", "tom": "Bio 2 of tom."})
+        self.assertEqual(self.bios(), {"meredith": "Bio 1 of meredith.", "ann": "Bio 2 of ann.", "tom": "Bio 2 of tom."})
+
+    def test_many_bios_go_out_in_batches(self):
+        with mock.patch.object(casting, "BIO_BATCH", 2):
+            written = self.write(only=["meredith", "ann", "tom"], redo=True)
+        self.assertEqual([ids for _, ids, _ in self.llm.calls], [["meredith", "ann"], ["tom"]])
+        self.assertEqual(written, {"meredith": "Bio 1 of meredith.", "ann": "Bio 1 of ann.", "tom": "Bio 2 of tom."})
+
+    def test_a_pass_that_leaves_a_character_out_does_not_save(self):
+        self.llm.drop = {"ann"}
+        with self.assertRaises(LLMError) as e:
+            self.write(only=["meredith", "ann"], redo=True)
+        self.assertIn("didn't return a bio for ann", str(e.exception))
+        self.assertEqual(self.bios(), {"meredith": None, "ann": "An old bio.", "tom": None})
 
 
 if __name__ == "__main__":

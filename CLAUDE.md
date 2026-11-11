@@ -74,7 +74,7 @@ export SERIAL_AUDIO_COMFY_OUTPUT="$S/output"
 
   Then run the step you changed against that copy.
 
-* Take phone-width screenshots of the web app over the Chrome DevTools Protocol. Start headless Chrome or Edge with `--remote-debugging-port`, then send `Emulation.setDeviceMetricsOverride` at 390 by 844. A headless window doesn't go narrower than about 477 px on its own. Node 24 has a global WebSocket for the protocol.
+* Take phone-width screenshots of the web app over the Chrome DevTools Protocol. Start headless Chrome or Edge with `--remote-debugging-port`, then send `Emulation.setDeviceMetricsOverride` at 390 by 844. A headless window doesn't go narrower than about 477 px on its own. Node 24 has a global WebSocket for the protocol. `Page.navigate` to the page that is already open doesn't load it again, so send `Page.reload` with `ignoreCache` after a change to a static file.
 
 ## Gotchas
 

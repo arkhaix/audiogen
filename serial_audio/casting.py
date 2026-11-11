@@ -1,7 +1,9 @@
 """Casting: design a voice for each character that needs one, check it, and file it.
 
 For every character whose importance qualifies for a dedicated voice and who has no voice yet:
-  1. A casting pass (LLM) turns the bible record into a voice-design instruction and a sample line.
+  1. A casting pass (LLM) turns the bible record into a voice-design instruction and a sample line. A bio pass
+     (LLM) then writes the character's casting bio into the bible: who they are, without the plot, for the
+     listener who judges the voice.
   2. A designer makes N candidate clips of the sample line from the instruction. Engine "qwen" runs Qwen3-TTS
      Voice Design in ComfyUI and encodes each clip as a Drama 3 voice. Engine "breeze" runs Breeze TTS 2's voice
      design in breeze-server, with no ComfyUI, and makes no Drama 3 voice.
@@ -23,10 +25,13 @@ from . import asr as recognizer
 from . import library as lib
 from . import machine
 from .comfy import ComfyClient, ComfyError, design_graph, encode_voice_graph
-from .llm import run_pass
+from .llm import LLMError, run_pass
 
 CASTING_PROMPT = lib.PROMPTS / "casting_pass.system.md"
 CASTING_SCHEMA = lib.SCHEMAS / "casting_pass.schema.json"
+BIO_PROMPT = lib.PROMPTS / "bio_pass.system.md"
+BIO_SCHEMA = lib.SCHEMAS / "bio_pass.schema.json"
+BIO_BATCH = 12
 COMFY_OUTPUT = machine.COMFY_OUTPUT
 VOICES_OUTPUT = COMFY_OUTPUT / "drama3_voices"
 BREEZE_CAST_OUTPUT = COMFY_OUTPUT / "breeze" / "cast"
@@ -126,6 +131,73 @@ def casting_pass(serial: dict, records: dict[str, dict], *, backend="auto", mode
     log(f"casting pass: {len(result.data['voices'])} briefs via {result.backend}/{result.model}, "
         f"est ${result.cost_estimate_usd or 0:.4f}")
     return {v["id"]: v for v in result.data["voices"]}
+
+
+def bio_pass(serial: dict, records: dict[str, dict], *, backend="auto", model="opus", effort=None,
+             on_limit="api", log=print) -> dict[str, str]:
+    """Asks the LLM for a casting bio of each record: who the character is, for a listener judging a voice, without
+    the plot.
+
+    serial: the serial.yaml record.
+    records: id -> bible character.
+    backend, model, effort, on_limit: passed to run_pass.
+    log: receives the progress lines.
+    Returns id -> bio, with every id of records. Raises LLMError when the pass fails or leaves an id out.
+    """
+    ids, out = list(records), {}
+    for start in range(0, len(ids), BIO_BATCH):
+        batch = ids[start:start + BIO_BATCH]
+        lines = [f"# Casting bios for {serial['title']} by {serial.get('author') or 'unknown'}\n"]
+        for cid in batch:
+            c = records[cid]
+            facts = "\n".join(f"- chapter {f.get('chapter')}: {f.get('text')}" for f in c.get("facts") or [])
+            lines.append(f"## {cid}\nname: {c.get('name')}\ngender: {c.get('gender')}\nage_group: {c.get('age_group')}\n"
+                         f"importance: {c.get('importance')}\nrole: {c.get('role')}\n"
+                         f"description: {c.get('description')}\nvoice_brief: {c.get('voice_brief')}\nfacts:\n{facts}\n")
+        result = run_pass(BIO_PROMPT.read_text(encoding="utf-8"), "\n".join(lines), lib.load_json(BIO_SCHEMA),
+                          model=model, effort=effort, backend=backend, on_limit=on_limit, log=log,
+                          instruction="Write the casting bio for every character above and answer with the JSON "
+                                      "object only.")
+        got = {b["id"]: b["bio"].strip() for b in result.data["bios"]}
+        absent = [cid for cid in batch if not got.get(cid)]
+        if absent:
+            raise LLMError(f"the bio pass didn't return a bio for {', '.join(absent)}")
+        out.update({cid: got[cid] for cid in batch})
+        log(f"bio pass: {len(batch)} bios via {result.backend}/{result.model}, est ${result.cost_estimate_usd or 0:.4f}")
+    return out
+
+
+def write_bios(slug: str, *, only: list[str] | None = None, redo: bool = False, backend="auto", model="opus",
+               effort=None, on_limit="api", log=print) -> dict[str, str]:
+    """Writes casting bios into the bible, under each character's `bio`.
+
+    slug: the serial.
+    only: the character ids. None or an empty list means every character that has a voice.
+    redo: write a bio again where the character already has one.
+    backend, model, effort, on_limit: passed to run_pass.
+    log: receives the skipped ids and each bio.
+    Returns id -> bio for the bios written, and saves the bible when there are any. An id that is not in the bible
+    is skipped. Raises LLMError when the pass fails, before anything is saved.
+    """
+    serial = lib.load_serial(slug)
+    bible = lib.load_bible(slug)
+    chars = bible["characters"]
+    ids = list(only) if only else [cid for cid, c in chars.items() if c.get("voice_id")]
+    unknown = [cid for cid in ids if cid not in chars]
+    if unknown:
+        log(f"skipped, not in the bible: {', '.join(unknown)}")
+    todo = [cid for cid in ids if cid in chars and (redo or not chars[cid].get("bio"))]
+    if not todo:
+        log("nothing to write")
+        return {}
+    log(f"writing {len(todo)} bio(s): {', '.join(todo)}")
+    bios = bio_pass(serial, {cid: chars[cid] for cid in todo}, backend=backend, model=model, effort=effort,
+                    on_limit=on_limit, log=log)
+    for cid, text in bios.items():
+        chars[cid]["bio"] = text
+        log(f"-- {cid}\n   {text}")
+    lib.save_bible(slug, bible)
+    return bios
 
 
 def transcript_match(expected: str, heard: str) -> float:
@@ -364,6 +436,8 @@ def cast(slug: str, *, only: list[str] | None = None, candidates: int = 3, seed0
          engine: str | None = None, asr: str | None = None, log=print) -> list[dict]:
     """Design and file voices. `recast` replaces the voices of `only` (the old record is kept under `history`);
     `instruct` overrides the voice description for a single id; `redo_brief` asks the casting pass again.
+    A character the casting pass briefs in this run also gets its casting bio written, with or without `dry_run`.
+    A bio pass that fails is logged and does not stop the cast, and `write_bios` writes those bios later.
     `engine` is the designer, "qwen" or "breeze", from plan_cast_engine. `asr` is the recognizer that scores the
     candidates, "qwen3" or "parakeet", from asr.choose. Both, and ComfyUI for qwen, are checked before the casting
     pass runs. When a Breeze design fails, the voices designed before it are filed and then the error is raised."""
@@ -407,6 +481,16 @@ def cast(slug: str, *, only: list[str] | None = None, candidates: int = 3, seed0
         briefs[ids[0]]["instruct"] = instruct.strip()
     if missing or instruct:
         lib.save_yaml(briefs_path, briefs)
+    briefed = [cid for cid in missing if cid in briefs and cid in bible["characters"]]
+    if briefed:
+        try:
+            written = write_bios(slug, only=briefed, redo=True, backend=backend, model=model, effort=effort,
+                                 on_limit=on_limit, log=log)
+        except LLMError as e:
+            written = {}
+            log(f"the bio pass failed, and the cast goes on without it: {e}")
+        for cid, text in written.items():
+            bible["characters"][cid]["bio"] = text      # filing a voice saves this copy of the bible
     for cid in ids:
         b = briefs.get(cid)
         log(f"-- {cid}\n   instruct: {b['instruct'] if b else '(missing)'}\n   sample:   {b['sample_text'] if b else ''}")

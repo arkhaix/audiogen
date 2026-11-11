@@ -176,6 +176,7 @@ hr { border: 0; border-top: 1px solid var(--border); margin: 1.2em 0; }
 .notice.bad { background: var(--bad-soft); color: var(--bad); }
 .notice.info { background: var(--info-soft); color: var(--info); }
 .notice ul { margin: 4px 0 0; padding-left: 18px; }
+.notice + .notice { margin-top: 8px; }
 .empty { padding: 30px; text-align: center; color: var(--muted); }
 
 /* Library */

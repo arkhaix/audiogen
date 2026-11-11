@@ -6,7 +6,7 @@ the job's class:
 
 * `breeze`: Breeze renders through breeze-server, and joining saved takes again. The laptop (aj-legion5).
 * `comfyui`: Drama 3 renders, casting voices, picking a voice and checking takes, which need ComfyUI or its output folder. The laptop.
-* `llm`: the character pass, the screenplay and the casting briefs, which run `claude` under AJ's subscription. dev-arch.
+* `llm`: the character pass, the screenplay, the casting briefs and the casting bios, which run `claude` under AJ's subscription. dev-arch.
 
 A cast runs as two dispatches: the briefs on an `llm` node, then the voices on a `comfyui` node, which finds the
 briefs cached and doesn't call Claude.
@@ -127,10 +127,10 @@ packs.
 5. Stop in the app asks the worker to stop. It kills the CLI within a few seconds, cancels the job's ComfyUI prompts and reports. A job no node has started yet is cancelled at once, and its dispatch exits as soon as a node starts it. A dispatch that fails or times out is tried again with the same idempotency token, so Nomad never runs it twice.
 
 Jobs on different chapters, serials or nodes run at the same time. Jobs on the same chapter wait for each other, and
-so does any job beside one that changes a whole serial (the character pass, a cast, picking a voice, fetching), with
-one exception: a cast, a voice pick, a say-as or a voice effect starts beside a running render, screenplay or take
-check of its serial once that job has fetched its bundle, because it writes no chapter file and the bundle holds the
-chapter job's copy of the voices, pronunciations and effects. It also passes a chapter job that waits ahead of it in
+so does any job beside one that changes a whole serial (the character pass, a cast, casting bios, picking a voice,
+fetching), with one exception: a cast, casting bios, a voice pick, a say-as or a voice effect starts beside a running
+render, screenplay or take check of its serial once that job has fetched its bundle, because it writes no chapter file
+and the bundle holds the chapter job's copy of the bible, voices, pronunciations and effects. It also passes a chapter job that waits ahead of it in
 its lane. A render queued after one of them still waits for it, and a cast's briefs stage still waits for a running
 screenplay, because the app runs one Claude job at a time. A laptop that sleeps through part of a render has 2 hours to come back before Nomad
 gives the allocation up.

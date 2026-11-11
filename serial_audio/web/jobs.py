@@ -34,8 +34,8 @@ LOG_DIR = STATE_DIR / "jobs"
 INCOMING = ROOT / "incoming"
 COMFY_URL = "http://127.0.0.1:8188"
 
-HEAVY = {"render", "cast", "check-takes", "character-pass", "screenplay"}
-BIBLE_WRITERS = {"character-pass", "cast"}
+HEAVY = {"render", "cast", "bios", "check-takes", "character-pass", "screenplay"}
+BIBLE_WRITERS = {"character-pass", "cast", "bios"}
 SERIAL_WRITERS = {"voice-effect"}    # rewrites serial.yaml in place, so it waits for any job on that serial
 FINISHED = {"done", "failed", "cancelled", "stopped", "skipped", "lost"}
 SETTLE_SECONDS = 15
@@ -133,6 +133,17 @@ def _incoming_file(slug_dir: str, name, suffixes: tuple[str, ...]) -> Path:
     return path
 
 
+def _character_ids(p: dict) -> list[str]:
+    raw = p.get("characters") or []
+    if not isinstance(raw, list) or not all(isinstance(c, str) for c in raw):
+        raise ValueError("characters must be a list of ids")
+    ids = [c.strip() for c in raw if c.strip()]
+    for cid in ids:
+        if not SLUG_RE.match(cid):
+            raise ValueError(f"bad character id {cid!r}")
+    return ids
+
+
 def _llm_args(p: dict) -> list[str]:
     args = ["--backend", _choice(p, "backend", BACKENDS, "auto"), "--model", _choice(p, "model", MODELS, "opus"),
             "--on-limit", _choice(p, "on_limit", ON_LIMIT, "api")]
@@ -216,13 +227,7 @@ def build(kind: str, p: dict, comfy_url: str = COMFY_URL) -> dict:
 
     if kind == "cast":
         slug = _slug(p)
-        raw = p.get("characters") or []
-        if not isinstance(raw, list) or not all(isinstance(c, str) for c in raw):
-            raise ValueError("characters must be a list of ids")
-        ids = [c.strip() for c in raw if c.strip()]
-        for cid in ids:
-            if not SLUG_RE.match(cid):
-                raise ValueError(f"bad character id {cid!r}")
+        ids = _character_ids(p)
         args = ["cast", slug, "--candidates", str(_int(p, "candidates", 1, 12, 3)),
                 "--seed", str(_int(p, "seed", 0, 2**31, 1000)), "--comfy-url", comfy_url] + _llm_args(p)
         if ids:
@@ -248,6 +253,21 @@ def build(kind: str, p: dict, comfy_url: str = COMFY_URL) -> dict:
         verb = "Recast" if p.get("recast") else ("Casting briefs" if dry else "Cast")
         return {"args": args, "heavy": True, "gpu": not dry, "comfy": not dry, "title": f"{verb} · {who}", "slug": slug,
                 "meta": {"characters": ids, "candidates": _int(p, "candidates", 1, 12, 3), "dry_run": dry}}
+
+    if kind == "bios":
+        slug = _slug(p)
+        ids = _character_ids(p)
+        redo = bool(p.get("redo"))
+        args = ["bios", slug] + _llm_args(p)
+        if ids:
+            args += ["--characters", ",".join(ids)]
+        if redo:
+            args.append("--redo")
+        who = "every voice" if redo else "every voice without one"
+        if ids:
+            who = ", ".join(ids) if len(ids) <= 3 else f"{len(ids)} characters"
+        return {"args": args, "heavy": True, "gpu": False, "comfy": False, "title": f"Casting bios · {who}",
+                "slug": slug, "meta": {"characters": ids}}
 
     if kind == "pick-voice":
         slug = _slug(p)

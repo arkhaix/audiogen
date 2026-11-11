@@ -8,7 +8,7 @@ TTS 2 render.
 
 ```
 library/<slug>/serial.yaml               title, source, narration, casting policy
-library/<slug>/bible/characters.yaml     id -> character (aliases, facts by chapter, voice brief, voice id)
+library/<slug>/bible/characters.yaml     id -> character (aliases, facts by chapter, voice brief, casting bio, voice id)
 library/<slug>/bible/pronunciations.yaml term -> respelling
 library/<slug>/voices/                   designed voices: brief, clip (wav), encoded Drama 3 voice
 library/<slug>/chapters/0001/text.md     cleaned chapter text
@@ -31,6 +31,7 @@ python -m serial_audio.cli character-pass <slug> <1|1-5|all> [--backend auto|sub
 python -m serial_audio.cli bible <slug> [-v]
 python -m serial_audio.cli reset-bible <slug>            # throw the bible away to re-run the pass
 python -m serial_audio.cli cast <slug> [--characters a,b] [--candidates 3] [--dry-run] [--engine qwen|breeze] [--asr qwen3|parakeet]
+python -m serial_audio.cli bios <slug> [--characters a,b] [--redo]   # casting bios: who each voiced character is, without the plot
 python -m serial_audio.cli voices <slug> [-v]            # cast voices and their candidates
 python -m serial_audio.cli pick-voice <slug> <id> [--seed N]   # after listening: re-file / approve
 python -m serial_audio.cli cast <slug> --characters <id> --recast [--seed N] [--instruct "..."] [--redo-brief] [--note "..."]
@@ -54,14 +55,16 @@ python -m serial_audio.web --host 100.81.138.51     # reachable over Tailscale, 
 
 Run it from `D:\fish`. It shows each serial's chapters on the way to audio and plays rendered chapters,
 remembering the listening position per chapter. On the Cast tab you can play every candidate, file or approve
-one, recast with a new description, or cast the characters who have no voice yet. The bible and pronunciations
-are searchable. The app has no login, so bind it only to an address you trust. It answers only to localhost,
+one, recast with a new description, or cast the characters who have no voice yet. Each voice card shows the
+character's casting bio: age, race, station, temperament and habits of speech, without the plot. Write bios queues a
+`bios` job for the voices that don't have one, and Rewrite bio on a card writes that one again from the bible as it
+stands. The bible and pronunciations are searchable. The app has no login, so bind it only to an address you trust. It answers only to localhost,
 the machine's name, the `--host` address and any `--allow-host` name, and refuses POSTs from other web pages.
 A second instance on the same `.webapp/` or port refuses to start.
 
 Every change goes through `python -m serial_audio.cli` as a background job, under `serial_audio/web/runjob.py`,
 so a job keeps running when the server stops and is picked up again when it starts. Job records and logs live in
-`.webapp/`. Heavy jobs (character pass, screenplay, cast, render) run one at a time, in order, and wait while
+`.webapp/`. Heavy jobs (character pass, screenplay, cast, casting bios, render) run one at a time, in order, and wait while
 any pipeline process the app did not start is running, including a PowerShell script that calls the CLI, or
 while ComfyUI is busy with a prompt the app did not queue. A render or cast that queues ComfyUI prompts also waits
 for ComfyUI to answer. A Breeze render under `breeze-server` does not, so it runs with ComfyUI down. A render job is
@@ -96,7 +99,11 @@ its override removes the entry.
    gets a narrator, cast first as the voice `narrator` from the blurb, tags, and opening of chapter 1
    (set `narrator_brief` in `serial.yaml` to steer it). Recurring characters who have not spoken yet
    are cast once they do. With `cast_engine: qwen` in `serial.yaml`, or `--engine qwen`, ComfyUI makes the
-   candidates with Qwen3-TTS Voice Design instead and encodes each as a Drama 3 voice.
+   candidates with Qwen3-TTS Voice Design instead and encodes each as a Drama 3 voice. Beside each brief the
+   casting pass writes, a bio pass writes the character's casting bio into the bible under `bio`, from the whole
+   record with its facts: who the character is, in 50 words at most, for the listener who judges the voice. It
+   leaves out events and what a character conceals. `bios` writes the bios of voices cast before, or again with
+   `--redo` after later chapters changed the record.
 4. `screenplay` turns the chapter into ordered lines with speakers and sparse directions, verbatim
    apart from speech normalizations; a coverage check guards against dropped text; status `scripted`.
 5. `render` maps speakers to Drama 3 slots (narrator = 0, unvoiced speakers read by the narrator),

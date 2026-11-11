@@ -35,11 +35,11 @@ NAMESPACE = "serial-audio"
 PREFIX = "serial-audio"
 CLASSES = ("breeze", "comfyui", "llm")
 GPU_CLASSES = {"breeze", "comfyui"}
-LLM_KINDS = {"character-pass", "screenplay"}
+LLM_KINDS = {"character-pass", "screenplay", "bios"}
 COMFY_KINDS = {"pick-voice", "check-takes"}
-SERIAL_WIDE = {"character-pass", "cast", "reset-bible", "pick-voice", "fetch", "say-as", "voice-effect"}
+SERIAL_WIDE = {"character-pass", "cast", "bios", "reset-bible", "pick-voice", "fetch", "say-as", "voice-effect"}
 # serial-wide jobs that write only voices/, the bible and serial.yaml, which a chapter job took in its bundle
-CONFIG_WRITERS = {"cast", "pick-voice", "say-as", "voice-effect"}
+CONFIG_WRITERS = {"cast", "bios", "pick-voice", "say-as", "voice-effect"}
 # jobs that write only their chapters' files
 CHAPTER_KINDS = {"render", "screenplay", "check-takes"}
 # seconds per Breeze take by GPU type, until a node's own render records give its rate

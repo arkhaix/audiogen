@@ -1,0 +1,22 @@
+{
+  "type": "object",
+  "properties": {
+    "bios": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string", "description": "The character id exactly as given."},
+          "bio": {
+            "type": "string",
+            "description": "Two or three plain sentences, 50 words at most, on who the character is: sex, age, race or species, station, temperament, manner and habits of speech. No plot events, no secret spelled out, no description of the voice."
+          }
+        },
+        "required": ["id", "bio"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["bios"],
+  "additionalProperties": false
+}

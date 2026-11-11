@@ -1068,15 +1068,19 @@ function castTab(sd, v, slug) {
   const pending = v.voices.filter((x) => x.status !== "approved");
   const approved = v.voices.filter((x) => x.status === "approved");
   const usel = uselFor(slug);
+  const noBio = v.voices.filter((x) => x.in_bible && !x.bio).map((x) => x.character_id || x.id);
+  const bioNote = !noBio.length ? "" : `<div class="notice info">${plural(noBio.length, "voice doesn't", "voices don't")} have a casting bio yet, so ${noBio.length === 1 ? "its card shows" : "their cards show"} the bible's role and description, plot and all. ${
+    activeJobs(slug, null, "bios").length ? "The bios are being written." : jobButton("Write bios", "bios", { slug, characters: noBio, ...storedLLM() })}</div>`;
   const uncastRows = v.uncast.map((u) => `<tr class="${usel.has(u.id) ? "sel" : ""}">
       <td><input type="checkbox" data-change="usel" data-id="${esc(u.id)}" ${usel.has(u.id) ? "checked" : ""} aria-label="Select ${esc(u.name)}"></td>
-      <td><b>${esc(u.name)}</b> <span class="mono small muted">${esc(u.id)}</span>${u.role ? `<div class="small muted">${esc(u.role)}</div>` : ""}</td>
+      <td><b>${esc(u.name)}</b> <span class="mono small muted">${esc(u.id)}</span>${u.bio || u.role ? `<div class="small muted">${esc(u.bio || u.role)}</div>` : ""}</td>
       <td><span class="tag">${esc(u.importance)}</span>${u.speaks ? "" : ` <span class="tag">silent so far</span>`}${u.policy ? ` <span class="pill auto">will be cast</span>` : ""}</td>
       <td class="num right hide-sm">${u.chapters}</td>
       <td class="small muted hide-sm">${u.brief ? esc(u.brief.instruct) : "no brief yet"}</td>
     </tr>`).join("");
   return `
     ${pending.length ? `<div class="notice info">${plural(pending.length, "voice is", "voices are")} waiting for you to listen. Approve the take you like, file another candidate, or recast with a new description.</div>` : ""}
+    ${bioNote}
     ${pending.length ? `<div class="section-head"><h2>To review</h2></div><div class="voices">${pending.map((x) => voiceCard(x, slug)).join("")}</div>` : ""}
     <div class="section-head"><h2>Approved</h2><span class="muted small">${approved.length ? "" : "none yet"}</span></div>
     <div class="voices">${approved.map((x) => voiceCard(x, slug)).join("")}</div>
@@ -1102,7 +1106,7 @@ function voiceCard(x, slug) {
     x.rendered_in.length && `rendered in ${esc(rangeText(x.rendered_in))}`,
     x.effect && `<span class="tag">${esc(x.effect.effect)} effect</span>`,
   ].filter(Boolean).join(" · ");
-  const bio = [x.role, x.description].filter(Boolean).join(" ");
+  const bio = x.bio || [x.role, x.description].filter(Boolean).join(" ");
   const rounds = x.history.slice().reverse().map((h) => `<div class="round">
       <div class="small muted">Earlier round${h.replaced_at ? `, replaced ${esc(when(h.replaced_at))}` : ""}${h.why_replaced ? `: ${esc(h.why_replaced)}` : ""}</div>
       <div class="instruct small">${esc(h.instruct)}</div>
@@ -1113,7 +1117,7 @@ function voiceCard(x, slug) {
         <div class="grow"><h3>${esc(x.name)}</h3><div class="mono small muted">${esc(x.id)}</div></div>
         <span class="pill ${esc(x.status)}">${esc(x.status)}</span></div>
       <div class="small muted">${facts}</div>
-      ${bio ? `<div class="bio" data-act="expand" title="Click to expand">${esc(bio)}</div>` : ""}
+      ${x.bio ? `<div class="bio open">${esc(bio)}</div>` : bio ? `<div class="bio" data-act="expand" title="Click to expand">${esc(bio)}</div>` : ""}
       <div class="instruct" data-act="expand" title="Click to expand">${esc(x.instruct)}</div>
       <div class="sample">“${esc(x.sample_text)}”</div>
       <details class="cands" data-key="cands:${esc(x.id)}"><summary>${plural(count, "candidate")}${x.history.length ? ` across ${x.history.length + 1} rounds` : ""}</summary>
@@ -1122,6 +1126,7 @@ function voiceCard(x, slug) {
       <div class="actions">
         ${x.status !== "approved" ? `<button class="sm primary" data-act="pick" data-id="${esc(x.id)}" data-seed="${esc(x.seed)}" data-approve="1">Approve</button>` : ""}
         <button class="sm" data-act="recast" data-id="${esc(x.id)}">Recast…</button>
+        ${x.bio ? jobButton("Rewrite bio", "bios", { slug, characters: [x.id], redo: true, ...storedLLM() }) : ""}
       </div>
     </div>`;
 }
@@ -1217,6 +1222,7 @@ function bibleTab(b) {
       </summary>
       <div class="body">
         <div><span class="mono small muted">${esc(c.id)}</span>${c.aliases?.length ? ` · also ${esc(c.aliases.join(", "))}` : ""}</div>
+        ${c.bio ? `<div><b>Casting bio.</b> ${esc(c.bio)}</div>` : ""}
         <div><b>Role.</b> ${esc(c.role)}</div>
         ${c.description ? `<div><b>Description.</b> ${esc(c.description)}</div>` : ""}
         <div><b>Voice brief.</b> ${esc(c.voice_brief)}</div>
