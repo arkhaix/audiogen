@@ -111,10 +111,15 @@ its lane. A render queued after one of them still waits for it, and a cast's bri
 screenplay, because the app runs one Claude job at a time. A laptop that sleeps through part of a render has 2 hours to come back before Nomad
 gives the allocation up.
 
+A job of a Process batch waits by the same rules and for nothing else, so a chapter renders as soon as its screenplay
+is written, beside the other chapters' screenplays. When a batch job fails or is lost, the queued jobs of the batch
+that wait for it are skipped and the rest run. Stopping a batch job skips every queued job of the batch as soon as
+the stop is asked for. A job of the batch that already runs on another node keeps running until it is stopped too.
+
 The app picks the node for a GPU job, one GPU job per node:
 
 * A join, a take check and picking a voice need files that live on one node, so they run there and wait for it. A take check or a pick on a node without ComfyUI runs as a `breeze` job.
-* Any other GPU job goes to the ready node where its estimated finish is earliest. The estimate is the node's running job's remaining time, from its progress log, plus the queued jobs already waiting for that node, plus the job itself: its takes times the node's seconds per take, the mean of the last three Breeze renders of twenty takes or more that finished on that node, kept in `placement.json` (3 s for NVIDIA and 18 s for Metal until then), counting only the takes the holder lacks, plus the join and the check. A render whose reuse cannot be worked out is costed at all its takes. The job waits for a busy node when that beats every free node by two minutes or more, and its wait reason shows both estimates. A node whose running job's log has not changed for ten minutes counts as busy for a day, so nothing waits for it. A GPU job does not wait behind a blocked job in its lane.
+* Any other GPU job goes to the ready node where its estimated finish is earliest. The estimate is the node's running job's remaining time, from its progress log, plus the queued jobs already waiting for that node, plus the job itself: its takes times the node's seconds per take, the mean of the last three Breeze renders that finished on that node and made twenty takes or more and at least half of their chapter's lines, kept in `placement.json` (3 s for NVIDIA and 18 s for Metal until then), counting only the takes the holder lacks, plus the join and the check. A render whose reuse cannot be worked out is costed at all its takes. The job waits for a busy node when that beats every free node by two minutes or more, and its wait reason shows both estimates. A node whose running job's log has not changed for ten minutes counts as busy for a day, so nothing waits for it. A GPU job does not wait behind a blocked job in its lane.
 * The app records the node of each chapter's takes and each voice's candidates in `state/placement.json` as results come back. For a chapter or voice from before that record, it reads the node from the path style of its files, which works while one node runs each OS.
 
 The static port 19137 that GPU jobs reserve doesn't keep them apart, because Nomad checks it per address and the

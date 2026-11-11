@@ -768,7 +768,9 @@ async function openProcess(slug) {
       <label class="inline"><input type="checkbox" name="do_${name}" ${on ? "checked" : ""}> ${label}</label>
       <div class="why">${why}</div>${opts ? `<div class="opts">${opts}</div>` : ""}</div>`;
   const body = `
-    <p class="small muted">Chapters ${esc(rangeText(sel))}. The jobs run one at a time, in this order. If one fails, the rest of the batch is skipped.</p>
+    <p class="small muted">Chapters ${esc(rangeText(sel))}. ${S.state?.executor === "nomad"
+      ? "Each chapter's jobs run in this order. A job waits only for the jobs it needs, so a chapter renders once its screenplay is written. If a job fails, only the jobs that need it are skipped."
+      : "The jobs run one at a time, in this order. If one fails, the rest of the batch is skipped."}</p>
     ${stage("characters", "Character pass", needChars.length, `${plural(needChars.length, "chapter")} still need it. It updates the bible with who appears.`,
       `<label class="inline"><input type="checkbox" name="redo_characters"> redo chapters that have one</label>`)}
     ${stage("cast", "Cast new voices", castLikely, "Designs a voice for each major or recurring character who has spoken and has none. Runs on a GPU node.",

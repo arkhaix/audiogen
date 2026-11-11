@@ -8,7 +8,7 @@ existing entries for a conflict before adding one, and rewrite an entry when AJ 
 ### Two LLM backends: the Claude subscription first, the API as the fallback
 **Date:** 2026-10-16
 **Context:** AJ asked for both at the start.
-**Decision:** The character pass, the casting pass and the screenplay run through headless Claude Code under AJ's login by default (`--backend auto`). On a usage-limit message they fall back to the Anthropic API, wait for the reset, or fail, per `--on-limit`. Every chapter records which backend ran.
+**Decision:** The character pass, the casting pass and the screenplay run through headless Claude Code under AJ's login by default (`--backend auto`). On a usage-limit message they fall back to the Anthropic API, wait for the reset, or fail, per `--on-limit`. Every chapter records which backend ran. On the cluster the API fallback can't run, because `/usr/bin/python3` on dev-arch doesn't have the `anthropic` package (checked 2026-11-09), so a pass that hits the limit with `--on-limit api`, the app's default, fails. AJ said on 2026-11-09 to leave that until it causes a problem.
 
 ---
 
@@ -85,7 +85,7 @@ existing entries for a conflict before adding one, and rewrite an entry when AJ 
 ### jsc-m1 renders Breeze, and the laptop is preferred
 **Date:** 2026-11-07, revised 2026-11-08
 **Context:** AJ asked for jsc-m1 to be usable as a worker. Its patched Metal breeze-server runs at about 0.4x realtime, against the laptop's 2x. The CPU backend and Vulkan through MoltenVK were slower, at 0.26x and 0.28x. In the render records of 2026-11-08 the Mac made a take in 17.5 s and the laptop in 2.8 s, about 6x faster.
-**Decision:** jsc-m1 offers the `breeze` class, one GPU job per node. A job that needs a node's saved files goes back to that node, and a voice pick goes to the node that made the candidate it files. Any other GPU job goes to the ready node where its estimated finish is earliest: the node's running job's remaining time from its progress log, plus the queued jobs already waiting for that node, plus the job's own estimate, which is its takes times the node's seconds per take (the mean of the last three Breeze renders of twenty takes or more that finished on the node, kept in `placement.json`, else 3 s for NVIDIA and 18 s for Metal), counting only the takes the holder lacks, plus the join and the check. A render whose reuse cannot be worked out is costed at all its takes, because sending it to the slow node by mistake costs an hour and the other mistake costs ten minutes. It waits for a busy node when that beats every free one by two minutes or more, and a GPU job no longer waits behind a blocked job in its lane. With the join and the check the same on both nodes and the margin, the Mac wins a fresh 255-line render only when four or five are ahead of it on the laptop. AJ set the conditions: estimate the completion times, wait only when it saves time, and account for the other queued jobs. Rejected on 2026-11-08: sending a render back to the node that holds its takes whatever it would reuse there, and then the 90% reuse threshold that replaced it for a few hours, because both ignore how long the fast node stays busy (JOURNAL.md, 2026-11-08).
+**Decision:** jsc-m1 offers the `breeze` class, one GPU job per node. A job that needs a node's saved files goes back to that node, and a voice pick goes to the node that made the candidate it files. Any other GPU job goes to the ready node where its estimated finish is earliest: the node's running job's remaining time from its progress log, plus the queued jobs already waiting for that node, plus the job's own estimate, which is its takes times the node's seconds per take (the mean of the last three Breeze renders that finished on the node and made twenty takes or more and at least half of their chapter's lines, kept in `placement.json`, else 3 s for NVIDIA and 18 s for Metal), counting only the takes the holder lacks, plus the join and the check. A render whose reuse cannot be worked out is costed at all its takes, because sending it to the slow node by mistake costs an hour and the other mistake costs ten minutes. It waits for a busy node when that beats every free one by two minutes or more, and a GPU job no longer waits behind a blocked job in its lane. With the join and the check the same on both nodes and the margin, the Mac wins a fresh 255-line render only when four or five are ahead of it on the laptop. AJ set the conditions: estimate the completion times, wait only when it saves time, and account for the other queued jobs. Rejected on 2026-11-08: sending a render back to the node that holds its takes whatever it would reuse there, and then the 90% reuse threshold that replaced it for a few hours, because both ignore how long the fast node stays busy (JOURNAL.md, 2026-11-08).
 
 ---
 
@@ -131,9 +131,16 @@ existing entries for a conflict before adding one, and rewrite an entry when AJ 
 
 ---
 
+### A batch job waits only for the jobs it needs
+**Date:** 2026-11-09
+**Context:** On the cluster every job of a Process batch waited for every earlier job of the batch. The rule came from the one-machine app, where heavy jobs ran one at a time anyway. A render waited for the screenplays of the other chapters, so the batch of chapters 13 to 17 on 2026-11-08 kept the laptop idle for 12.5 minutes with chapter 12 ready to render, and the batch of chapters 18 to 23 on 2026-11-09 kept it idle for 12.7 minutes. Renders of one batch never ran on two nodes at once, and one failed job skipped every later job, including the renders of chapters that were already scripted. AJ asked why only dev-arch was working and said to drop the wait.
+**Decision:** On the cluster a batch job waits by the same rules as any other job: for the jobs of its chapter, and for a job that changes the whole serial. A chapter renders as soon as its screenplay is written, beside the other chapters' screenplays, and a batch's renders can run on both GPU nodes. When a batch job fails or is lost, only the queued jobs of the batch that wait for it are skipped. Stopping a batch job still skips every queued job of the batch, now as soon as the stop is asked for, because a queued job could otherwise start before the worker confirms the stop. A job of the batch that already runs on another node keeps running until it is stopped too. The one-machine executor is unchanged. In a scratch run of the scheduler on the 18 to 23 batch, the first chapter was ready after 23 minutes, against 36, and all six after 95, against 108.
+
+---
+
 ## Not decided yet
 
-As of 2026-11-08:
+As of 2026-11-09:
 
 
 * Whether to re-render the chapters of The Hundred Reigns that use old voices. Chapters 1 to 6 are Drama 3 renders, so Louis and Lauriane sound different there, and they take about 85 minutes on the laptop. AJ was asked about them on 2026-11-07 and hasn't answered. Chapter 12 has Lauriane's old Qwen voice, because it was rendered before the recast on 2026-11-08.
@@ -141,3 +148,4 @@ As of 2026-11-08:
 * Whether to render chapters 7, 8 and 10 of The Hundred Reigns again. They have the Qwen voices of Casval and Anna that AJ replaced on 2026-11-09, and they were joined before the join leveled each voice. AJ had finished them, so they were left alone.
 * How the library is backed up. `/opt/serial-audio/library` on containers' local disk has no backup, and silver has no backup job.
 * lorimor-ancitif and eole were cast on 2026-11-08 (Breeze seeds 17000 to 17002, 17000 filed with status auto for both) from the cached briefs, not the older, lower descriptions planned in `docs/casting.md`, and wait for AJ's pick or a recast. The narrator reads their lines in chapter 12, rendered before the cast, so it needs a render afterwards, which remakes only their 3 lines.
+* Whether an import or a character pass should wait for the renders of other chapters. Both wait for every running or queued job of their serial, so the chapters for the next batch can't be prepared while a batch renders. The job history up to 2026-11-09 doesn't show a case. AJ was told on 2026-11-09.

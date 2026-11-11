@@ -29,7 +29,7 @@ from pathlib import Path
 from .. import library as lib
 from ..breeze import reusable_takes
 from . import exchange
-from .jobs import FINISHED, ROOT, JobManager, now_iso, read_tail
+from .jobs import ROOT, JobManager, now_iso, read_tail
 
 NAMESPACE = "serial-audio"
 PREFIX = "serial-audio"
@@ -419,6 +419,7 @@ class NomadJobManager(JobManager):
                     n["stop_at"] = time.time()
                     job["stopping"] = True
                     self._append_log(job, "\n[web] stop requested; the worker stops within a few seconds\n")
+                    self._skip_batch(job, "an earlier job in the batch was stopped")
                 self._save()
                 return job
         if not local:
@@ -597,6 +598,27 @@ class NomadJobManager(JobManager):
             self._skip_batch(job, f"an earlier job in the batch {status}")
         self._save()
 
+    def _skip_batch(self, job: dict, why: str) -> None:
+        """Skips the queued jobs of a batch that can't go on after job ended early.
+
+        job: the batch job that failed, was lost, was cancelled, or was stopped or asked to stop.
+        why: the note each skipped job gets.
+        Returns nothing. A stop, a stop request or a cancel skips every queued job of the batch. A failure or a
+        loss skips only the queued jobs that wait for the job, or for a job skipped with it, so the batch's
+        other chapters still run.
+        """
+        if not job.get("batch") or job["status"] not in ("failed", "lost"):
+            super()._skip_batch(job, why)
+            return
+        gone = [job]
+        queued = sorted((j for j in self.jobs.values() if j.get("batch") == job["batch"] and j["status"] == "queued"),
+                        key=lambda j: j["seq"])
+        for other in queued:
+            # the job ran, so every queued job that conflicts with it waited for it, whatever their order
+            if any(conflicts(other, g) and (g is job or g["seq"] < other["seq"]) for g in gone):
+                other.update({"status": "skipped", "finished": now_iso(), "note": why})
+                gone.append(other)
+
     # Scheduling
 
     def _schedule(self, now: float, dispatch: list[str]) -> bool:
@@ -637,11 +659,6 @@ class NomadJobManager(JobManager):
         """Why the queued job cannot start now, or None."""
         if self.paused and (lane in CLASSES or job["heavy"]):
             return "the queue is on hold"
-        if job.get("batch"):
-            ahead = next((j for j in sorted(self.jobs.values(), key=lambda j: j["seq"])
-                          if j["batch"] == job["batch"] and j["seq"] < job["seq"] and j["status"] not in FINISHED), None)
-            if ahead:
-                return f"waiting for {ahead['title']}, earlier in its batch"
         earlier = next((j for j in self.jobs.values() if j["status"] == "queued" and j["seq"] < job["seq"]
                         and conflicts(job, j)), None)
         if earlier:
@@ -824,12 +841,23 @@ class NomadJobManager(JobManager):
         return RATE_DEFAULT.get((w or {}).get("gpu") or "none", RATE_DEFAULT["none"])
 
     def _record_rate(self, slug: str, n: int, node: str) -> None:
-        """Adds a finished render's seconds per take to the last RATE_KEEP recorded for node. Never raises."""
+        """Adds a finished render's seconds per take to the last RATE_KEEP recorded for node.
+
+        slug: the serial.
+        n: the chapter the render finished.
+        node: the node that rendered it.
+        Returns nothing. Records only a Breeze render under breeze-server that made RATE_MIN_TAKES takes or more
+        and at least half of its chapter's lines. Never raises.
+        """
         try:
             meta = lib.load_yaml(lib.chapter_dir(slug, n) / "chapter.yaml", {}) or {}
             r = meta.get("render") if isinstance(meta.get("render"), dict) else {}
+            script = meta.get("script") if isinstance(meta.get("script"), dict) else {}
             takes, secs = int(r.get("generated_takes") or 0), float(r.get("generate_seconds") or 0)
             if r.get("engine") != "breeze" or r.get("runner") != "cpp" or takes < RATE_MIN_TAKES or secs <= 0:
+                return
+            # part of a chapter is a few voices' lines, whose lengths differ from the whole chapter's
+            if takes * 2 < int(script.get("lines") or 0):
                 return
         except Exception:
             return

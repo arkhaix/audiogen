@@ -317,6 +317,111 @@ class NodeChoiceTest(unittest.TestCase):
         self.assertEqual(dispatch, ["c"])
         self.assertIn("Cast · eole", self.m.wait_reasons["c2"])
 
+    def test_a_batch_job_waits_only_for_the_jobs_it_needs(self):
+        self.m.workers.append(worker("dev", ["llm"], "linux"))
+        self.m.nomad_state["up"] = True
+
+        def queued(jid, seq, kind, n):
+            label = "Screenplay" if kind == "screenplay" else "Render"
+            return {"id": jid, "seq": seq, "status": "queued", "kind": kind, "slug": "demo", "heavy": True,
+                    "batch": "b1", "created": "2026-11-09T23:08:32", "title": f"{label} · ch {n}",
+                    "meta": {"chapters": [n], "lines": 200}, "args": [kind, "demo", str(n)]}
+
+        first = {**queued("s18", 1, "screenplay", 18), "status": "running",
+                 "nomad": {"stage": 0, "stages": [{"class": "llm", "args": []}], "contact": "t"}}
+        self.m.jobs = {j["id"]: j for j in (first, queued("s19", 2, "screenplay", 19), queued("r18", 3, "render", 18),
+                                            queued("r19", 4, "render", 19))}
+        dispatch = []
+        # While chapter 18's screenplay runs, its render waits for it, and chapter 19's jobs wait their turn.
+        self.m._schedule(0.0, dispatch)
+        self.assertEqual(dispatch, [])
+        self.assertEqual(self.m.wait_reasons["r18"], "waiting for Screenplay · ch 18, which works on the same chapter")
+        self.assertEqual(self.m.wait_reasons["s19"], "waiting for Screenplay · ch 18")
+        self.assertEqual(self.m.wait_reasons["r19"],
+                         "waiting for Screenplay · ch 19, queued ahead of it on the same serial")
+        # Once it is written, chapter 18 renders beside chapter 19's screenplay, which is earlier in the batch.
+        first["status"] = "done"
+        self.m._schedule(0.0, dispatch)
+        self.assertEqual(dispatch, ["s19", "r18"])
+        self.assertEqual(self.m.jobs["r18"]["nomad"]["target"], "laptop")
+        self.assertEqual(self.m.wait_reasons["r19"], "waiting for Screenplay · ch 19, which works on the same chapter")
+
+    def test_a_failed_batch_job_skips_only_the_jobs_that_wait_for_it(self):
+        def queued(jid, seq, kind, n=None, batch="b1"):
+            return {"id": jid, "seq": seq, "status": "queued", "kind": kind, "slug": "demo", "batch": batch,
+                    "created": "2026-11-09T23:08:32", "title": jid, "meta": {"chapters": [n] if n else []},
+                    "args": [kind, "demo"]}
+
+        def batch():
+            jobs = [queued("s20", 1, "screenplay", 20), queued("s21", 2, "screenplay", 21),
+                    queued("r18", 3, "render", 18), queued("r20", 4, "render", 20), queued("r21", 5, "render", 21),
+                    queued("other", 6, "render", 20, batch="b2")]
+            self.m.jobs = {j["id"]: j for j in jobs}
+            return self.m.jobs
+
+        def statuses():
+            return {jid: j["status"] for jid, j in self.m.jobs.items()}
+
+        # A failed screenplay skips its chapter's render. The other chapters and the other batch go on.
+        jobs = batch()
+        self.m._finish(jobs["s20"], "failed", "exit 1 on dev", 1)
+        self.assertEqual(statuses(), {"s20": "failed", "s21": "queued", "r18": "queued", "r20": "skipped",
+                                      "r21": "queued", "other": "queued"})
+        self.assertEqual(jobs["r20"]["note"], "an earlier job in the batch failed")
+        # A lost render skips nothing, because no other job of the batch waits for it.
+        jobs = batch()
+        self.m._finish(jobs["r18"], "lost", "the Nomad allocation on laptop ended lost without a result")
+        self.assertEqual([jid for jid, status in statuses().items() if status == "skipped"], [])
+        # A render that was moved ahead of its screenplay in the queue waited for it too, so it is skipped.
+        jobs = batch()
+        jobs["r20"]["seq"] = 0.5
+        self.m._finish(jobs["s20"], "failed", "exit 1 on dev", 1)
+        self.assertEqual(jobs["r20"]["status"], "skipped")
+        # A failed job that changes the whole serial skips every queued job of the batch.
+        jobs = batch()
+        jobs["cast"] = queued("cast", 0.5, "cast")
+        self.m._finish(jobs["cast"], "failed", "exit 1 on laptop", 1)
+        self.assertEqual(statuses(), {"s20": "skipped", "s21": "skipped", "r18": "skipped", "r20": "skipped",
+                                      "r21": "skipped", "other": "queued", "cast": "failed"})
+        # A job skipped with the failed one skips the later jobs that wait for it, and not the earlier ones.
+        jobs = batch()
+        jobs["s20"]["status"] = "done"
+        jobs["c22"] = queued("c22", 4.5, "character-pass", 22)
+        self.m._finish(jobs["r20"], "failed", "exit 1 on laptop", 1)
+        self.assertEqual(statuses(), {"s20": "done", "s21": "queued", "r18": "queued", "r20": "failed",
+                                      "r21": "skipped", "other": "queued", "c22": "skipped"})
+        # A stopped job still skips every queued job of the batch.
+        jobs = batch()
+        self.m._finish(jobs["r18"], "stopped", "stopped from the web app")
+        self.assertEqual(statuses(), {"s20": "skipped", "s21": "skipped", "r18": "stopped", "r20": "skipped",
+                                      "r21": "skipped", "other": "queued"})
+
+    def test_a_stop_request_skips_the_batch_s_queued_jobs_before_the_worker_confirms(self):
+        self.m.workers.append(worker("dev", ["llm"], "linux"))
+        self.m.nomad_state["up"] = True
+
+        def queued(jid, seq, kind, n):
+            return {"id": jid, "seq": seq, "status": "queued", "kind": kind, "slug": "demo", "heavy": True,
+                    "batch": "b1", "created": "2026-11-09T23:08:32", "title": jid,
+                    "meta": {"chapters": [n], "lines": 200}, "args": [kind, "demo", str(n)]}
+
+        render = {**queued("r18", 1, "render", 18), "status": "running",
+                  "nomad": {"key": "k", "target": "laptop", "node": "laptop", "stage": 0,
+                            "stages": [{"class": "breeze", "args": []}], "contact": "t"}}
+        self.m.jobs = {j["id"]: j for j in (render, queued("s19", 2, "screenplay", 19), queued("r19", 3, "render", 19))}
+        # The request skips the queued jobs at once, so the next scheduling pass starts none of them while the
+        # worker still runs.
+        self.m.cancel("r18")
+        self.assertEqual({jid: j["status"] for jid, j in self.m.jobs.items()},
+                         {"r18": "running", "s19": "skipped", "r19": "skipped"})
+        dispatch = []
+        self.m._schedule(0.0, dispatch)
+        self.assertEqual(dispatch, [])
+        # A worker that is lost before it confirms the stop changes nothing for the batch.
+        self.m._finish(render, "lost", "the Nomad allocation on laptop ended lost without a result")
+        self.assertEqual({jid: j["status"] for jid, j in self.m.jobs.items()},
+                         {"r18": "lost", "s19": "skipped", "r19": "skipped"})
+
     def test_a_breeze_cast_takes_the_nvidia_node_first(self):
         cast = job("cast", args=["cast", "demo", "--engine", "breeze"])
         self.assertEqual(self.m._pick_node(cast, "breeze", [])[:2], ("laptop", "breeze"))
@@ -395,10 +500,11 @@ class NodeChoiceTest(unittest.TestCase):
         from unittest import mock
         from serial_audio import library as lib
         with mock.patch.object(lib, "LIBRARY", Path(self.tmp.name) / "library"):
-            def finish(n, node, takes, secs, success=True):
+            def finish(n, node, takes, secs, success=True, lines=None):
                 lib.save_yaml(lib.chapter_dir("demo", n) / "chapter.yaml",
                               {"render": {"engine": "breeze", "runner": "cpp", "generated_takes": takes,
-                                          "generate_seconds": secs}})
+                                          "generate_seconds": secs},
+                               **({"script": {"lines": lines}} if lines else {})})
                 render = {**job("render", chapters=[n], args=["render", "demo", str(n)]), "id": f"r{n}"}
                 self.m._record_placement(render, node, {"applied": [f"chapters/{n:04d}/chapter.yaml"]}, success)
 
@@ -416,6 +522,12 @@ class NodeChoiceTest(unittest.TestCase):
             for n in (5, 6, 7):
                 finish(n, "laptop", 100, 100 * n)
             self.assertAlmostEqual(self.m._rate("laptop"), 6.0, places=2)
+            # A touch-up render that made under half of its chapter's lines is skipped, and one that made half
+            # or more counts.
+            finish(8, "laptop", 21, 22, lines=231)
+            self.assertAlmostEqual(self.m._rate("laptop"), 6.0, places=2)
+            finish(9, "laptop", 120, 240, lines=231)
+            self.assertAlmostEqual(self.m._rate("laptop"), 5.0, places=2)
 
     def test_paths_name_their_node_when_one_node_runs_that_os(self):
         self.assertEqual(self.m._node_for_paths(["D:\\comfy\\out\\a.wav"]), "laptop")

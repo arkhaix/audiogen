@@ -675,7 +675,8 @@ class JobManager:
         """Queues the jobs in order as one batch. Validates them all first.
 
         requests: [{"kind", "params"}].
-        stop_on_failure: skip the rest of the batch when one job fails.
+        stop_on_failure: when one job fails, skip the batch's queued jobs that can't go on. Here that is the rest
+            of the batch, and on the cluster the jobs that wait for the failed one.
         Returns the new jobs. Raises ValueError and queues nothing if any request is bad.
         """
         built = []
