@@ -42,6 +42,9 @@ SERIAL_WIDE = {"character-pass", "cast", "bios", "reset-bible", "pick-voice", "f
 CONFIG_WRITERS = {"cast", "bios", "pick-voice", "say-as", "voice-effect"}
 # jobs that write only their chapters' files
 CHAPTER_KINDS = {"render", "screenplay", "check-takes"}
+# pairs of serial-wide jobs that share no file: a fetch writes chapter files, the index and serial.yaml, and bios
+# writes bible/characters.yaml
+NO_SHARED_FILE = {frozenset({"bios", "fetch"})}
 # seconds per Breeze take by GPU type, until a node's own render records give its rate
 RATE_DEFAULT = {"nvidia": 3.0, "metal": 18.0, "none": 60.0}
 RATE_MIN_TAKES = 20
@@ -185,11 +188,25 @@ def _overhead(lines: int) -> float:
     return JOIN_ESTIMATE + CHECK_PER_TAKE * lines
 
 
+def _is_import(job: dict) -> bool:
+    """Whether a job imports one saved chapter page. It writes only that chapter's files, on the app's machine."""
+    return job["kind"] == "fetch" and "--html" in (job.get("args") or [])
+
+
+def _chapters(job: dict) -> set[int]:
+    return set((job.get("meta") or {}).get("chapters") or [])
+
+
 def _touches(job: dict) -> tuple[str | None, set[int] | None]:
     """The serial a job works on and its chapters, or None for chapters when it affects the whole serial."""
-    if job["kind"] in SERIAL_WIDE:
+    if job["kind"] in SERIAL_WIDE and not _is_import(job):
         return job.get("slug"), None
-    return job.get("slug"), set((job.get("meta") or {}).get("chapters") or [])
+    return job.get("slug"), _chapters(job)
+
+
+def _starts_beside(job: dict) -> bool:
+    """Whether a job can start beside a running chapter job of its serial."""
+    return job["kind"] in CONFIG_WRITERS or job["kind"] == "character-pass" or _is_import(job)
 
 
 def conflicts(job: dict, other: dict) -> bool:
@@ -197,8 +214,12 @@ def conflicts(job: dict, other: dict) -> bool:
 
     job: the job that would start, a record with kind, slug and meta.
     other: a job that runs or was queued ahead of it.
-    Returns True when both work on one serial and either changes the whole serial or they share a chapter, except
-    that a CONFIG_WRITERS job never waits for a CHAPTER_KINDS job. Raises KeyError on a record without kind.
+    Returns True when both work on one serial and either changes the whole serial or they share a chapter, with
+    these exceptions. A CONFIG_WRITERS job never waits for a CHAPTER_KINDS job. The two jobs of a NO_SHARED_FILE
+    pair never wait for each other. The import of a saved page changes only its chapter, and it and a
+    CONFIG_WRITERS job never wait for each other. A character pass waits for a CHAPTER_KINDS job or an import only
+    on a chapter of its own, and an import waits for a character pass only on its chapter. Raises KeyError on a
+    record without kind.
     """
     slug, chapters = _touches(job)
     slug_other, chapters_other = _touches(other)
@@ -206,6 +227,14 @@ def conflicts(job: dict, other: dict) -> bool:
         return False
     if job["kind"] in CONFIG_WRITERS and other["kind"] in CHAPTER_KINDS:
         return False
+    if frozenset({job["kind"], other["kind"]}) in NO_SHARED_FILE:
+        return False
+    if (_is_import(job) and other["kind"] in CONFIG_WRITERS) or (job["kind"] in CONFIG_WRITERS and _is_import(other)):
+        return False
+    if job["kind"] == "character-pass" and (other["kind"] in CHAPTER_KINDS or _is_import(other)):
+        return bool(_chapters(job) & chapters_other)
+    if _is_import(job) and other["kind"] == "character-pass":
+        return bool(chapters & _chapters(other))
     return chapters is None or chapters_other is None or bool(chapters & chapters_other)
 
 
@@ -631,7 +660,7 @@ class NomadJobManager(JobManager):
         for job in queued:
             lane = self.lane(job)
             first = blocked.get(lane)
-            if first and lane not in GPU_CLASSES and (job["kind"] not in CONFIG_WRITERS or conflicts(job, first)):
+            if first and lane not in GPU_CLASSES and (not _starts_beside(job) or conflicts(job, first)):
                 reason = f"queued behind {first['title']}"
             else:
                 reason = self._blocker_for(job, lane, running)
@@ -665,13 +694,18 @@ class NomadJobManager(JobManager):
             return f"waiting for {earlier['title']}, queued ahead of it on the same serial"
         for other in running:
             if conflicts(job, other):
-                wide = other["kind"] in SERIAL_WIDE or job["kind"] in SERIAL_WIDE
+                wide = _touches(other)[1] is None or _touches(job)[1] is None
                 return f"waiting for {other['title']}" + (", which changes the whole serial" if wide else
                                                           ", which works on the same chapter")
+            if not job.get("slug") or other.get("slug") != job["slug"]:
+                continue
+            n = other.get("nomad")
             # a chapter job reads the serial's files when it builds its bundle, not when it is dispatched
-            if (job["kind"] in CONFIG_WRITERS and job.get("slug") and other.get("slug") == job["slug"]
-                    and not (other.get("nomad") or {}).get("contact")):
-                return f"waiting for {other['title']} to fetch its bundle"
+            if _starts_beside(job) and not (n or {}).get("contact"):
+                return f"waiting for {other['title']}" + (" to fetch its bundle" if n else "")
+            # an import writes its files in place, so a job that builds a bundle starts after it
+            if lane in CLASSES and _is_import(other):
+                return f"waiting for {other['title']}"
         if lane not in CLASSES:
             return None
         if not self.nomad.token:

@@ -317,6 +317,146 @@ class NodeChoiceTest(unittest.TestCase):
         self.assertEqual(dispatch, ["c"])
         self.assertIn("Cast · eole", self.m.wait_reasons["c2"])
 
+    def test_casting_bios_start_beside_a_render_and_the_fetch_that_waits_for_it(self):
+        self.m.workers.append(worker("dev", ["llm"], "linux"))
+        self.m.nomad_state["up"] = True
+        render = {"id": "r", "seq": 1, "status": "running", "kind": "render", "slug": "demo", "heavy": True,
+                  "meta": {"chapters": [38]}, "args": ["render", "demo", "38"], "title": "Render · ch 38",
+                  "nomad": {"target": "mac", "node": "mac", "stage": 0, "stages": [{"class": "breeze", "args": []}],
+                            "contact": "t"}}
+        fetch = {"id": "f", "seq": 2, "status": "queued", "kind": "fetch", "slug": "demo", "heavy": False,
+                 "meta": {}, "args": ["fetch", "demo", "new"], "title": "Fetch from site · new"}
+        bios = {"id": "b", "seq": 3, "status": "queued", "kind": "bios", "slug": "demo", "heavy": True,
+                "meta": {"characters": []}, "args": ["bios", "demo"], "title": "Casting bios · every voice without one"}
+        self.m.jobs = {j["id"]: j for j in (render, fetch, bios)}
+        dispatch = []
+        # The fetch from the site waits for the render. The bios job, queued after the fetch, goes to the Claude
+        # node at once.
+        self.m._schedule(0.0, dispatch)
+        self.assertEqual(self.m.wait_reasons["f"], "waiting for Render · ch 38, which changes the whole serial")
+        self.assertEqual(dispatch, ["b"])
+        self.assertEqual((bios["status"], fetch["status"]), ("running", "queued"))
+
+    def test_an_import_waits_only_for_its_own_chapter(self):
+        from unittest import mock
+
+        def imp(n, **more):
+            return {"kind": "fetch", "slug": "demo", "heavy": False, "meta": {"chapters": [n], "file": "p.html"},
+                    "args": ["fetch", "demo", str(n), "--html", "p.html"], "title": f"Import saved page · ch {n}",
+                    **more}
+
+        # An import and a chapter job of another chapter don't wait for each other, and neither do two imports.
+        # On one chapter they do, in both orders.
+        self.assertFalse(conflicts(imp(39), job("render", chapters=[38])))
+        self.assertFalse(conflicts(job("render", chapters=[38]), imp(39)))
+        self.assertFalse(conflicts(job("screenplay", chapters=[38]), imp(39)))
+        self.assertFalse(conflicts(imp(39), imp(40)))
+        self.assertTrue(conflicts(imp(38), job("render", chapters=[38])))
+        self.assertTrue(conflicts(job("render", chapters=[38]), imp(38)))
+        # An import and a job that writes only voices, the bible or serial.yaml don't wait for each other. A
+        # character pass and an import wait for each other only on one chapter. A fetch from the site still changes
+        # the whole serial.
+        for kind in ("cast", "bios", "pick-voice", "say-as", "voice-effect"):
+            self.assertFalse(conflicts(imp(39), job(kind)), kind)
+            self.assertFalse(conflicts(job(kind), imp(39)), kind)
+        self.assertTrue(conflicts(imp(39), job("reset-bible")))
+        self.assertTrue(conflicts(imp(39), job("character-pass", chapters=[39])))
+        self.assertTrue(conflicts(job("character-pass", chapters=[39]), imp(39)))
+        self.assertFalse(conflicts(imp(39), job("character-pass", chapters=[1])))
+        self.assertFalse(conflicts(job("character-pass", chapters=[40]), imp(39)))
+        self.assertTrue(conflicts(job("fetch"), job("render", chapters=[38])))
+        self.assertTrue(conflicts(imp(39), job("fetch")))
+
+        # Scheduling: the first import starts beside a render of another chapter. The second waits for the first.
+        self.m.nomad_state["up"] = True
+        render = {"id": "r", "seq": 1, "status": "running", "kind": "render", "slug": "demo", "heavy": True,
+                  "meta": {"chapters": [38]}, "args": ["render", "demo", "38"], "title": "Render · ch 38",
+                  "nomad": {"target": "mac", "node": "mac", "stage": 0, "stages": [{"class": "breeze", "args": []}],
+                            "contact": "t"}}
+        first, second = imp(39, id="i39", seq=2, status="queued"), imp(40, id="i40", seq=3, status="queued")
+        self.m.jobs = {j["id"]: j for j in (render, first, second)}
+        with mock.patch.object(self.m, "_launch_local", side_effect=lambda j: j.update(status="running")):
+            self.m._schedule(0.0, [])
+        self.assertEqual((first["status"], second["status"]), ("running", "queued"))
+        self.assertEqual(self.m.wait_reasons["i40"], "waiting for Import saved page · ch 39")
+
+        # Bundles: an import waits until a running job of its serial has fetched its bundle, and a job that gets a
+        # bundle waits for a running import. On the render's own chapter the import waits for the render.
+        self.m.jobs = {}
+        unfetched = {**render, "nomad": {**render["nomad"], "contact": None}}
+        self.assertEqual(self.m._blocker_for(imp(41), "local", [unfetched]),
+                         "waiting for Render · ch 38 to fetch its bundle")
+        other = job("render", chapters=[12], args=["render", "demo", "12"])
+        self.assertEqual(self.m._blocker_for(other, "breeze", [first]), "waiting for Import saved page · ch 39")
+        self.assertEqual(self.m._blocker_for(imp(38), "local", [render]),
+                         "waiting for Render · ch 38, which works on the same chapter")
+
+        # Queue order: an import starts while a batch's cast waits ahead of it for a character pass, and while an
+        # import of the render's chapter waits ahead of it in its lane.
+        stage = {"stage": 0, "stages": [{"class": "llm", "args": []}], "contact": "t"}
+        passing = {"id": "c39", "seq": 2, "status": "running", "kind": "character-pass", "slug": "demo",
+                   "heavy": True, "meta": {"chapters": [39]}, "args": ["character-pass", "demo", "39"],
+                   "title": "Character pass · ch 39", "nomad": {"target": "dev", "node": "dev", **stage}}
+        cast = {"id": "cast", "seq": 3, "status": "queued", "kind": "cast", "slug": "demo", "heavy": True,
+                "meta": {"characters": []}, "args": ["cast", "demo"], "title": "Cast · everyone who needs a voice"}
+        held, free = imp(38, id="i38", seq=4, status="queued"), imp(44, id="i44", seq=5, status="queued")
+        self.m.jobs = {j["id"]: j for j in (render, passing, cast, held, free)}
+        with mock.patch.object(self.m, "_launch_local", side_effect=lambda j: j.update(status="running")):
+            self.m._schedule(0.0, [])
+        self.assertEqual((cast["status"], held["status"], free["status"]), ("queued", "queued", "running"))
+        self.assertEqual(self.m.wait_reasons["cast"], "waiting for Character pass · ch 39, which changes the whole serial")
+        self.assertEqual(self.m.wait_reasons["i38"], "waiting for Render · ch 38, which works on the same chapter")
+
+    def test_a_character_pass_starts_beside_a_render_of_another_chapter(self):
+        # A character pass waits for a chapter job only on its own chapter. A chapter job reads the bible, so it
+        # waits for a character pass of any chapter, and character passes wait for each other.
+        self.assertFalse(conflicts(job("character-pass", chapters=[39]), job("render", chapters=[38])))
+        self.assertFalse(conflicts(job("character-pass", chapters=[39]), job("screenplay", chapters=[38])))
+        self.assertFalse(conflicts(job("character-pass", chapters=[39]), job("check-takes", chapters=[38])))
+        self.assertTrue(conflicts(job("character-pass", chapters=[38]), job("render", chapters=[38])))
+        self.assertTrue(conflicts(job("character-pass", chapters=[37, 38]), job("screenplay", chapters=[38])))
+        self.assertTrue(conflicts(job("render", chapters=[38]), job("character-pass", chapters=[39])))
+        self.assertTrue(conflicts(job("screenplay", chapters=[40]), job("character-pass", chapters=[39])))
+        self.assertTrue(conflicts(job("character-pass", chapters=[40]), job("character-pass", chapters=[39])))
+        self.assertTrue(conflicts(job("character-pass", chapters=[39]), job("cast")))
+
+        # Scheduling: a batch queued behind another batch's running render. Its first character pass starts beside
+        # the render, and the rest of the batch waits for the character pass.
+        self.m.workers.append(worker("dev", ["llm"], "linux"))
+        self.m.nomad_state["up"] = True
+
+        def queued(jid, seq, kind, n=None):
+            titles = {"character-pass": "Character pass", "screenplay": "Screenplay", "render": "Render"}
+            return {"id": jid, "seq": seq, "status": "queued", "kind": kind, "slug": "demo", "heavy": True,
+                    "batch": "b2", "created": "2026-11-11T11:05:00", "meta": {"chapters": [n] if n else []},
+                    "title": f"{titles[kind]} · ch {n}" if n else "Cast · everyone who needs a voice",
+                    "args": [kind, "demo"] + ([str(n)] if n else [])}
+
+        render = {**queued("r38", 1, "render", 38), "status": "running", "batch": "b1",
+                  "nomad": {"target": "mac", "node": "mac", "stage": 0, "stages": [{"class": "breeze", "args": []}],
+                            "contact": "t"}}
+        batch = [queued("c39", 2, "character-pass", 39), queued("c40", 3, "character-pass", 40),
+                 {**queued("cast", 4, "cast"), "title": "Cast · everyone who needs a voice"},
+                 queued("s39", 5, "screenplay", 39), queued("r39", 6, "render", 39)]
+        self.m.jobs = {j["id"]: j for j in [render] + batch}
+        dispatch = []
+        self.m._schedule(0.0, dispatch)
+        self.assertEqual(dispatch, ["c39"])
+        self.assertEqual(self.m.wait_reasons["c40"], "waiting for Character pass · ch 39, which changes the whole serial")
+        self.assertEqual(self.m.wait_reasons["r39"],
+                         "waiting for Character pass · ch 40, queued ahead of it on the same serial")
+        self.assertEqual({j["id"]: j["status"] for j in batch},
+                         {"c39": "running", "c40": "queued", "cast": "queued", "s39": "queued", "r39": "queued"})
+
+        # Bundles and its own chapter: a character pass waits until a running render has fetched its bundle, and a
+        # character pass on the render's chapter waits for the render.
+        self.m.jobs = {}
+        unfetched = {**render, "nomad": {**render["nomad"], "contact": None}}
+        self.assertEqual(self.m._blocker_for(queued("c41", 9, "character-pass", 41), "llm", [unfetched]),
+                         "waiting for Render · ch 38 to fetch its bundle")
+        self.assertEqual(self.m._blocker_for(queued("c38", 9, "character-pass", 38), "llm", [render]),
+                         "waiting for Render · ch 38, which changes the whole serial")
+
     def test_a_batch_job_waits_only_for_the_jobs_it_needs(self):
         self.m.workers.append(worker("dev", ["llm"], "linux"))
         self.m.nomad_state["up"] = True
@@ -383,13 +523,14 @@ class NodeChoiceTest(unittest.TestCase):
         self.m._finish(jobs["cast"], "failed", "exit 1 on laptop", 1)
         self.assertEqual(statuses(), {"s20": "skipped", "s21": "skipped", "r18": "skipped", "r20": "skipped",
                                       "r21": "skipped", "other": "queued", "cast": "failed"})
-        # A job skipped with the failed one skips the later jobs that wait for it, and not the earlier ones.
+        # A job skipped with the failed one skips the later jobs that wait for it, and not the earlier ones. The
+        # character pass is on the failed render's chapter, because one on another chapter doesn't wait for a render.
         jobs = batch()
         jobs["s20"]["status"] = "done"
-        jobs["c22"] = queued("c22", 4.5, "character-pass", 22)
+        jobs["c20"] = queued("c20", 4.5, "character-pass", 20)
         self.m._finish(jobs["r20"], "failed", "exit 1 on laptop", 1)
         self.assertEqual(statuses(), {"s20": "done", "s21": "queued", "r18": "queued", "r20": "failed",
-                                      "r21": "skipped", "other": "queued", "c22": "skipped"})
+                                      "r21": "skipped", "other": "queued", "c20": "skipped"})
         # A stopped job still skips every queued job of the batch.
         jobs = batch()
         self.m._finish(jobs["r18"], "stopped", "stopped from the web app")
@@ -757,6 +898,12 @@ class BiosJobTest(unittest.TestCase):
         self.assertTrue(conflicts(job("bios"), job("character-pass", chapters=[1])))
         self.assertTrue(conflicts(job("bios"), job("bios")))
         self.assertFalse(conflicts(job("bios"), job("cast", slug="other")))
+
+        # An import writes chapter files, the index and serial.yaml, and never the bible, so bios and an import
+        # don't wait for each other. A cast still waits for an import.
+        self.assertFalse(conflicts(job("bios"), job("fetch")))
+        self.assertFalse(conflicts(job("fetch"), job("bios")))
+        self.assertTrue(conflicts(job("cast"), job("fetch")))
 
 
 if __name__ == "__main__":

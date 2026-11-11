@@ -128,11 +128,19 @@ packs.
 
 Jobs on different chapters, serials or nodes run at the same time. Jobs on the same chapter wait for each other, and
 so does any job beside one that changes a whole serial (the character pass, a cast, casting bios, picking a voice,
-fetching), with one exception: a cast, casting bios, a voice pick, a say-as or a voice effect starts beside a running
+fetching from the site), with one exception: a cast, casting bios, a voice pick, a say-as or a voice effect starts beside a running
 render, screenplay or take check of its serial once that job has fetched its bundle, because it writes no chapter file
 and the bundle holds the chapter job's copy of the bible, voices, pronunciations and effects. It also passes a chapter job that waits ahead of it in
 its lane. A render queued after one of them still waits for it, and a cast's briefs stage still waits for a running
-screenplay, because the app runs one Claude job at a time. A laptop that sleeps through part of a render has 2 hours to come back before Nomad
+screenplay, because the app runs one Claude job at a time. Casting bios and a fetch or an import don't wait for each
+other, because a fetch writes chapter files, the index and `serial.yaml` and the bios write only the bible. The import
+of a saved page counts as a job on its chapter, because it writes only that chapter's files. It runs beside the renders,
+screenplays and take checks of other chapters, and beside a cast, casting bios, a voice pick, a say-as or a voice
+effect, once each running job of its serial has fetched its bundle, and a job that gets a bundle starts after a running
+import. Imports of one serial run one after the other. A character pass
+starts beside the renders, screenplays and take checks of other chapters on the same terms, because it writes the bible
+and its own chapter's files. It waits for a job on its own chapter, and every chapter job still waits for a character
+pass, because it reads the bible. A laptop that sleeps through part of a render has 2 hours to come back before Nomad
 gives the allocation up.
 
 A job of a Process batch waits by the same rules and for nothing else, so a chapter renders as soon as its screenplay
