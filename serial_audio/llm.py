@@ -78,12 +78,12 @@ def _estimate_cost(model_id: str, usage: dict) -> float | None:
 
 
 class ClaudeCodeBackend:
-    """Headless Claude Code under the subscription login.
+    """Headless Claude Code under the subscription: the token in CLAUDE_CODE_OAUTH_TOKEN, else the saved login.
 
     The chapter goes in on stdin (Windows caps argument length), the instruction is the
     -p argument, the system prompt replaces Claude Code's default through a temp file,
     all tools are off, and the schema answer comes back in `structured_output`. The
-    child environment must carry no ANTHROPIC_API_KEY: a key outranks the login.
+    child environment must carry no ANTHROPIC_API_KEY: a key outranks the token and the login.
     """
 
     name = "subscription"

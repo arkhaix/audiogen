@@ -21,7 +21,7 @@ home Nomad cluster.
 * containers, a Linux VM: the web app in Docker under `/opt/serial-audio`, and the library of record in `/opt/serial-audio/library`. It runs quick library jobs itself and dispatches the rest.
 * aj-legion5, AJ's Windows laptop with an 8 GB RTX 3070: the fast GPU node, with the classes `breeze` and `comfyui`. ComfyUI, its models and breeze-server are in `D:\comfy`, and `D:\fish` is a dev tree. Its Nomad tasks run as SYSTEM.
 * jsc-m1, AJ's M1 Mac with 16 GB: a slower `breeze` node, about 0.4x realtime against the laptop's 2x. Its tools are in `/Users/aj/serial-audio`, outside this repo. It has no ComfyUI, so it checks takes and casting candidates with Parakeet.
-* dev-arch, a Linux VM: the `llm` node, because the Claude passes need AJ's claude login, which lives there.
+* dev-arch, a Linux VM: the `llm` node. The Claude passes run aj's install of `claude` there and sign in with AJ's subscription token, which the job reads from the Nomad variable `nomad/jobs/serial-audio-llm`.
 
 Reach them by tailnet name: `ssh aj@containers`, `ssh aj@dev-arch`, `ssh jsc-m1`. From the Mac, `ssh
 aj-legion5-tailscale` reaches the laptop as an elevated user. Facts about the hosts themselves are in
@@ -79,7 +79,7 @@ export SERIAL_AUDIO_COMFY_OUTPUT="$S/output"
 ## Gotchas
 
 * Royal Road has answered the pipeline with HTTP 403 since 2026-11-05, and probing it counts as getting around a bot check. Don't try. Ingest a chapter from the page AJ saves in his browser, with `fetch <slug> <n> --html <file>` or an upload in the app.
-* The subscription backend runs `claude -p` with `--json-schema`, which needs `--max-turns` of 3 or more because the answer arrives as a tool call. The child's environment must not hold `ANTHROPIC_API_KEY`, because it outranks the login.
+* The subscription backend runs `claude -p` with `--json-schema`, which needs `--max-turns` of 3 or more because the answer arrives as a tool call. The child's environment must not hold `ANTHROPIC_API_KEY`, because it outranks the token and the login.
 * On macOS and Linux, a process started in the background from a non-interactive shell ignores SIGINT. Stop a CLI render with SIGTERM to its process group. breeze-server stays in that group, so it stops too. On Windows the CLI ties breeze-server to itself with a job object.
 * Over a non-interactive ssh session the Mac's PATH lacks `/opt/homebrew/bin`, where nomad, cmake and the Homebrew Pythons live. Export it first.
 * zsh doesn't word-split a variable that holds `env A=1 B=2`. Export the settings instead.
@@ -89,6 +89,8 @@ export SERIAL_AUDIO_COMFY_OUTPUT="$S/output"
 * While ComfyUI renders, the laptop's RAM is nearly full, and Claude Code's low-memory reaper kills background Bash commands. Launch long work detached with PowerShell `Start-Process`, and watch its log with a Monitor tail through `grep -a --line-buffered`, not `tr`.
 * Windows PowerShell 5.1's `*>>` appends UTF-16 to a UTF-8 log. Use pwsh.
 * The `Scripts\*.exe` launchers in ComfyUI's embedded Python, such as `hf.exe`, are broken. Download models with the `huggingface_hub` API from a script. Dry-run a pip change to the embedded Python first.
+* Git on the laptop has `core.autocrlf` true in its system config, so 19 of the deployed files had CRLF in the working tree on 2026-11-11, and a plain `tar` of the tree sends them to containers that way. A `git archive` does too unless `core.autocrlf` is off for that command. Deploy with the command in `deploy/README.md`, which sends LF. To check what is deployed, strip `\r` before comparing hashes.
+* A tar made on the Mac adds `._*` AppleDouble files unless `COPYFILE_DISABLE=1` is set. `/opt/serial-audio/src` held 56 of them on 2026-11-11, and 37 of those went out in every worker bundle, because `exchange.code_files` leaves out only `__pycache__`, `*.pyc` and the static folder. The `git archive` deploy doesn't add any.
 
 ## Updating
 

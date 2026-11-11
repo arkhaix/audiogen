@@ -34,6 +34,8 @@ KEY_HEADER = "X-Serial-Audio-Key"
 NODE_HEADER = "X-Serial-Audio-Node"
 STAGE_HEADER = "X-Serial-Audio-Stage"
 CHILD_ENV_DROP = ("CLAUDECODE", "NOMAD_TOKEN")
+CLAUDE_AUTH = "SERIAL_AUDIO_CLAUDE_AUTH"
+CLAUDE_TOKEN = "CLAUDE_CODE_OAUTH_TOKEN"
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 CREATE_NO_WINDOW = 0x08000000
 GPU_LOCK = Path(os.environ.get("SERIAL_AUDIO_GPU_LOCK") or (
@@ -214,6 +216,23 @@ def child_env(config: dict, work: Path) -> dict:
     env.update({str(k): str(v) for k, v in (config.get("env") or {}).items()})
     env.update({"PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8", "PYTHONPATH": str(work)})
     return env
+
+
+def claude_sign_in(env: dict) -> tuple[bool, str]:
+    """Checks that a job which must sign in to Claude with a token has one.
+
+    env: the CLI's environment, a dict of strings.
+    Returns (ok, a line for the job log). The line is empty when SERIAL_AUDIO_CLAUDE_AUTH is unset. Any value of
+    it but "token" is refused.
+    """
+    want = env.get(CLAUDE_AUTH) or ""
+    if not want:
+        return True, ""
+    if want != "token":
+        return False, f"[worker] {CLAUDE_AUTH} is {want!r}, and the only value it takes is 'token'"
+    if (env.get(CLAUDE_TOKEN) or "").strip():
+        return True, f"[worker] Claude signs in with the token in {CLAUDE_TOKEN}"
+    return False, f"[worker] this job must sign in to Claude with a token, and {CLAUDE_TOKEN} is not set (deploy/README.md)"
 
 
 def kill_tree(proc: subprocess.Popen) -> None:
@@ -397,7 +416,13 @@ def main(app_url: str, job: str, key: str, work: str | Path) -> int:
         wait_for_machine(comfy_url, log, stop)
     env = child_env(config, work)
     code = 0
-    for args in info.get("steps") or []:
+    steps = info.get("steps") or []
+    signed_in, line = claude_sign_in(env)
+    if line:
+        log.line(line)
+    if not signed_in:
+        code, steps = 1, []
+    for args in steps:
         if stop.is_set():
             break
         code = run_step(list(args), work, env, log, stop)

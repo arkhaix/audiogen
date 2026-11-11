@@ -40,11 +40,12 @@ variable "node" {
 }
 
 locals {
-  gpu = var.class != "llm"
+  gpu    = var.class != "llm"
+  job_id = var.node == "" ? "${var.prefix}-${var.class}" : "${var.prefix}-${var.class}-${var.node}"
 }
 
 job "serial-audio" {
-  id        = var.node == "" ? "${var.prefix}-${var.class}" : "${var.prefix}-${var.class}-${var.node}"
+  id        = local.job_id
   namespace = "serial-audio"
   type      = "batch"
 
@@ -70,8 +71,8 @@ job "serial-audio" {
       value     = constraint.value
     }
   }
-  # The Claude passes need AJ's claude login, which only a Linux client can
-  # reach by running the task as aj.
+  # The Claude passes run aj's install of claude, so the task runs as aj on a
+  # Linux client.
   dynamic "constraint" {
     for_each = var.class == "llm" ? ["linux"] : []
     content {
@@ -135,6 +136,22 @@ job "serial-audio" {
         right_delimiter = "]]]"
       }
 
+      # The Claude passes sign in with the token in the Nomad variable
+      # nomad/jobs/<job id>, item claude_oauth_token (deploy/README.md). A job
+      # reads only the variable at its own id.
+      dynamic "template" {
+        for_each = var.class == "llm" ? ["claude"] : []
+        content {
+          data        = "CLAUDE_CODE_OAUTH_TOKEN={{ with nomadVar \"nomad/jobs/${local.job_id}\" }}{{ .claude_oauth_token }}{{ end }}\n"
+          destination = "secrets/claude.env"
+          env         = true
+          perms       = "0400"
+          # A pass that is running keeps the token it started with.
+          change_mode          = "noop"
+          error_on_missing_key = true
+        }
+      }
+
       env = merge({
         SERIAL_AUDIO_APP    = var.app_url
         SERIAL_AUDIO_NODE   = "${node.unique.name}"
@@ -145,6 +162,8 @@ job "serial-audio" {
         HOME = "/home/aj"
         USER = "aj"
         PATH = "/home/aj/.local/bin:/home/aj/bin:/usr/local/bin:/usr/bin:/bin"
+        # The worker refuses the job when the token did not arrive.
+        SERIAL_AUDIO_CLAUDE_AUTH = "token"
       })
 
       resources {

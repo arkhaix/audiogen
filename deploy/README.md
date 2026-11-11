@@ -6,7 +6,7 @@ the job's class:
 
 * `breeze`: Breeze renders through breeze-server, and joining saved takes again. The laptop (aj-legion5).
 * `comfyui`: Drama 3 renders, casting voices, picking a voice and checking takes, which need ComfyUI or its output folder. The laptop.
-* `llm`: the character pass, the screenplay and the casting briefs, which need AJ's claude login. dev-arch.
+* `llm`: the character pass, the screenplay and the casting briefs, which run `claude` under AJ's subscription. dev-arch.
 
 A cast runs as two dispatches: the briefs on an `llm` node, then the voices on a `comfyui` node, which finds the
 briefs cached and doesn't call Claude.
@@ -28,12 +28,17 @@ The app listens on port 8765 on every interface, with host networking. https://a
 through haproxy on proxy. It answers only to the names in `--allow-host` and to `containers.*`, so a new proxy name
 needs a new `--allow-host` in `compose.yml`.
 
-Deploy a code change from the repo root on the laptop:
+Deploy a code change from the repo root, on the laptop or the Mac:
 
 ```
-tar cf - --exclude=__pycache__ serial_audio prompts schemas deploy | ssh aj@containers 'cd /opt/serial-audio/src && tar xf -'
+R=$(git stash create)
+git -c core.autocrlf=false archive ${R:-HEAD} serial_audio prompts schemas deploy | ssh aj@containers 'cd /opt/serial-audio/src && tar xf -'
 ssh aj@containers 'cd /opt/serial-audio && cp src/deploy/docker/compose.yml . && docker compose up -d --build'
 ```
+
+The archive holds the tracked files with their uncommitted edits, with LF line endings, and it doesn't make a stash
+entry. It leaves out an untracked file, so `git add` a new file first. A plain `tar` of the tree sends CRLF files from
+the laptop and `._*` files from the Mac (CLAUDE.md, Gotchas).
 
 Logs: `ssh aj@containers docker logs --tail 50 serial-audio`. A worker always runs the code the app runs, because it
 fetches the code with its job, so a deploy needs nothing on the nodes.
@@ -47,6 +52,7 @@ fetches the code with its job, so a deploy needs nothing on the nodes.
 * Pinned jobs `serial-audio-<class>-<node>`, one for each GPU class a GPU node offers: today `serial-audio-breeze-aj-legion5`, `serial-audio-comfyui-aj-legion5` and `serial-audio-breeze-jsc-m1`. The app picks the node for every GPU job and dispatches the pinned job.
 * Policy `serial-audio-dispatch` (`deploy/nomad/serial-audio-dispatch.policy.hcl`): list-jobs, read-job, dispatch-job and read-logs in the namespace, and node read. It can't register, change or stop a job.
 * Token `serial-audio dispatch (containers)`, accessor 682ddbca-a2ae-377b-7141-d2c07f58886c. The copy of record is the vault item `homelab-nomad-serial-audio-dispatch-token`. The working copy is `/opt/serial-audio/secrets/nomad-token`.
+* Variable `nomad/jobs/serial-audio-llm`, item `claude_oauth_token`: the working copy of AJ's Claude subscription token, which the Claude passes sign in with. The copy of record is the vault item `homelab-claude-subscription-token`. A request without a token and the dispatch token both get HTTP 403 for it (checked 2026-11-11).
 
 Register or update the jobs from the repo root with the management token, because the template reads
 `deploy/nomad/bootstrap.py` by relative path:
@@ -67,6 +73,24 @@ Rotate the token: `nomad acl token delete <accessor>`, then
 `nomad acl token create -name="serial-audio dispatch (containers)" -type=client -policy=serial-audio-dispatch`,
 write its secret to the vault item and to `secrets/nomad-token`, and run `docker compose restart`.
 
+The `llm` job's template reads the Claude token from the variable into `CLAUDE_CODE_OAUTH_TOKEN` when a task
+starts, and the job sets `SERIAL_AUDIO_CLAUDE_AUTH=token`, so the worker refuses a job that did not get one. A job
+log says `Claude signs in with the token in CLAUDE_CODE_OAUTH_TOKEN`. On the node the token is in the task's
+environment and in `secrets/claude.env` of its allocation, a file on tmpfs that only root can read and that stays
+until Nomad collects the finished allocation. A job reads only the variable at its own id, so a test instance with
+its own prefix needs its own variable, `nomad/jobs/<prefix>-llm`, before its Claude jobs can run. The token outranks the claude login in
+`/home/aj/.claude` on dev-arch, which the passes no longer use. It came from `claude setup-token` on 2026-11-11 and
+is valid for a year. Replace it: mint a new one in a terminal outside Claude Code, store it as the vault item's
+password, then write the variable from the vault with the management token, without printing either:
+
+```
+bw get password homelab-claude-subscription-token --session "$BW_SESSION" \
+  | jq -Rs '{Namespace: "serial-audio", Path: "nomad/jobs/serial-audio-llm", Items: {claude_oauth_token: gsub("[[:space:]]"; "")}}' \
+  | nomad var put -in json -force - >/dev/null
+```
+
+The next job uses the new token. A pass that is running keeps the one it started with.
+
 ---
 
 ## Nodes
@@ -81,12 +105,12 @@ A node offers classes through client meta:
 A GPU node also needs its pinned jobs registered (above).
 
 The laptop sets them in `C:\nomad\config\client.hcl` (copy in the ansible repo, `nomad/aj-legion5/client.hcl`), then
-`Restart-Service Nomad`. Its tasks run as SYSTEM. That works for renders and casting, which need no login, and
-rules out the Claude passes there. Its defaults are the pipeline's built-in `D:\comfy` paths, so it has no settings
-file. dev-arch has dynamic meta, set with
+`Restart-Service Nomad`. Its tasks run as SYSTEM, which works for renders and casting. The laptop's defaults are the
+pipeline's built-in `D:\comfy` paths, so it has no settings file. The Claude passes don't run there, because the
+`llm` job runs aj's install of `claude` on a Linux node. dev-arch has dynamic meta, set with
 `nomad node meta apply -node-id <id> serial_audio=llm serial_audio_python=/usr/bin/python3`. Remove it with
-`-unset serial_audio,serial_audio_python`. `llm` jobs run as aj there, so they use the claude login in
-`/home/aj/.claude`.
+`-unset serial_audio,serial_audio_python`. `llm` jobs run as aj there, because they use aj's install
+of `claude`. They sign in with the token in the Nomad variable (above), not with the login in `/home/aj/.claude`.
 
 A node with the class `breeze` needs breeze-server and its Q8_0 weights, and the Python with numpy and soundfile that
 joins the takes. A `comfyui` node needs ComfyUI on 127.0.0.1:8188 with the ComfyUI-Drama3 and ComfyUI-Qwen-TTS node
@@ -135,7 +159,7 @@ with the result, and the app keeps them in `state/media/`, so the Cast tab and t
 * A job's key is in its dispatch meta, which every tailnet device can read through Nomad's anonymous policy. It ties a worker's uploads to its own job. It is not a secret, and the app has no login either, so the tailnet stays the boundary.
 * The worker doesn't send back deleted files. Only fetch and reset-bible delete library files, and they run on the app's machine.
 * Saved Breeze takes stay on the node that made them. A rerun on another node renders every line again.
-* Tasks on the laptop run as SYSTEM, so the laptop can't run the Claude passes.
+* The Claude passes run only on a Linux node with aj's install of `claude`, which today is dev-arch.
 
 ---
 

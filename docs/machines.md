@@ -147,4 +147,4 @@ on 127.0.0.1, so query it with `NOMAD_ADDR=http://containers.goblin-truck.ts.net
 ## containers and dev-arch
 
 `deploy/README.md` covers both: the app's folder, deploys, logs and the dispatch token on containers, and dev-arch's
-dynamic node meta and claude login.
+dynamic node meta and the Claude token its jobs sign in with.

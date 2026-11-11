@@ -137,7 +137,8 @@ up split across CPU and GPU. It uses about 7.7 GB of the card and generates at a
 
 ## LLM backends
 
-`subscription` runs headless Claude Code (`claude -p`) under the claude.ai login, so it draws on
-subscription usage; `api` uses the Anthropic SDK and `ANTHROPIC_API_KEY`. `auto` tries the
+`subscription` runs headless Claude Code (`claude -p`) under AJ's Claude subscription, with the token in
+`CLAUDE_CODE_OAUTH_TOKEN` when the environment has one and the claude.ai login otherwise, so it draws on
+subscription usage. `api` uses the Anthropic SDK and `ANTHROPIC_API_KEY`. `auto` tries the
 subscription first and, on a usage-limit message, falls back to the API, waits for the reset, or fails,
 per `--on-limit`. Both backends get the same prompt, input, and schema; every chapter records which one ran.

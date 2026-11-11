@@ -628,6 +628,29 @@ class KeyAndLockTest(unittest.TestCase):
             self.assertIsNotNone(again)
             again.close()
 
+    def test_a_job_that_must_use_the_claude_token_is_refused_without_it(self):
+        from serial_audio import worker as w
+        # A job that does not ask for a token runs with whatever sign-in the node has, and logs nothing.
+        self.assertEqual(w.claude_sign_in({}), (True, ""))
+        self.assertEqual(w.claude_sign_in({"CLAUDE_CODE_OAUTH_TOKEN": "t"}), (True, ""))
+        # A job that asks for a token runs when it has one, and its log line does not hold the token.
+        ok, line = w.claude_sign_in({"SERIAL_AUDIO_CLAUDE_AUTH": "token", "CLAUDE_CODE_OAUTH_TOKEN": "sk-secret"})
+        self.assertTrue(ok)
+        self.assertIn("CLAUDE_CODE_OAUTH_TOKEN", line)
+        self.assertNotIn("sk-secret", line)
+        # Without a token, or with a blank one, it is refused.
+        for env in ({"SERIAL_AUDIO_CLAUDE_AUTH": "token"},
+                    {"SERIAL_AUDIO_CLAUDE_AUTH": "token", "CLAUDE_CODE_OAUTH_TOKEN": " \n"}):
+            ok, line = w.claude_sign_in(env)
+            self.assertFalse(ok)
+            self.assertIn("is not set", line)
+        # A misspelled setting is refused, with or without a token, so it can't turn the check off.
+        for value in ("Token", " token", "tokn"):
+            ok, line = w.claude_sign_in({"SERIAL_AUDIO_CLAUDE_AUTH": value, "CLAUDE_CODE_OAUTH_TOKEN": "sk-secret"})
+            self.assertFalse(ok)
+            self.assertIn("only value it takes", line)
+            self.assertNotIn("sk-secret", line)
+
 
 class VoiceEffectTest(unittest.TestCase):
     def setUp(self):
