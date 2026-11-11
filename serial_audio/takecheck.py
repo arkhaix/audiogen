@@ -66,11 +66,90 @@ def classify(expected: list[str], heard_text: str) -> dict:
             "verdict": verdict}
 
 
-def summarize(results: dict) -> dict:
-    """The render.check record for a set of per-take results."""
+def expected_words(line: dict, say: dict) -> list[str]:
+    """The words a take of this script line should say, with the bible's say-as map applied."""
+    return words(speakable(apply_say_as(line["text"], say)))
+
+
+def entry(take: dict, engine: str, verdict: dict) -> dict:
+    """The take_check.json entry for one take: the take and the recognizer the verdict is for, then the verdict."""
+    out = {"key": take["key"], "asr": engine, **verdict}
+    if take.get("audio"):
+        out["audio"] = take["audio"]
+    return out
+
+
+def reusable(old: dict, take: dict, engine: str) -> bool:
+    """Whether a saved entry holds this recognizer's transcript of this take's audio."""
+    return (old.get("key") == take.get("key") and old.get("audio") == take.get("audio")
+            and (old.get("asr") or "qwen3") == engine and isinstance(old.get("heard"), str))
+
+
+def badness(result: dict) -> tuple[int, int]:
+    """Orders verdicts from best to worst: by verdict in VERDICTS order, then by the count of wrong words."""
+    return VERDICTS.index(result["verdict"]), result["sub"] + result["del"] + result["ins"]
+
+
+def transcribe(todo: list[tuple[str, dict, list[str]]], engine: str, comfy_url: str, log) -> dict:
+    """Transcribes takes and judges each against its line.
+
+    todo: (line, take, expected words) per take, where take is its breeze_takes.json entry.
+    engine: "qwen3" or "parakeet".
+    comfy_url: the ComfyUI that runs Qwen3-ASR.
+    log: receives a progress line every REPORT_EVERY seconds.
+    Returns {line: take_check.json entry}. Raises ComfyError when the recognizer cannot run here or fails.
+    """
+    results = {}
+    if not todo:
+        return results
+    check_ready(engine, comfy_url)
+    start = last_report = time.time()
+    files = [Path(take["file"]) for _, take, _ in todo]
+    for done, (i, heard) in enumerate(transcripts(files, engine=engine, comfy_url=comfy_url), 1):
+        k, take, expected = todo[i]
+        results[k] = entry(take, engine, classify(expected, heard))
+        now = time.time()
+        if now - last_report >= REPORT_EVERY:
+            last_report = now
+            per = (now - start) / done
+            log(f"   [{(now - start) / 60:.0f} min] checked {done}/{len(todo)}, {per:.1f} s/take, "
+                f"~{per * (len(todo) - done) / 60:.0f} min left")
+    return results
+
+
+def check_entries(takes: dict, lines: list[dict], say: dict, *, engine: str, comfy_url: str, log) -> dict:
+    """The take_check.json entry for each take.
+
+    takes: {line: breeze_takes.json entry}.
+    lines: the script lines.
+    say: the bible's say-as map.
+    engine, comfy_url, log: as transcribe takes them.
+    Returns {line: entry}. Raises ComfyError when the recognizer cannot run here or fails.
+    """
+    todo = [(k, takes[k], expected_words(lines[int(k)], say)) for k in sorted(takes, key=int)]
+    return transcribe(todo, engine, comfy_url, log)
+
+
+def save_entries(folder: Path, entries: dict, engine: str) -> None:
+    """Writes entries into the chapter folder's take_check.json and keeps its entries for other lines."""
+    path = folder / CHECK_FILE
+    old = (lib.load_json(path).get("takes") or {}) if path.is_file() else {}
+    lib.save_json(path, {"at": lib.now_iso(), "model": model_name(engine), "asr": engine, "takes": {**old, **entries}})
+
+
+def summarize(results: dict, takes: dict | None = None) -> dict:
+    """The render.check record for a set of per-take results.
+
+    results: {line: take_check.json entry}.
+    takes: the chapter's breeze_takes.json entries. With them, the record lists under "retaken" the lines whose
+        take replaced a flagged one.
+    """
     out = {"at": lib.now_iso(), "file": CHECK_FILE, "checked": len(results)}
     for verdict in VERDICTS[1:]:
         out[verdict] = sorted(int(k) for k, r in results.items() if r["verdict"] == verdict)
+    retaken = sorted(int(k) for k, t in (takes or {}).items() if t.get("retaken") and k in results)
+    if retaken:
+        out["retaken"] = retaken
     return out
 
 
@@ -88,6 +167,8 @@ def describe(summary: dict) -> str:
         bits.append(f"{len(summary['suspect'])} suspect, usually name spellings")
     if summary.get("unreadable"):
         bits.append(f"{len(summary['unreadable'])} unreadable")
+    if summary.get("retaken"):
+        bits.append(f"{len(summary['retaken'])} taken again after a flag")
     return "take check: " + ", ".join(bits)
 
 
@@ -102,7 +183,7 @@ def check_takes(slug: str, number: int, *, comfy_url: str = "http://127.0.0.1:81
     redo: transcribe every take again instead of reusing the saved transcript of an unchanged take.
     asr: "qwen3" or "parakeet". None uses this machine's recognizer, from asr.choose.
     Returns the summary, which is also stored as render.check in chapter.yaml. A saved transcript is reused only
-    when the take and the recognizer are unchanged. Raises ComfyError when the chapter has no Breeze takes, the
+    when the take, its audio and the recognizer are unchanged. Raises ComfyError when the chapter has no Breeze takes, the
     recognizer cannot run here, a take file lies outside the ComfyUI output folder for Qwen3-ASR, or the
     recognizer fails.
     """
@@ -122,33 +203,20 @@ def check_takes(slug: str, number: int, *, comfy_url: str = "http://127.0.0.1:81
     todo = []
     for k in sorted(takes, key=int):
         take = takes[k]
-        expected = words(speakable(apply_say_as(lines[int(k)]["text"], say)))
+        expected = expected_words(lines[int(k)], say)
         old = previous.get(k) or {}
-        same_asr = (old.get("asr") or "qwen3") == engine
-        if old.get("key") == take.get("key") and same_asr and isinstance(old.get("heard"), str):
-            results[k] = {"key": take["key"], "asr": engine, **classify(expected, old["heard"])}
+        if reusable(old, take, engine):
+            results[k] = entry(take, engine, classify(expected, old["heard"]))
         else:
             todo.append((k, take, expected))
     log(f"   checking {len(todo)} takes with {LABELS[engine]}"
         + (f", {len(results)} already checked" if results else "") + "...")
 
     # Transcribe
-    if todo:
-        check_ready(engine, comfy_url)
-        start = last_report = time.time()
-        files = [Path(take["file"]) for _, take, _ in todo]
-        for done, (i, heard) in enumerate(transcripts(files, engine=engine, comfy_url=comfy_url), 1):
-            k, take, expected = todo[i]
-            results[k] = {"key": take["key"], "asr": engine, **classify(expected, heard)}
-            now = time.time()
-            if now - last_report >= REPORT_EVERY:
-                last_report = now
-                per = (now - start) / done
-                log(f"   [{(now - start) / 60:.0f} min] checked {done}/{len(todo)}, {per:.1f} s/take, "
-                    f"~{per * (len(todo) - done) / 60:.0f} min left")
+    results.update(transcribe(todo, engine, comfy_url, log))
 
     # Record
-    summary = summarize(results)
+    summary = summarize(results, takes)
     lib.save_json(check_path, {"at": summary["at"], "model": model_name(engine), "asr": engine, "takes": results})
     meta, _ = lib.load_chapter(slug, number)
     meta["render"]["check"] = summary

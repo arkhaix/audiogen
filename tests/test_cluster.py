@@ -14,6 +14,7 @@ from serial_audio.web.nomad import conflicts, job_stages, placement_wait, worker
 
 def make_root(base: Path) -> Path:
     for rel, text in {"serial_audio/__init__.py": "", "serial_audio/web/static/app.js": "ui", "prompts/p.md": "p",
+                      "serial_audio/._cli.py": "AppleDouble", "prompts/._p.md": "AppleDouble",
                       "schemas/s.json": "{}", "library/demo/serial.yaml": "title: Demo\n",
                       "library/demo/chapters/0001/chapter.yaml": "status: scripted\n",
                       "library/demo/audio/ch0001.opus": "old audio"}.items():
@@ -55,6 +56,8 @@ class ExchangeTest(unittest.TestCase):
         self.assertIn("library/demo/chapters/0001/chapter.yaml", self.names)
         self.assertNotIn("library/demo/audio/ch0001.opus", self.names)
         self.assertNotIn("serial_audio/web/static/app.js", self.names)
+        # The ._ files a tar from a Mac leaves beside the code are not code.
+        self.assertFalse([n for n in self.names if "/._" in n], self.names)
         self.assertFalse(self.info["manifest"]["audio/ch0001.opus"]["shipped"])
         self.assertEqual(self.info["steps"], [["chapters", "demo"]])
 
@@ -485,6 +488,77 @@ class NodeChoiceTest(unittest.TestCase):
         self.assertEqual(dispatch, ["s19", "r18"])
         self.assertEqual(self.m.jobs["r18"]["nomad"]["target"], "laptop")
         self.assertEqual(self.m.wait_reasons["r19"], "waiting for Screenplay · ch 19, which works on the same chapter")
+
+    def test_a_batch_that_imports_chapters_and_processes_them_runs_in_order(self):
+        from unittest import mock
+        from serial_audio import library as lib
+        from serial_audio.web import jobs
+
+        base = Path(self.tmp.name)
+        for patch in (mock.patch.object(lib, "LIBRARY", base / "library"),
+                      mock.patch.object(jobs, "INCOMING", base / "incoming")):
+            patch.start()
+            self.addCleanup(patch.stop)
+        lib.save_serial("demo", {"title": "Demo"})
+        lib.chapter_dir("demo", 1).mkdir(parents=True)
+        (base / "incoming" / "demo").mkdir(parents=True)
+        for n in (7, 8):
+            (base / "incoming" / "demo" / f"ch{n}.html").write_text("<html>", encoding="utf-8")
+        self.m.workers.append(worker("dev", ["llm"], "linux"))
+        self.m.nomad_state["up"] = True
+
+        def requests(*numbers):
+            def each(kind, params):
+                return [{"kind": kind, "params": {"slug": "demo", **params(n)}} for n in numbers]
+            return (each("fetch", lambda n: {"chapter": n, "html": f"ch{n}.html"})
+                    + each("character-pass", lambda n: {"chapters": str(n)})
+                    + [{"kind": "cast", "params": {"slug": "demo"}}]
+                    + each("screenplay", lambda n: {"chapters": str(n)})
+                    + each("render", lambda n: {"chapter": n}))
+
+        def schedule():
+            dispatch = []
+            with mock.patch.object(self.m, "_launch_local", side_effect=lambda j: j.update(status="running")):
+                self.m._schedule(0.0, dispatch)
+            return dispatch
+
+        # Queued behind the import of its chapter, a character pass or a screenplay names the chapter before it is
+        # on disk. Queued alone, it names only chapters on disk.
+        batch = self.m.submit(requests(7))
+        imp, chars, cast, script, render = batch
+        self.assertEqual([j["meta"].get("chapters") for j in batch], [[7], [7], None, [7], [7]])
+        self.assertEqual(len({j["batch"] for j in batch}), 1)
+        self.assertEqual(jobs.build("screenplay", {"slug": "demo", "chapters": "7"})["meta"]["chapters"], [])
+        self.assertEqual(jobs.build("character-pass", {"slug": "demo", "chapters": "all"}, coming={"demo": {7}})
+                         ["meta"]["chapters"], [1, 7])
+
+        # The import starts on the app's machine, and the rest of the batch waits for it in order.
+        self.assertEqual(schedule(), [])
+        self.assertEqual(imp["status"], "running")
+        self.assertIn("Import saved page · ch 7", self.m.wait_reasons[chars["id"]])
+        self.assertEqual(self.m.wait_reasons[render["id"]],
+                         "waiting for Character pass · ch 7, queued ahead of it on the same serial")
+        # The character pass follows the import, and the cast follows the character pass.
+        imp["status"] = "done"
+        self.assertEqual(schedule(), [chars["id"]])
+        chars["status"] = "done"
+        self.assertEqual(schedule(), [cast["id"]])
+        self.assertEqual(self.m.wait_reasons[render["id"]],
+                         "waiting for Screenplay · ch 7, queued ahead of it on the same serial")
+        # The render waits for its chapter's screenplay, which follows the cast.
+        cast["status"] = "done"
+        self.assertEqual(schedule(), [script["id"]])
+        self.assertEqual(self.m.wait_reasons[render["id"]],
+                         "waiting for Screenplay · ch 7, which works on the same chapter")
+
+        # A failed import skips its chapter's character pass and the jobs that wait for that one: the cast, and
+        # with it every screenplay and render. The other import and the earlier chapter's character pass go on.
+        self.m.jobs = {}
+        batch = self.m.submit(requests(7, 8))
+        self.m._finish(batch[1], "failed", "exit 1", 1)
+        self.assertEqual([j["status"] for j in batch], ["queued", "failed", "queued"] + ["skipped"] * 6)
+        self.assertEqual([j["title"] for j in batch[:4]], ["Import saved page · ch 7", "Import saved page · ch 8",
+                                                           "Character pass · ch 7", "Character pass · ch 8"])
 
     def test_a_failed_batch_job_skips_only_the_jobs_that_wait_for_it(self):
         def queued(jid, seq, kind, n=None, batch="b1"):

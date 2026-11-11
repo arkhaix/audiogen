@@ -53,7 +53,8 @@ python -m serial_audio.web                          # http://127.0.0.1:8765/, ev
 python -m serial_audio.web --host 100.81.138.51     # reachable over Tailscale, e.g. from a phone
 ```
 
-Run it from `D:\fish`. It shows each serial's chapters on the way to audio and plays rendered chapters,
+Run a local instance from a copy of the code that has its own `library/`, with its own `--state-dir`. The app shows
+each serial's chapters on the way to audio and plays rendered chapters,
 remembering the listening position per chapter. On the Cast tab you can play every candidate, file or approve
 one, recast with a new description, or cast the characters who have no voice yet. Each voice card shows the
 character's casting bio: age, race, station, temperament and habits of speech, without the plot. Write bios queues a
@@ -62,9 +63,28 @@ stands. The bible and pronunciations are searchable. The app has no login, so bi
 the machine's name, the `--host` address and any `--allow-host` name, and refuses POSTs from other web pages.
 A second instance on the same `.webapp/` or port refuses to start.
 
+With `--backup-dir <folder>` the app backs the library up once a day. It writes `snapshots/library-<time>.tar.gz`
+with every library file but the audio, the uploads in `incoming/` and `placement.json`, and keeps the newest 30. It
+copies new or changed audio to `library/<slug>/audio/` and never deletes an audio copy. The folder must hold a file named
+`.serial-audio-backup`, so an unmounted disk doesn't get a backup. The header says "backup failing" when the last try
+failed, and its tooltip gives the time of the last backup. `deploy/README.md` has the restore steps.
+
+On a browser that can write to a folder (one with `showDirectoryPicker`), the serial page has a Save to this device
+button. The first time, it asks for a folder, such as the root folder of Smart AudioBook Player. It writes every
+rendered chapter that the device doesn't have yet to `<serial title>/<NNN> - <chapter title>.opus` there. A chapter you
+delete after listening is written again only after a new render. The browser remembers the folder and the saved
+chapters, so another browser, or the same one after its site data is cleared, starts over.
+
+With `--publish-dir <folder>` the app copies every rendered chapter to `<serial title>/<NNN> - <chapter title>.opus`
+in that folder within five minutes of its render, for an audiobook player that reads one folder per book. A chapter
+is copied again only after it is rendered again, so a copy you delete after listening stays deleted. The app doesn't
+write into a folder it did not make, and the `--publish-dir` folder must already hold something, which shows that its
+disk is mounted. `--publish-skip <slug>` keeps a serial out. The header says "audiobook folders failing" when a pass failed.
+
 Every change goes through `python -m serial_audio.cli` as a background job, under `serial_audio/web/runjob.py`,
 so a job keeps running when the server stops and is picked up again when it starts. Job records and logs live in
-`.webapp/`. Heavy jobs (character pass, screenplay, cast, casting bios, render) run one at a time, in order, and wait while
+`.webapp/`. The rest of this paragraph is the one-machine executor (`--executor local`), and `deploy/README.md` has
+the cluster's rules. Heavy jobs (character pass, screenplay, cast, casting bios, render) run one at a time, in order, and wait while
 any pipeline process the app did not start is running, including a PowerShell script that calls the CLI, or
 while ComfyUI is busy with a prompt the app did not queue. A render or cast that queues ComfyUI prompts also waits
 for ComfyUI to answer. A Breeze render under `breeze-server` does not, so it runs with ComfyUI down. A render job is
@@ -79,6 +99,12 @@ player, and a Check takes button that runs it as a job.
 Every chapter with audio has a download button on the serial page and the chapter page. `GET /download/<slug>/<n>`
 sends the file as an attachment named `<serial> - <NNN> - <chapter title>.opus`, so an audiobook reader on a phone
 sorts the chapters in order.
+On a Royal Road serial, Import saved pages has a box named process the chapters after import. With it ticked, the
+import queues one batch: the imports, then each imported chapter's character pass, a cast of new voices, its
+screenplay and its render, with the Process dialog's defaults and the LLM settings last chosen in a dialog. Only a
+chapter that nothing has been made from yet is processed: a new chapter, or one on disk at status `fetched` whose text
+is replaced. A replaced chapter that has a character pass, a script or audio from its old text is left for the Process
+dialog and its redo boxes. The browser remembers the box.
 The bible page lists the pronunciations with their say-as overrides first. Edit, Override and Add an override queue a
 quick `say-as` job, and the table refreshes when it finishes. `say-as <slug> <term> <spoken>` does the same from the
 command line, and `--clear` removes an override. A term added only for an override has no respelling, and clearing
@@ -119,7 +145,11 @@ its override removes the entry.
    line. The `cpp` runner refuses to start while any other breeze-server runs, and a take whose length
    does not fit its line is taken again with new seeds, up to twice. `breeze_takes.json` in the chapter folder lists the
    takes, so a rerun renders only new or changed lines and `--decode-only` joins the saved takes again.
-   After the join, `render` checks the new takes: a speech recognizer transcribes each one, the words are aligned
+   Before the join, when the recognizer is Parakeet, `render` transcribes the new takes while breeze-server is still
+   up. It takes a flagged line again with new seeds, in up to two rounds, and keeps a new take only when its transcript is
+   closer to the line. `breeze_takes.json` marks a replaced take with `retaken`, and `render.check` lists those lines.
+   A take that came from an earlier render is not taken again.
+   After the join, `render` checks the new takes, and reuses the transcripts made before the join: a speech recognizer transcribes each one, the words are aligned
    with the script line, and a take with three or more inserted or dropped words is flagged, in `take_check.json`
    beside the script and as `render.check` in `chapter.yaml`. A take with a high word error rate but fewer slips is
    suspect, usually a name the recognizer spelled its own way. When the recognizer can't run, the check is skipped and
@@ -134,8 +164,8 @@ its override removes the entry.
    take fades in and out over 3 ms, because Breeze sometimes starts a take at full level on its first sample. The
    chapter's `render.clicks_filled` counts the clicks filled in.
 
-ComfyUI (portable, `D:\comfy`) must be running with the ComfyUI-Drama3 and ComfyUI-Qwen-TTS node
-packs. Every ComfyUI step runs as its own prompt with `POST /free` in between: on an 8 GB card the
+A Drama 3 render and a Qwen cast need ComfyUI (portable, `D:\comfy`) running with the ComfyUI-Drama3 and
+ComfyUI-Qwen-TTS node packs. A Breeze render under breeze-server and a Breeze cast don't. Every ComfyUI step runs as its own prompt with `POST /free` in between: on an 8 GB card the
 Drama 3 codec must load alone, or ComfyUI loads it partially and it fails with a device mismatch.
 The `cpp` runner uses about 3.8 GB of the card and generates at about 2x realtime. It asks ComfyUI to
 unload its models first. The `comfyui` runner needs the ComfyUI-Breeze-TTS-2 node pack and ComfyUI

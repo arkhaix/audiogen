@@ -810,7 +810,7 @@ class NomadJobManager(JobManager):
         if mtime and time.time() - mtime > STALE_LOG_SECONDS:
             return 86400.0
         eta = float(p["eta"])
-        if job["kind"] == "render" and p.get("phase") not in ("checking", "done"):
+        if job["kind"] == "render" and p.get("phase") not in ("checking", "done") and not p.get("prechecked"):
             eta += 30 + CHECK_PER_TAKE * ((job.get("meta") or {}).get("lines") or DEFAULT_LINES)
         return eta
 

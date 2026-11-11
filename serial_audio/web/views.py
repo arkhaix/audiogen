@@ -178,6 +178,23 @@ def download_name(serial_title: str, number: int, width: int, title: str | None,
     return " - ".join(p for p in parts if p)[:180].rstrip(" .") + suffix
 
 
+def book_folder(serial: dict, slug: str) -> str:
+    """The folder name a serial has in an audiobook player's library: its title, or its slug without one."""
+    return _file_safe(str(serial.get("title") or "")) or slug
+
+
+def book_file(number: int, numbers: list[int], meta: dict, suffix: str) -> str:
+    """The name a chapter's audio has inside its serial's audiobook folder, "<NNN> - <title><suffix>".
+
+    number: the chapter.
+    numbers: every chapter number of the serial, which sets how many digits the number is padded to.
+    meta: the chapter's record, for its title or label.
+    suffix: the audio file's suffix.
+    """
+    width = max(3, len(str(max(numbers, default=number))))
+    return download_name("", number, width, meta.get("title") or meta.get("label"), suffix)
+
+
 def chapter_download(slug: str, n: int) -> tuple[Path, str]:
     """The chapter's audio file and the name to save it under. Raises FileNotFoundError when it has no audio."""
     meta = _chapter_meta(slug, n)
@@ -223,7 +240,8 @@ def serial_detail(slug: str, minutes_per_line: float) -> dict:
     voices = _voice_records(slug)
     policy = set((serial.get("casting_policy") or {}).get("dedicated_voice_for") or ["major", "recurring"])
     rows = []
-    for n in lib.list_chapters(slug):
+    numbers = lib.list_chapters(slug)
+    for n in numbers:
         meta = _chapter_meta(slug, n)
         script = meta.get("script") or {}
         speakers =[s for s in script.get("speakers") or meta.get("characters_present") or [] if s != "narrator"]
@@ -247,6 +265,7 @@ def serial_detail(slug: str, minutes_per_line: float) -> dict:
             "lines": script.get("lines"), "coverage": script.get("coverage"), "speakers": speakers,
             "present": len(meta.get("characters_present") or []), "summary": meta.get("summary"),
             "audio": lib_media(audio) if audio else None, "rendered_at": (meta.get("render") or {}).get("at"),
+            "save_name": book_file(n, numbers, meta, audio.suffix) if audio else None,
             "has_notes": (folder / "author_notes.md").is_file(), "will_cast": will_cast,
             "narrator_reads": narrator_reads, "unapproved": unapproved,
             "estimate_minutes": round(script["lines"] * minutes_per_line) if script.get("lines") else None,
@@ -258,6 +277,7 @@ def serial_detail(slug: str, minutes_per_line: float) -> dict:
     incoming_dir = INCOMING / slug
     incoming = sorted(p.name for p in incoming_dir.iterdir() if p.is_file()) if incoming_dir.is_dir() else []
     return {"serial": serial, "chapters": rows, "remote": remote, "index_checked": index.get("checked_at"),
+            "folder": book_folder(serial, slug),
             "voices_pending": sum(1 for v in voices.values() if v.get("status") != "approved"),
             "characters": len(chars), "incoming": incoming, "minutes_per_line": minutes_per_line,
             "render_engine": engine, "render_runner": runner}

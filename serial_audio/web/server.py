@@ -54,6 +54,7 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "serial_audio_web/0.1"
     timeout = 60
     manager: JobManager
+    mirror = None
     allowed_names: set[str] = set()
     machine_name = ""
 
@@ -279,6 +280,8 @@ def get_state(h: Handler, q):
     finished = [j for j in snap["jobs"] if j["status"] in FINISHED]
     snap["finished_total"] = len(finished)
     snap["jobs"] = active + (finished if q.get("all") else finished[:RECENT_FINISHED])
+    if h.mirror is not None:
+        snap["mirror"] = h.mirror.status()
     h._send_json(snap)
 
 
@@ -488,14 +491,16 @@ class Server(ThreadingHTTPServer):
         super().server_bind()
 
 
-def serve(host: str, port: int, manager: JobManager, allow_hosts: list[str] | None = None) -> None:
+def serve(host: str, port: int, manager: JobManager, allow_hosts: list[str] | None = None, mirror=None) -> None:
     """Serves the app until interrupted.
 
     host, port: the address to listen on.
     manager: the job manager the API drives.
     allow_hosts: extra host names browsers may use to reach the app.
+    mirror: a mirror.Mirror to run beside the app, or None.
     """
     Handler.manager = manager
+    Handler.mirror = mirror
     if getattr(manager, "media_dir", None) is not None:
         views.MEDIA_MIRROR = manager.media_dir
     Handler.machine_name = socket.gethostname().lower()
@@ -503,11 +508,15 @@ def serve(host: str, port: int, manager: JobManager, allow_hosts: list[str] | No
                              *(h.lower() for h in allow_hosts or [])}
     httpd = Server((host, port), Handler)
     manager.start()
+    if mirror is not None:
+        mirror.start()
     print(f"serial_audio web app: http://{host}:{port}/", flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        if mirror is not None:
+            mirror.stop()
         manager.stop()
         httpd.server_close()

@@ -14,11 +14,11 @@ home Nomad cluster.
 * `docs/machines.md`: what each machine holds and how to rebuild it.
 * `docs/casting.md`: how to write a voice brief that works, the cast so far and the voices still to cast.
 * `deploy/macos/ggml-metal-left-pad.patch`: the ggml fix the Mac's Metal breeze-server needs.
-* `tests/`: unit tests for the cluster, casting, the speech recognizers and the Breeze join's click repair, and a fake Nomad end-to-end test.
+* `tests/`: unit tests for the cluster, casting, the speech recognizers and the retakes of flagged takes, the backup and the audiobook folders, the parsers and the Claude passes, and the Breeze join's click repair, and a fake Nomad end-to-end test.
 
 ## Where things run
 
-* containers, a Linux VM: the web app in Docker under `/opt/serial-audio`, and the library of record in `/opt/serial-audio/library`. It runs quick library jobs itself and dispatches the rest.
+* containers, a Linux VM: the web app in Docker under `/opt/serial-audio`, and the library of record in `/opt/serial-audio/library`. It runs quick library jobs itself and dispatches the rest. It backs the library up once a day to `/mnt/nfs/serial-audio/backup` on storage's NFS share.
 * aj-legion5, AJ's Windows laptop with an 8 GB RTX 3070: the fast GPU node, with the classes `breeze` and `comfyui`. ComfyUI, its models and breeze-server are in `D:\comfy`, and `D:\fish` is a dev tree. Its Nomad tasks run as SYSTEM.
 * jsc-m1, AJ's M1 Mac with 16 GB: a slower `breeze` node, about 0.4x realtime against the laptop's 2x. Its tools are in `/Users/aj/serial-audio`, outside this repo. It has no ComfyUI, so it checks takes and casting candidates with Parakeet.
 * dev-arch, a Linux VM: the `llm` node. The Claude passes run aj's install of `claude` there and sign in with AJ's subscription token, which the job reads from the Nomad variable `nomad/jobs/serial-audio-llm`.
@@ -56,7 +56,7 @@ is deployed to containers.
 
 ## Testing
 
-* Run `python -m unittest tests.test_cluster tests.test_casting tests.test_asr` and `python tests/e2e_fake_nomad.py` after any change. The end-to-end test covers the cluster exchange and scheduling.
+* Run `python -m unittest tests.test_cluster tests.test_casting tests.test_asr tests.test_mirror tests.test_text` and `python tests/e2e_fake_nomad.py` after any change. The end-to-end test covers the cluster exchange and scheduling.
 * After a change to `fx.py` or `breeze_join.py`, also run `tests/test_fx.py` under the audio Python, with `D:\comfy\python_embeded\python.exe -I tests/test_fx.py` on the laptop. The plain Python skips it.
 * Check a pipeline change in a scratch copy with the layout a worker gets: the code, and one serial's folder without its audio, copied from containers. Point the output folder at the scratch copy too, so its takes can't land beside the node's real ones. On the Mac, from the clone:
 
@@ -90,7 +90,7 @@ export SERIAL_AUDIO_COMFY_OUTPUT="$S/output"
 * Windows PowerShell 5.1's `*>>` appends UTF-16 to a UTF-8 log. Use pwsh.
 * The `Scripts\*.exe` launchers in ComfyUI's embedded Python, such as `hf.exe`, are broken. Download models with the `huggingface_hub` API from a script. Dry-run a pip change to the embedded Python first.
 * Git on the laptop has `core.autocrlf` true in its system config, so 19 of the deployed files had CRLF in the working tree on 2026-11-11, and a plain `tar` of the tree sends them to containers that way. A `git archive` does too unless `core.autocrlf` is off for that command. Deploy with the command in `deploy/README.md`, which sends LF. To check what is deployed, strip `\r` before comparing hashes.
-* A tar made on the Mac adds `._*` AppleDouble files unless `COPYFILE_DISABLE=1` is set. `/opt/serial-audio/src` held 56 of them on 2026-11-11, and 37 of those went out in every worker bundle, because `exchange.code_files` leaves out only `__pycache__`, `*.pyc` and the static folder. The `git archive` deploy doesn't add any.
+* A tar made on the Mac adds `._*` AppleDouble files unless `COPYFILE_DISABLE=1` is set. `/opt/serial-audio/src` held 56 of them on 2026-11-11. `exchange.code_files` leaves `._*` files out of a worker bundle. The `git archive` deploy doesn't add any.
 
 ## Updating
 

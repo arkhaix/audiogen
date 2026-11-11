@@ -156,6 +156,63 @@ function toast(message, bad = false) {
   setTimeout(() => el.remove(), bad ? 9000 : 3500);
 }
 
+// Saving chapters into a folder on this device, for an audiobook player that reads one folder per book
+
+const canSaveToFolder = "showDirectoryPicker" in window;
+const saveMark = (c) => `${c.audio.bytes}-${c.rendered_at || ""}`;
+
+function unsaved(slug, sd) {
+  const saved = store.get(`saved:${slug}`, {});
+  return sd.chapters.filter((c) => c.audio && c.save_name && saved[c.number]?.mark !== saveMark(c));
+}
+
+function kv(mode, fn) {
+  return new Promise((resolve, reject) => {
+    const open = indexedDB.open("serial-audio", 1);
+    open.onupgradeneeded = () => open.result.createObjectStore("kv");
+    open.onerror = () => reject(open.error);
+    open.onsuccess = () => {
+      const tx = open.result.transaction("kv", mode);
+      const req = fn(tx.objectStore("kv"));
+      tx.oncomplete = () => { open.result.close(); resolve(req.result); };
+      tx.onerror = () => { open.result.close(); reject(tx.error); };
+    };
+  });
+}
+
+// The folder picked before, when the browser still allows writing to it, else a newly picked one
+async function bookRoot() {
+  let root = await kv("readonly", (s) => s.get("book-root")).catch(() => null);
+  const mode = { mode: "readwrite" };
+  if (root && (await root.queryPermission(mode)) !== "granted" && (await root.requestPermission(mode)) !== "granted") root = null;
+  if (!root) {
+    root = await window.showDirectoryPicker({ id: "audiobooks", ...mode });
+    await kv("readwrite", (s) => s.put(root, "book-root")).catch(() => null);
+  }
+  return root;
+}
+
+// Writes each chapter that is new, or rendered again, since it was last saved. A chapter deleted from the folder
+// stays deleted. Returns how many it wrote.
+async function saveChapters(root, slug, sd, onProgress) {
+  const folder = await root.getDirectoryHandle(sd.folder, { create: true });
+  const saved = store.get(`saved:${slug}`, {});
+  const todo = unsaved(slug, sd);
+  for (const [i, c] of todo.entries()) {
+    onProgress(i + 1, todo.length);
+    const res = await fetch(c.audio.url);
+    if (!res.ok) throw new Error(`Chapter ${c.number} did not download: ${res.status} ${res.statusText}`);
+    const out = await (await folder.getFileHandle(c.save_name, { create: true })).createWritable();
+    await out.write(await res.blob());
+    await out.close();
+    const old = saved[c.number]?.name;
+    if (old && old !== c.save_name) await folder.removeEntry(old).catch(() => null);
+    saved[c.number] = { mark: saveMark(c), name: c.save_name };
+    store.set(`saved:${slug}`, saved);
+  }
+  return todo.length;
+}
+
 // State and routing
 
 const S = {
@@ -373,6 +430,10 @@ function renderHeader() {
   const { pct, eta } = progressBits(p);
   if (pct != null) text += ` · ${pct}%`;
   if (eta) text += ` · ${eta}`;
+  const bk = st.mirror?.backup;
+  const pb = st.mirror?.publish;
+  if (bk && !bk.ok) text += " · backup failing";
+  if (pb && !pb.ok) text += " · audiobook folders failing";
   if (S.stateError) text = "web app not reachable";
   const c = st.comfy || {};
   const cluster = st.executor === "nomad";
@@ -382,6 +443,8 @@ function renderHeader() {
   a.title = cluster
     ? (st.nomad?.up ? `Workers ready: ${ready.map((w) => w.name).join(", ") || "none"}` : "Nomad is not reachable")
     : c.up ? `ComfyUI ${c.version || ""} is up. RAM free ${gb(c.ram_free)}.` : "ComfyUI is not reachable";
+  if (bk) a.title += ` Last backup: ${bk.last ? when(bk.last) : "none yet"}${bk.ok ? "" : ` (${bk.error})`}.`;
+  if (pb && !pb.ok) a.title += ` Audiobook folders: ${pb.errors.join(", ")}.`;
   a.innerHTML = `<span class="dot ${dot}"></span><span class="txt">${esc(text)}</span>`
     + (pct != null ? `<div class="bar hide-sm"><i style="width:${pct}%"></i></div>` : "");
 }
@@ -647,11 +710,15 @@ function chaptersTab(sd, slug) {
   }
   const allOn = rows.length > 0 && rows.every((c) => sel.has(c.number));
   const filters = ["all", ...STATUSES].map((st) => `<button class="${f === st ? "on" : ""}" data-act="filter" data-status="${st}">${st}${st === "all" ? "" : ` ${counts[st] || 0}`}</button>`).join("");
+  const fresh = canSaveToFolder ? unsaved(slug, sd).length : 0;
+  const saveBtn = canSaveToFolder && sd.chapters.some((c) => c.audio)
+    ? `<button class="sm ghost" data-act="save-folder" ${fresh ? "" : "disabled"} title="Write the rendered chapters into a folder on this device, for an audiobook player that reads one folder per book">${fresh ? `Save ${fresh} to this device` : "All saved to this device"}</button>` : "";
   return `<div class="panel">
       <div class="toolbar">
         <label class="inline"><input type="checkbox" data-change="sel-all" ${allOn ? "checked" : ""} aria-label="Select all shown"> <span class="small">${sel.size ? `${sel.size} selected` : "Select"}</span></label>
         <button class="sm ghost" data-act="sel-next" data-count="5">Next 5 to render</button>
         ${sel.size ? `<button class="sm ghost" data-act="sel-none">Clear</button>` : ""}
+        ${saveBtn}
         <span class="grow"></span>
         <div class="filters">${filters}</div>
         <button class="primary" data-act="process" ${sel.size ? "" : "disabled"}>Process…</button>
@@ -712,6 +779,7 @@ function addChapters(sd, slug) {
         ${imports.length ? `<div class="table-wrap" style="margin-top:10px"><table class="list"><thead><tr><th>File</th><th>Chapter</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>
           <div class="row" style="margin-top:10px">
             <label class="inline small"><input type="checkbox" id="import-force"> replace chapter text already on disk</label>
+            <label class="inline small" title="Queues the character pass, new voices, the screenplay and the render behind each import, with the Process dialog's defaults"><input type="checkbox" id="import-process" data-change="import-process"${store.get("importProcess", false) ? " checked" : ""}> process the chapters after import</label>
             <span class="grow"></span>
             <button class="ghost" data-act="import-clear" data-slug="${esc(slug)}">Clear</button>
             <button class="primary" data-act="import-go" data-slug="${esc(slug)}">Import ${plural(imports.length, "page")}</button>
@@ -750,16 +818,25 @@ async function voicesFor(slug) {
   return get(`/api/serials/${slug}/voices`);
 }
 
+async function nextCastSeed(slug) {
+  try {
+    return (await voicesFor(slug)).next_seed;
+  } catch (e) {
+    return 1000;
+  }
+}
+
+// The fetched chapters before the last of `numbers` that are not among them. A character pass on `numbers` skips them.
+function bibleGaps(sd, numbers) {
+  return sd.chapters.filter((c) => c.status === "fetched" && c.number < numbers[numbers.length - 1] && !numbers.includes(c.number))
+    .map((c) => c.number);
+}
+
 async function openProcess(slug) {
   const sd = S.data[routeKey(S.route)].serial;
   const sel = [...selFor(slug)].sort((a, b) => a - b);
   const rows = sd.chapters.filter((c) => sel.includes(c.number));
-  let nextSeed = 1000;
-  try {
-    nextSeed = (await voicesFor(slug)).next_seed;
-  } catch (e) {
-    nextSeed = 1000;
-  }
+  const nextSeed = await nextCastSeed(slug);
   const needChars = rows.filter((c) => c.status === "fetched");
   const needScript = rows.filter((c) => c.status === "fetched" || c.status === "characters");
   const needRender = rows.filter((c) => c.status !== "rendered");
@@ -798,7 +875,7 @@ async function openProcess(slug) {
       $("#dlg-note").textContent = `${plural(jobs.length, "job")}${minutes ? `, rendering about ${span(minutes * 60)}` : ""}`;
       $("#dlg-submit").disabled = !jobs.length;
       const warn = [];
-      const gaps = sd.chapters.filter((c) => c.status === "fetched" && c.number < sel[sel.length - 1] && !sel.includes(c.number)).map((c) => c.number);
+      const gaps = bibleGaps(sd, sel);
       if (checked(form, "do_characters") && gaps.length) {
         warn.push(`Chapter ${esc(rangeText(gaps))} ${gaps.length === 1 ? "has" : "have"} no character pass and ${gaps.length === 1 ? "is" : "are"} not selected. The bible for later chapters will miss ${gaps.length === 1 ? "its" : "their"} characters.`);
       }
@@ -822,34 +899,61 @@ async function openProcess(slug) {
 }
 
 function buildProcess(form, rows, slug) {
-  const llm = llmParams(form);
+  return processJobs(slug, rows, {
+    characters: checked(form, "do_characters"), redoCharacters: checked(form, "redo_characters"),
+    cast: checked(form, "do_cast"), candidates: num(form, "candidates"), castSeed: num(form, "cast_seed"),
+    script: checked(form, "do_script"), redoScript: checked(form, "redo_script"),
+    render: checked(form, "do_render"), rerender: checked(form, "rerender"), renderSeed: num(form, "render_seed"),
+    llm: llmParams(form),
+  });
+}
+
+// The jobs that take the chapters in rows through the stages switched on in o, in the order they run.
+function processJobs(slug, rows, o) {
   const jobs = [];
-  if (checked(form, "do_characters")) {
+  if (o.characters) {
     for (const c of rows) {
-      if (c.status === "fetched" || checked(form, "redo_characters")) {
-        jobs.push({ kind: "character-pass", params: { slug, chapters: String(c.number), redo: c.status !== "fetched", ...llm } });
+      if (c.status === "fetched" || o.redoCharacters) {
+        jobs.push({ kind: "character-pass", params: { slug, chapters: String(c.number), redo: c.status !== "fetched", ...o.llm } });
       }
     }
   }
-  if (checked(form, "do_cast")) {
-    jobs.push({ kind: "cast", params: { slug, candidates: num(form, "candidates"), seed: num(form, "cast_seed"), ...llm } });
+  if (o.cast) {
+    jobs.push({ kind: "cast", params: { slug, candidates: o.candidates, seed: o.castSeed, ...o.llm } });
   }
-  if (checked(form, "do_script")) {
+  if (o.script) {
     for (const c of rows) {
       const done = c.status === "scripted" || c.status === "rendered";
-      if (!done || checked(form, "redo_script")) {
-        jobs.push({ kind: "screenplay", params: { slug, chapters: String(c.number), redo: done, ...llm } });
+      if (!done || o.redoScript) {
+        jobs.push({ kind: "screenplay", params: { slug, chapters: String(c.number), redo: done, ...o.llm } });
       }
     }
   }
-  if (checked(form, "do_render")) {
+  if (o.render) {
     for (const c of rows) {
-      if ((c.status !== "rendered" || checked(form, "rerender")) && !chapterBusy(slug, c.number, "render")) {
-        jobs.push({ kind: "render", params: { slug, chapter: c.number, seed: num(form, "render_seed") } });
+      if ((c.status !== "rendered" || o.rerender) && !chapterBusy(slug, c.number, "render")) {
+        jobs.push({ kind: "render", params: { slug, chapter: c.number, seed: o.renderSeed } });
       }
     }
   }
   return jobs;
+}
+
+// The chapters of an import that nothing has been made from yet, as chapter rows: every picked chapter that is new,
+// and with `force` each one on disk that is still at fetched.
+function importRows(sd, items, force) {
+  const numbers = [...new Set(items.map((it) => it.n))].sort((a, b) => a - b);
+  const onDisk = new Map(sd.chapters.map((c) => [c.number, c]));
+  return numbers.filter((n) => !onDisk.has(n) || (force && onDisk.get(n).status === "fetched"))
+    .map((n) => onDisk.get(n) || { number: n, status: "fetched", will_cast: [] });
+}
+
+// The Process dialog's default jobs for the rows of an import, which are all at fetched.
+async function importProcessJobs(slug, rows) {
+  return processJobs(slug, rows, {
+    characters: true, cast: true, script: true, render: true,
+    candidates: 3, castSeed: await nextCastSeed(slug), renderSeed: 1, llm: storedLLM(),
+  });
 }
 
 async function nextStep(slug, n) {
@@ -953,7 +1057,8 @@ function takeCheck(d) {
   if (!c) head = "The takes have not been checked against the script.";
   else if (c.skipped) head = `Take check skipped ${esc(when(c.at))}: ${esc(c.skipped)}`;
   else head = `<b>Take check.</b> ` + [`${c.checked} takes checked ${esc(when(c.at))}`, `${(c.flagged || []).length} flagged`,
-    c.suspect?.length ? `${c.suspect.length} suspect` : "", c.unreadable?.length ? `${c.unreadable.length} unreadable` : ""].filter(Boolean).join(" · ");
+    c.suspect?.length ? `${c.suspect.length} suspect` : "", c.unreadable?.length ? `${c.unreadable.length} unreadable` : "",
+    c.retaken?.length ? `${c.retaken.length} taken again after a flag` : ""].filter(Boolean).join(" · ");
   const why = (t) => t.verdict === "out_of_range" ? `${clock(t.seconds || 0)} for ${t.said.split(/\s+/).length} words, kept after retakes`
     : `${t.ins} inserted, ${t.del} dropped, ${t.sub} changed`;
   const row = (t) => `<div class="stack"><div class="row tight"><span class="pill ${listen.includes(t) ? "failed" : "auto"}">${esc(t.verdict.replace("_", " "))}</span><b>line ${t.line + 1}</b>${chip(t.speaker, t.name || t.speaker)}${t.direction ? `<span class="dir small">${esc(t.direction)}</span>` : ""}<span class="small muted">${why(t)}</span></div>
@@ -1402,6 +1507,24 @@ const ACT = {
   "dlg-close": () => $("#dlg").close(),
   "log-close": closeLog,
   "sel-none": () => { selFor(S.route.slug).clear(); paint(); },
+  "save-folder": async (el) => {
+    const slug = S.route.slug;
+    const sd = S.data[routeKey(S.route)].serial;
+    let root;
+    try {
+      root = await bookRoot();
+    } catch (err) {
+      if (err.name === "AbortError") return;
+      throw err;
+    }
+    el.disabled = true;
+    try {
+      const n = await saveChapters(root, slug, sd, (i, total) => { el.textContent = `Saving ${i} of ${total}…`; });
+      toast(n ? `Saved ${plural(n, "chapter")} to ${root.name}/${sd.folder}. Update the library in the audiobook player.` : "Nothing new to save");
+    } finally {
+      paint();
+    }
+  },
   "sel-next": (el) => {
     const sd = S.data[routeKey(S.route)].serial;
     const sel = selFor(S.route.slug);
@@ -1481,17 +1604,33 @@ const ACT = {
     const missing = items.filter((it) => !it.n);
     if (missing.length) throw new Error(`Give a chapter number for ${missing.map((it) => it.file.name).join(", ")}`);
     const force = $("#import-force")?.checked || false;
+    const sd = S.data[routeKey(S.route)].serial;
+    const rows = $("#import-process")?.checked ? importRows(sd, items, force) : [];
+    const gaps = rows.length ? bibleGaps(sd, rows.map((c) => c.number)) : [];
+    if (gaps.length) {
+      const one = gaps.length === 1;
+      if (!confirm(`${one ? "Chapter" : "Chapters"} ${rangeText(gaps)} ${one ? "has" : "have"} no character pass, and this import doesn't process ${one ? "it" : "them"}. The bible for later chapters will miss ${one ? "its" : "their"} characters.\n\nImport and process anyway?`)) return;
+    }
     el.disabled = true;
     const jobs = [];
+    let processing = [];
     try {
       for (const it of items) {
         const up = await upload(slug, it.file);
         jobs.push({ kind: "fetch", params: { slug, chapter: it.n, html: up.name, force } });
       }
+      if (rows.length) processing = await importProcessJobs(slug, rows);
     } finally {
       el.disabled = false;
     }
-    await queue(jobs, false);
+    if (!processing.length) {
+      await queue(jobs, false);
+    } else {
+      // An import of a chapter on disk fails without the replace box, so it stays out of the batch it would stop.
+      const fails = (j) => !force && sd.chapters.some((c) => c.number === j.params.chapter);
+      if (jobs.some(fails)) await queue(jobs.filter(fails), false);
+      await queue([...jobs.filter((j) => !fails(j)), ...processing], true);
+    }
     S.imports[slug] = [];
     paint();
   },
@@ -1552,6 +1691,7 @@ const CHANGE = {
     paint();
   },
   "epub-pick": (el) => { S.epubFile = el.files[0] || null; },
+  "import-process": (el) => store.set("importProcess", el.checked),
   "import-n": (el) => {
     const it = (S.imports[el.dataset.slug] || [])[Number(el.dataset.i)];
     if (it) it.n = Number(el.value) || null;

@@ -6,6 +6,7 @@
 #   /opt/serial-audio/state/        job records and logs
 #   /opt/serial-audio/incoming/     uploaded EPUBs and saved pages
 #   /opt/serial-audio/secrets/nomad-token   the dispatch token, mode 600
+#   /mnt/nfs/serial-audio/backup/   the daily backup, on storage's NFS share
 # Start or rebuild: cd /opt/serial-audio && docker compose up -d --build
 name: serial-audio
 
@@ -31,6 +32,9 @@ services:
       - ./state:/app/.webapp
       - ./incoming:/app/incoming
       - ./secrets/nomad-token:/run/secrets/nomad-token:ro
+      # Docker makes this folder on the local disk when the share is not mounted.
+      # The app backs up only into a folder that holds .serial-audio-backup.
+      - /mnt/nfs/serial-audio/backup:/backup
     command:
       - --host
       - 0.0.0.0
@@ -46,3 +50,5 @@ services:
       - containers.goblin-truck.ts.net
       - --allow-host
       - audiogen.grayfam.us
+      - --backup-dir
+      - /backup

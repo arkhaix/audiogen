@@ -4,7 +4,7 @@ The web app runs on containers and holds the library. It runs quick library jobs
 bible) itself and dispatches everything else to the Nomad cluster. A node takes a job when its client meta offers
 the job's class:
 
-* `breeze`: Breeze renders through breeze-server, and joining saved takes again. The laptop (aj-legion5).
+* `breeze`: Breeze renders through breeze-server, and joining saved takes again. The laptop (aj-legion5) and the Mac (jsc-m1).
 * `comfyui`: Drama 3 renders, casting voices, picking a voice and checking takes, which need ComfyUI or its output folder. The laptop.
 * `llm`: the character pass, the screenplay, the casting briefs and the casting bios, which run `claude` under AJ's subscription. dev-arch.
 
@@ -24,6 +24,8 @@ Everything lives in `/opt/serial-audio`, its own compose project beside the hous
 * `incoming/` holds uploaded EPUBs and saved pages.
 * `secrets/nomad-token` holds the dispatch token, mode 600, owned by aj.
 
+The daily backup is outside that folder, in `/mnt/nfs/serial-audio/backup` on storage's NFS share (Backup, below).
+
 The app listens on port 8765 on every interface, with host networking. https://audiogen.grayfam.us reaches it
 through haproxy on proxy. It answers only to the names in `--allow-host` and to `containers.*`, so a new proxy name
 needs a new `--allow-host` in `compose.yml`.
@@ -42,6 +44,28 @@ the laptop and `._*` files from the Mac (CLAUDE.md, Gotchas).
 
 Logs: `ssh aj@containers docker logs --tail 50 serial-audio`. A worker always runs the code the app runs, because it
 fetches the code with its job, so a deploy needs nothing on the nodes.
+
+### Backup
+
+The app backs the library up once a day to `/mnt/nfs/serial-audio/backup`, which `compose.yml` mounts at `/backup`
+and names with `--backup-dir`. `snapshots/library-<time>.tar.gz` holds `library/` without the audio, `incoming/` and
+`state/placement.json`, and the newest 30 stay. `library/<slug>/audio/` holds a copy of every chapter's audio, which
+a later render of the chapter replaces. A line that starts with `[mirror]` in the app's log reports each backup.
+
+The app backs up only into a folder that holds the file `.serial-audio-backup`. When the share is not mounted as the
+container starts, Docker makes an empty folder on the local disk in its place. The backup then fails, and the app's
+header says "backup failing". Mount the share and run `docker compose restart`.
+
+Restore on containers:
+
+```
+cd /opt/serial-audio && docker compose stop
+tar xzf /mnt/nfs/serial-audio/backup/snapshots/library-<time>.tar.gz -C /opt/serial-audio
+cp -a /mnt/nfs/serial-audio/backup/library/. library/
+docker compose start
+```
+
+`--publish-dir` copies rendered chapters into audiobook folders the same way (`README.md`). It is off on containers.
 
 ---
 
@@ -147,6 +171,9 @@ A job of a Process batch waits by the same rules and for nothing else, so a chap
 is written, beside the other chapters' screenplays. When a batch job fails or is lost, the queued jobs of the batch
 that wait for it are skipped and the rest run. Stopping a batch job skips every queued job of the batch as soon as
 the stop is asked for. A job of the batch that already runs on another node keeps running until it is stopped too.
+An import with "process the chapters after import" ticked queues the same batch behind its imports. A character pass
+or a screenplay queued behind the import of its chapter counts as a job on that chapter before the chapter is on disk,
+so it waits for the import, and a failed import skips it and the jobs that wait for it.
 
 The app picks the node for a GPU job, one GPU job per node:
 
@@ -174,9 +201,9 @@ with the result, and the app keeps them in `state/media/`, so the Cast tab and t
 ## Tests
 
 ```
-python -m unittest tests.test_cluster
+python -m unittest tests.test_cluster tests.test_mirror
 python tests/e2e_fake_nomad.py
 ```
 
-The second test copies the code into a temporary folder, writes a one-chapter serial there, and runs the app against
+The end-to-end test copies the code into a temporary folder, writes a one-chapter serial there, and runs the app against
 a fake Nomad that starts `bootstrap.py` as a local process for each dispatch. Neither test needs a library.

@@ -1,5 +1,6 @@
 """python -m serial_audio.web [--host 127.0.0.1] [--port 8765] [--comfy-url URL] [--allow-host NAME]
-                             [--executor local|nomad] [--nomad-addr URL] [--nomad-token-file PATH] [--state-dir DIR]"""
+                             [--executor local|nomad] [--nomad-addr URL] [--nomad-token-file PATH] [--state-dir DIR]
+                             [--backup-dir DIR] [--publish-dir DIR] [--publish-skip SLUG]"""
 from __future__ import annotations
 
 import argparse
@@ -7,7 +8,9 @@ import os
 import sys
 from pathlib import Path
 
-from .jobs import COMFY_URL, STATE_DIR, JobManager, StateInUse
+from .. import library as lib
+from .jobs import COMFY_URL, INCOMING, STATE_DIR, JobManager, StateInUse
+from .mirror import MARKER, Mirror
 from .server import serve
 
 
@@ -28,6 +31,14 @@ def main() -> int:
     ap.add_argument("--nomad-token-file", help="a file holding the dispatch token. NOMAD_TOKEN in the environment wins")
     ap.add_argument("--nomad-namespace", default="serial-audio")
     ap.add_argument("--nomad-prefix", default="serial-audio", help="the registered jobs are <prefix>-breeze, -comfyui, -llm")
+    ap.add_argument("--backup-dir", type=Path,
+                    help=f"a folder on another disk for a daily backup of the library. It must hold a file named {MARKER}")
+    ap.add_argument("--publish-dir", type=Path,
+                    help="a folder that gets every rendered chapter as <serial title>/<NNN> - <chapter title>.opus, "
+                         "for an audiobook player that reads one folder per book. It must already hold something, "
+                         "which shows that its disk is mounted")
+    ap.add_argument("--publish-skip", action="append", default=[], metavar="SLUG",
+                    help="a serial to keep out of --publish-dir (repeatable)")
     args = ap.parse_args()
     try:
         if args.executor == "nomad":
@@ -43,8 +54,12 @@ def main() -> int:
     except StateInUse as e:
         print(f"serial_audio web app: {e}", file=sys.stderr)
         return 1
+    mirror = None
+    if args.backup_dir or args.publish_dir:
+        mirror = Mirror(lib.LIBRARY, args.backup_dir, args.publish_dir, args.publish_skip,
+                        extra={"incoming": INCOMING, "state/placement.json": args.state_dir / "placement.json"})
     try:
-        serve(args.host, args.port, manager, args.allow_host)
+        serve(args.host, args.port, manager, args.allow_host, mirror)
     except OSError as e:
         print(f"serial_audio web app: cannot listen on {args.host}:{args.port}: {e}", file=sys.stderr)
         return 1

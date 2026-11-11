@@ -151,8 +151,15 @@ def _llm_args(p: dict) -> list[str]:
     return args + (["--effort", effort] if effort else [])
 
 
-def _expand(slug: str, spec: str) -> list[int]:
-    have = lib.list_chapters(slug)
+def _expand(slug: str, spec: str, coming=()) -> list[int]:
+    """The chapters a spec names.
+
+    slug: the serial.
+    spec: a chapter list such as 7-12, "all" or "new".
+    coming: chapters that earlier jobs of the batch import. They count beside the chapters on disk.
+    Returns the chapter numbers in order. "new" names none.
+    """
+    have = sorted(set(lib.list_chapters(slug)) | set(coming))
     if spec in ("all", "new"):
         return have if spec == "all" else []
     out = []
@@ -177,12 +184,14 @@ def _render_plan(slug: str, number: int, decode_only: bool) -> tuple[str, str | 
         raise ValueError(str(e)) from None
 
 
-def build(kind: str, p: dict, comfy_url: str = COMFY_URL) -> dict:
+def build(kind: str, p: dict, comfy_url: str = COMFY_URL, coming: dict | None = None) -> dict:
     """The job fields for a request: CLI args, lane, title and metadata.
 
     kind: a CLI subcommand the app exposes.
     p: the request's parameters.
     comfy_url: the ComfyUI address render and cast jobs use.
+    coming: {slug: chapters} that jobs queued ahead of this one in its batch import. A character pass or a
+        screenplay counts them as chapters of the serial.
     Returns {"args", "heavy", "gpu", "comfy", "title", "slug", "meta"}. gpu: the job uses the card. comfy: it queues
     ComfyUI prompts. Raises ValueError on a bad request.
     """
@@ -194,7 +203,7 @@ def build(kind: str, p: dict, comfy_url: str = COMFY_URL) -> dict:
         args = [kind, slug, spec] + _llm_args(p) + (["--redo"] if p.get("redo") else [])
         label = "Character pass" if kind == "character-pass" else "Screenplay"
         return {"args": args, "heavy": True, "gpu": False, "comfy": False, "title": f"{label} · ch {spec}", "slug": slug,
-                "meta": {"chapters": _expand(slug, spec)}}
+                "meta": {"chapters": _expand(slug, spec, (coming or {}).get(slug, ()))}}
 
     if kind == "render":
         slug = _slug(p)
@@ -390,6 +399,8 @@ TAKES_RE = re.compile(r"\[(\d+) min\] take (\d+)/(\d+), (\d+) ms/take")
 TAKES_HEAD_RE = re.compile(r"generating takes .*?: (\d+) of \d+ lines")
 CHECK_HEAD_RE = re.compile(r"checking (\d+) takes with (?:Qwen3-ASR|Parakeet)")
 CHECK_RE = re.compile(r"\[(\d+) min\] checked (\d+)/(\d+), ([\d.]+) s/take")
+PRECHECK_RE = re.compile(r"checking the (\d+) new takes? with")
+PRECHECK_SECONDS_PER_TAKE = 0.5
 CASTING_RE = re.compile(r"^casting (\d+): (.*)$", re.M)
 CANDIDATE_RE = re.compile(r"^\s+\S+ seed \d+: match", re.M)
 DESIGNED_RE = re.compile(r"^\s+\S+ seed \d+: designed ", re.M)
@@ -414,7 +425,8 @@ def render_progress(text: str, log_mtime: float | None, now: float, started: flo
     log_mtime: when the log last changed, which dates its last progress line.
     now: the current time.
     started: when the render process started, or None.
-    Returns {"phase", "fraction", "eta", "detail"}. Fraction and eta may be None.
+    Returns {"phase", "fraction", "eta", "detail"}. Fraction and eta may be None. "prechecked" is True once a
+    Breeze render has checked its new takes before the join, so the check after the join has nothing to transcribe.
     """
     head = text.rfind("render: ")
     seg = text[head:] if head >= 0 else text
@@ -426,8 +438,17 @@ def render_progress(text: str, log_mtime: float | None, now: float, started: flo
         return {**out, "phase": "done", "fraction": 1.0, "eta": 0, "detail": "audio written"}
     if CHECK_HEAD_RE.search(seg):
         return {**out, **check_progress(seg, log_mtime, now), "fraction": 0.99}
+    precheck = PRECHECK_RE.search(seg) if "could not check the new takes" not in seg else None
+    if precheck:
+        out["prechecked"] = True
     if "joining takes" in seg:
         return {**out, "phase": "joining", "fraction": 0.98, "eta": JOIN_SECONDS, "detail": "joining takes"}
+    if precheck:
+        marks = CHECK_RE.findall(seg[precheck.start():])
+        total = int(precheck.group(1))
+        done, per = (int(marks[-1][1]), float(marks[-1][3])) if marks else (0, PRECHECK_SECONDS_PER_TAKE)
+        return {**out, "phase": "checking", "fraction": 0.97, "eta": max(0, total - done) * per + JOIN_SECONDS,
+                "detail": f"checking the new takes before the join, {done:,} of {total:,}"}
     if "voice effects" in seg:
         return {**out, "phase": "effects", "fraction": 0.99, "eta": 30, "detail": "applying voice effects"}
     if "decoding..." in seg:
@@ -697,14 +718,20 @@ class JobManager:
         requests: [{"kind", "params"}].
         stop_on_failure: when one job fails, skip the batch's queued jobs that can't go on. Here that is the rest
             of the batch, and on the cluster the jobs that wait for the failed one.
+        A character pass or a screenplay that follows the import of its chapter in `requests` names that chapter in
+        its meta before the chapter is on disk.
         Returns the new jobs. Raises ValueError and queues nothing if any request is bad.
         """
         built = []
+        coming: dict[str, set[int]] = {}
         for r in requests:
             if not isinstance(r, dict):
                 raise ValueError("each job must be an object with a kind and params")
             params = r.get("params") if r.get("params") is not None else {}
-            built.append((r.get("kind"), params, build(r.get("kind"), params, self.comfy_url)))
+            b = build(r.get("kind"), params, self.comfy_url, coming)
+            if r.get("kind") == "fetch":
+                coming.setdefault(b["slug"], set()).update(b["meta"].get("chapters") or [])
+            built.append((r.get("kind"), params, b))
         batch = uuid.uuid4().hex[:8]
         out = []
         with self.lock:

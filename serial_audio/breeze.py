@@ -29,6 +29,7 @@ from pathlib import Path
 
 from . import library as lib
 from . import machine
+from .asr import choose as choose_asr
 from .comfy import ComfyClient, ComfyError
 from .render import AUDIO_SUFFIX, COMFY_OUTPUT, COMFY_PYTHON, apply_say_as, plan_slots, say_as_map, slot_effects
 
@@ -57,6 +58,7 @@ CPP_START_TIMEOUT = 180
 COMFY_IDLE_TIMEOUT = 4 * 3600
 RETAKES = 2
 RETAKE_SEED_STEP = 7919
+CHECK_RETAKES = 2
 
 
 def take_bounds(words: int) -> tuple[float, float]:
@@ -397,6 +399,124 @@ class CppServer:
             return self.speech(fields, wav)
 
 
+def cpp_take(server, wav: bytes, transcript: str, text: str, direction: str, vseed: int, line: int, log,
+             first: int = 0) -> dict:
+    """Takes one line with breeze-server, again with a new seed while its length does not fit the line.
+
+    server: a started CppServer.
+    wav, transcript: the speaker's reference clip and what it says.
+    text, direction: the line as the voice reads it, and its direction or "".
+    vseed: the voice's seed.
+    line: the line's number, for the log.
+    log: receives a line for each take whose length does not fit.
+    first: how many seeds of this line earlier calls used, so this call uses the next ones.
+    Returns {"pcm", "seed", "tries", "fits"} for the try whose length is closest to the plausible range, after at
+    most RETAKES + 1 tries. fits says whether it is inside the range. Raises ComfyError when a take fails twice.
+    """
+    fields = {"text": text, "ref_text": transcript, "seed": vseed,
+              "cfg_scale": DIRECTION_CFG if direction else CLONE_CFG, **CPP_FIELDS}
+    if direction:
+        fields["instruction"] = instruction(direction)
+    low, high = take_bounds(count_words(text))
+    tries = []
+    for attempt in range(first, first + RETAKES + 1):
+        fields["seed"] = 1 + (vseed - 1 + attempt * RETAKE_SEED_STEP) % (2**31 - 2)
+        pcm = server.take(fields, wav, f"line {line}", log)
+        secs = len(pcm) / 2 / server.sample_rate
+        tries.append((secs, fields["seed"], pcm))
+        if low <= secs <= high:
+            break
+        log(f"   line {line}: a {secs:.1f} s take is outside {low:.1f} to {high:.1f} s for "
+            f"{count_words(text)} words" + (", taking it again" if attempt < first + RETAKES else ""))
+    secs, seed, pcm = min(tries, key=lambda t: miss(t[0], low, high))
+    return {"pcm": pcm, "seed": seed, "tries": len(tries), "fits": low <= secs <= high}
+
+
+def take_fields(got: dict) -> dict:
+    """What a saved take records about a cpp_take answer: its seed, a hash of its audio, takes_tried when it took
+    more than one try, and out_of_range when its length does not fit."""
+    out = {"seed": got["seed"], "audio": hashlib.sha1(got["pcm"]).hexdigest()[:16]}
+    if got["tries"] > 1:
+        out["takes_tried"] = got["tries"]
+    if not got["fits"]:
+        out["out_of_range"] = True
+    return out
+
+
+def write_wav(path: Path, pcm: bytes, sample_rate: int) -> None:
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sample_rate)
+        w.writeframes(pcm)
+
+
+def retake_flagged(folder: Path, lines: list[dict], say: dict, saved: dict, made: list[str], again, *, save,
+                   comfy_url: str, log, rounds: int = CHECK_RETAKES) -> list[int]:
+    """Checks the takes a render just made against the script and replaces the ones that do not say their line.
+
+    folder: the chapter folder. Its take_check.json gets the verdict of every take in made.
+    lines: the script lines.
+    say: the bible's say-as map.
+    saved: the chapter's takes by line. The entry of a replaced take is updated in place.
+    made: the lines, as keys of saved, whose takes this render made.
+    again: again(line, round) takes a line again and returns its entry, with the audio in a file of its own.
+    save: save() writes saved to disk. It is called after each replaced take and at the end of each round.
+    comfy_url: the ComfyUI address the recognizer functions take.
+    log: receives the progress lines.
+    rounds: how many times a flagged line is taken again.
+    Returns the lines whose take was replaced. A new take replaces the old one only when its transcript is closer to
+    the line. Does nothing unless this machine's recognizer is Parakeet, which leaves the card to breeze-server.
+    Never raises. A failure is logged, and the takes replaced before it stay replaced, in saved and in
+    take_check.json.
+    """
+    replaced: list[int] = []
+    pending: dict[str, dict] = {}
+    try:
+        from . import takecheck
+        engine = choose_asr()
+        if engine != "parakeet" or not made:
+            return replaced
+        check = dict(engine=engine, comfy_url=comfy_url, log=log)
+        log(f"   checking the {len(made)} new take{'' if len(made) == 1 else 's'} with Parakeet before the join...")
+        results = takecheck.check_entries({k: saved[k] for k in made}, lines, say, **check)
+        takecheck.save_entries(folder, results, engine)
+        for round_ in range(1, rounds + 1):
+            bad = [k for k in made if results[k]["verdict"] == "flagged"]
+            if not bad:
+                break
+            log(f"   taking {len(bad)} of them again, because the transcript does not match the line: {', '.join(bad)}")
+            for k in bad:
+                pending[k] = again(k, round_)
+            verdicts = takecheck.check_entries(pending, lines, say, **check)
+            for k in bad:
+                new = pending.pop(k)
+                saved[k]["takes_tried"] = saved[k].get("takes_tried", 1) + new.get("takes_tried", 1)
+                if takecheck.badness(verdicts[k]) >= takecheck.badness(results[k]):
+                    Path(new["file"]).unlink(missing_ok=True)
+                    continue
+                os.replace(new["file"], saved[k]["file"])
+                saved[k].pop("out_of_range", None)
+                saved[k].update({f: new[f] for f in ("seed", "audio", "out_of_range") if f in new}, retaken=round_)
+                results[k] = verdicts[k]
+                save()
+                if int(k) not in replaced:
+                    replaced.append(int(k))
+            save()
+            takecheck.save_entries(folder, results, engine)
+        still = [k for k in made if results[k]["verdict"] == "flagged"]
+        if replaced:
+            log(f"   kept a new take for: {', '.join(map(str, sorted(replaced)))}")
+        if still:
+            log(f"   still flagged after {rounds} more rounds: {', '.join(still)}")
+    except Exception as e:
+        for new in pending.values():
+            Path(new["file"]).unlink(missing_ok=True)
+        log(f"   could not check the new takes before the join, so the join uses them as they are: "
+            f"{type(e).__name__}: {e}")
+    return sorted(replaced)
+
+
 def wait_comfy_idle(comfy_url: str, log, timeout: float = COMFY_IDLE_TIMEOUT) -> None:
     """Returns once ComfyUI has no running or queued prompt, or at once when it does not answer.
 
@@ -517,7 +637,8 @@ def render_breeze(slug: str, number: int, *, seed: int = 1, comfy_url: str = "ht
     join_only: join the saved takes again without generating any.
     runner: "cpp" or "comfyui". None uses the chapter's last runner on a join-only run, else serial.yaml
         breeze_runner, else cpp.
-    Returns the chapter's render record. New takes are then checked against the script with this machine's speech
+    Returns the chapter's render record. Under breeze-server with Parakeet, a new take that the transcript check
+    flags is taken again before the join (retake_flagged). New takes are then checked against the script with this machine's speech
     recognizer (asr.choose), and the result, or why the check was skipped, is stored under render.check. Raises ComfyError when the runner cannot start, a take
     fails twice, or a join-only run finds a take missing.
     """
@@ -600,37 +721,16 @@ def render_breeze(slug: str, number: int, *, seed: int = 1, comfy_url: str = "ht
                         raise ComfyError(f"line {i} produced no audio: outputs {list(entry.get('outputs', {}))}")
                     file = client.output_path(items[0])
                 else:
-                    fields = {"text": text, "ref_text": refs[voice]["transcript"], "seed": vseed,
-                              "cfg_scale": DIRECTION_CFG if direction else CLONE_CFG, **CPP_FIELDS}
-                    if direction:
-                        fields["instruction"] = instruction(direction)
-                    low, high = take_bounds(count_words(text))
-                    tries = []
-                    for attempt in range(RETAKES + 1):
-                        fields["seed"] = 1 + (vseed - 1 + attempt * RETAKE_SEED_STEP) % (2**31 - 2)
-                        pcm = server.take(fields, wavs[voice], f"line {i}", log)
-                        secs = len(pcm) / 2 / server.sample_rate
-                        tries.append((secs, fields["seed"], pcm))
-                        if low <= secs <= high:
-                            break
-                        log(f"   line {i}: a {secs:.1f} s take is outside {low:.1f} to {high:.1f} s for "
-                            f"{count_words(text)} words" + (", taking it again" if attempt < RETAKES else ""))
-                    secs, used_seed, pcm = min(tries, key=lambda t: miss(t[0], low, high))
+                    got = cpp_take(server, wavs[voice], refs[voice]["transcript"], text, direction, vseed, i, log)
                     file = take_dir / f"l{i:04d}.wav"
-                    with wave.open(str(file), "wb") as w:
-                        w.setnchannels(1)
-                        w.setsampwidth(2)
-                        w.setframerate(server.sample_rate)
-                        w.writeframes(pcm)
+                    write_wav(file, got["pcm"], server.sample_rate)
                 saved[str(i)] = {"key": key, "file": str(file), "voice": voice, "direction": direction,
                                  "seconds": round(time.time() - t0, 2)}
                 if server is not None:
-                    saved[str(i)]["seed"] = used_seed
-                    if len(tries) > 1:
-                        saved[str(i)]["takes_tried"] = len(tries)
-                    if not low <= secs <= high:
-                        saved[str(i)]["out_of_range"] = True
-                        log(f"   warning: line {i} kept a {secs:.1f} s take after {len(tries)} tries; listen to it")
+                    saved[str(i)].update(take_fields(got))
+                    if not got["fits"]:
+                        secs = len(got["pcm"]) / 2 / server.sample_rate
+                        log(f"   warning: line {i} kept a {secs:.1f} s take after {got['tries']} tries; listen to it")
                 save_takes(takes_path, saved, runner)
                 now = time.time()
                 if done == 1:
@@ -641,6 +741,21 @@ def render_breeze(slug: str, number: int, *, seed: int = 1, comfy_url: str = "ht
                     log(f"   [{(now - start) / 60:.0f} min] take {done}/{len(stale)}, {per * 1000:.0f} ms/take, "
                         f"~{per * (len(stale) - done) / 60:.0f} min left")
             generated_seconds = time.time() - start
+
+            # Retakes
+            if server is not None:
+                by_line = {str(p[0]): p for p in stale}
+
+                def again(k: str, round_: int) -> dict:
+                    i, voice, text, direction, vseed, key = by_line[k]
+                    got = cpp_take(server, wavs[voice], refs[voice]["transcript"], text, direction, vseed, i, log,
+                                   first=round_ * (RETAKES + 1))
+                    file = take_dir / f"l{i:04d}.retake.wav"
+                    write_wav(file, got["pcm"], server.sample_rate)
+                    return {"key": key, "file": str(file), **take_fields(got)}
+
+                retake_flagged(folder, lines, say, saved, list(by_line), again, comfy_url=comfy_url, log=log,
+                               save=lambda: save_takes(takes_path, saved, runner))
         finally:
             if server is not None:
                 server.__exit__(None, None, None)

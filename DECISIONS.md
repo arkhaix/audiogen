@@ -40,6 +40,13 @@ existing entries for a conflict before adding one, and rewrite an entry when AJ 
 
 ---
 
+### A render takes a flagged take again before the join
+**Date:** 2026-11-11
+**Context:** The take check ran after the join and only listed the flagged takes for AJ to listen to, and he listens while driving. In the 34 checked chapters of The Hundred Reigns, 17 of 7,602 takes were flagged, about one in every two chapters. Claude proposed taking them again, and AJ said "good idea".
+**Decision:** After the takes and before the join, a Breeze render under breeze-server transcribes its new takes with Parakeet while the server is still up. It takes a flagged line again with new seeds, in up to two rounds, and keeps a new take only when its transcript is closer to the line. A take from an earlier render is not taken again, so a render of an old chapter changes only the lines it makes anyway. With Qwen3-ASR as the recognizer nothing is taken again, because Qwen3-ASR needs the card that breeze-server holds. A saved take records a hash of its audio, and the check reuses a transcript only for the same audio, because a take that is made again keeps its key. In a scratch copy on the laptop on 2026-11-11, the eight flagged takes of chapters 16, 19, 24, 27, 36 and 37 came out flagged again from their seeds, and the first new take replaced each one. Two of the eight were lines of 58 and 64 words that had lost 25 and 30 of them.
+
+---
+
 ### Say-as overrides fix how names are read
 **Date:** 2026-11-07
 **Context:** AJ: Louis is always said "Lewis", and Lauriane is always said "Laurie Anne".
@@ -58,6 +65,20 @@ existing entries for a conflict before adding one, and rewrite an entry when AJ 
 **Date:** 2026-11-07
 **Context:** AJ wanted one entry point usable from any tailnet machine, with jobs running on whichever node is set up for them. He approved moving the library on 2026-11-07 at 22:08.
 **Decision:** The library is `/opt/serial-audio/library` on containers, behind the web app with the Nomad executor. `D:\fish\library` is retired. `library/` and `incoming/` stay out of git, because they hold chapter text and saved Royal Road pages.
+
+---
+
+### The app backs the library up to storage once a day
+**Date:** 2026-11-11
+**Context:** `/opt/serial-audio/library` on containers' local disk was the only copy. The bibles, the picked voices, the say-as overrides and the saved chapter pages can't be made again the way audio can. AJ said to use the NFS mount of storage, which containers has at `/mnt/nfs`.
+**Decision:** The app backs the library up itself, once a day, to `/mnt/nfs/serial-audio/backup` (`--backup-dir`). A snapshot archive holds everything but the audio, with `incoming/` and `placement.json`, and the newest 30 stay. Audio is copied beside the snapshots, and a later render of a chapter replaces its copy, because audio can be rendered again. The app backs up only into a folder that holds the file `.serial-audio-backup`, so it doesn't write a backup to the local disk when the share is not mounted. The header says "backup failing" when the last try failed or the last backup is more than two days old. Rejected: a timer on containers, because it is a host change and the app could not show that it failed. The first backup, on 2026-11-11, was a 21 MB snapshot of 660 files and 284 MB of audio in 44 files. `deploy/README.md` has the restore steps.
+
+---
+
+### Chapters reach the phone through a button on the serial page
+**Date:** 2026-11-11
+**Context:** AJ listens in Smart AudioBook Player on Android, which reads one folder per book from the phone's storage. He had been downloading each chapter and copying it by hand. Claude first built a folder export for a sync tool to pick up (`--publish-dir`), and AJ said "i don't like syncthing very much".
+**Decision:** The serial page has a Save to this device button on a browser that can write to a folder (`showDirectoryPicker`). It asks for the folder once, then writes each rendered chapter that the device doesn't have to `<serial title>/<NNN> - <chapter title>.opus`. A chapter deleted from the folder is written again only after a new render. The browser keeps the folder and the list of saved chapters, so the app doesn't keep anything per device. On 2026-11-11 it passed in headless Edge at phone width, with the browser's private file system in place of a picked folder. It was not tried on AJ's phone. The folder export stays in the code and is off on containers.
 
 ---
 
@@ -166,14 +187,26 @@ existing entries for a conflict before adding one, and rewrite an entry when AJ 
 
 ---
 
+### An import can queue the processing of its chapters
+**Date:** 2026-11-11
+**Context:** An imported chapter got its character pass, voices, screenplay and render only from the Process dialog or its next-step button, after the import had finished. AJ asked for "a checkbox to automatically process the chapters after import".
+**Decision:** Import saved pages has a box, process the chapters after import, and the browser remembers it. With it ticked, the import and the processing are one batch: the imports, then for each imported chapter the jobs the Process dialog queues by default, with 3 cast candidates, the next free cast seed, render seed 1 and the LLM settings last chosen in a dialog. The Process dialog doesn't open. The rest of this entry is Claude's choice, and AJ hasn't confirmed it. Only a chapter that nothing has been made from yet is processed: a new chapter, or a chapter on disk at status `fetched` when "replace chapter text already on disk" is ticked. A chapter on disk without that box isn't processed, because its import fails, and that import is queued outside the batch. A replaced chapter that already has a character pass, a script or audio isn't processed either. A forced import keeps the chapter's status, so the default jobs would render the script of the old text. The Process dialog's redo boxes cover that case. When a fetched chapter before the last processed one isn't processed, the import asks first, because the bible would miss its characters. A character pass or a screenplay queued behind the import of its chapter names that chapter in its job record before the chapter is on disk, so on the cluster the chapter's jobs wait for the import, and a failed import skips them and the jobs that wait for them. On the one-machine executor a failed import skips the rest of the batch, as any failed batch job does there.
+
+---
+
 ## Not decided yet
 
-As of 2026-11-09:
+As of 2026-11-11:
 
 
 * Whether to re-render the chapters of The Hundred Reigns that use old voices. Chapters 1 to 6 are Drama 3 renders, so Louis and Lauriane sound different there, and they take about 85 minutes on the laptop. AJ was asked about them on 2026-11-07 and hasn't answered. Chapter 12 has Lauriane's old Qwen voice, because it was rendered before the recast on 2026-11-08.
 * Whether to recast the other academy-age voices that were cast with aged-up Qwen briefs: simon, leonard-decarabia, meredith-dose, cassandra, antonine-de-shax and tiella-decarabia. Casval and Anna were recast with Breeze at their story age on 2026-11-09 (`docs/casting.md`), and AJ was asked about the rest that day.
 * Whether to render chapters 7, 8 and 10 of The Hundred Reigns again. They have the Qwen voices of Casval and Anna that AJ replaced on 2026-11-09, and they were joined before the join leveled each voice. AJ had finished them, so they were left alone.
-* How the library is backed up. `/opt/serial-audio/library` on containers' local disk has no backup, and silver has no backup job.
+* Whether storage's share needs a backup of its own. The library's daily backup lives only there, and silver has no backup job.
+* Whether the Save to this device button works on AJ's phone. Chrome's notes say the folder API reached Android in Chrome 132, and the button shows only where the browser has `showDirectoryPicker`. AJ was asked on 2026-11-11 to try it.
+* Whether to remove the folder export (`--publish-dir`). Nothing uses it since AJ said on 2026-11-11 that he doesn't want a sync tool.
+* Whether to prune anything. On 2026-11-11 the laptop's saved takes were 2.06 GB in 7,409 files with 289 GB free on `D:`, and containers held 301 MB of library and 99 MB of mirrored media with 235 GB free. AJ said that day that pruning is good. Nothing prunes yet, and a saved take still saves render time when a chapter is rendered again.
+* Whether to derive the scheduler's waits from the files each job kind reads and writes, in place of the exceptions in `conflicts()` in `serial_audio/web/nomad.py`. AJ said on 2026-11-11 that it is probably a good idea. It waits for a change of its own.
+* Whether to check a screenplay against its chapter word for word. The coverage check is a word-count ratio of 0.9 to 1.2, so a script that drops a paragraph passes. The check would compare text with text and use no recognizer. AJ's answer on 2026-11-11 was about trusting the transcriber, so he was told that and asked again.
 * lorimor-ancitif and eole were cast on 2026-11-08 (Breeze seeds 17000 to 17002, 17000 filed with status auto for both) from the cached briefs, not the older, lower descriptions planned in `docs/casting.md`, and wait for AJ's pick or a recast. The narrator reads their lines in chapter 12, rendered before the cast, so it needs a render afterwards, which remakes only their 3 lines.
 * Whether to raise `LLM_SLOTS` in `serial_audio/web/nomad.py` above 1, so two screenplays run at once. The records don't give a reason for the limit. On 2026-11-11 dev-arch ran two scratch screenplay passes beside a live one, and all three finished. The two live passes that overlapped them took 148 and 146 seconds, against 133 and 158 for the two before. With `LLM_SLOTS = 2` in a scratch copy the scheduler started two screenplays at once. Within one serial's batch the character passes and the cast still ran one at a time. Outside a batch that did not hold: character passes of two serials ran together, casts of two serials ran together, and a cast's briefs stage started beside a running screenplay of its serial, which the 2026-11-08 entry on casts and `deploy/README.md` say it waits for. Only `test_a_batch_job_waits_only_for_the_jobs_it_needs` failed, because it expects one slot, and the tests don't cover a cast beside a screenplay. It would not shorten a batch that renders, because a screenplay took about 2.5 minutes in the batch of chapters 29 to 38 and a render on the laptop took 12 to 17 in the app's job list that day, so the renders set the pace. AJ was told on 2026-11-11.
