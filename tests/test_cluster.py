@@ -1,10 +1,14 @@
 """Unit tests for the cluster exchange and the Nomad scheduling rules. Run: python -m unittest tests.test_cluster"""
 from __future__ import annotations
 
+import hashlib
 import io
 import json
+import os
 import tempfile
 import unittest
+import urllib.parse
+import wave
 import zipfile
 from pathlib import Path
 
@@ -146,6 +150,35 @@ class ExchangeTest(unittest.TestCase):
                                   root=self.root)
         self.assertEqual((mirror / exchange.mirror_rel(str(clip))).read_bytes(), b"BBBB")
 
+    def test_a_take_s_path_on_another_node_maps_under_this_node_s_output_folder(self):
+        root = Path(self.tmp.name) / "out"
+        anchor = "breeze/demo/ch0007"
+        here = root / "breeze" / "demo" / "ch0007"
+        # A Windows path and a POSIX path both map, whichever system asks.
+        self.assertEqual(exchange.local_path("D:\\comfy\\ComfyUI\\output\\breeze\\demo\\ch0007\\cpp\\l0003.wav", root, anchor),
+                         str(here / "cpp" / "l0003.wav"))
+        self.assertEqual(exchange.local_path("/Users/aj/serial-audio/output/breeze/demo/ch0007/l0003_00001_.flac", root,
+                                             anchor), str(here / "l0003_00001_.flac"))
+        # The last anchor counts, so an output folder whose own path holds the same folder names maps right.
+        self.assertEqual(exchange.local_path("/data/breeze/demo/ch0007/output/breeze/demo/ch0007/cpp/l0001.wav", root,
+                                             anchor), str(here / "cpp" / "l0001.wav"))
+        # A path of another chapter, a path that climbs out, and no path at all do not map.
+        self.assertIsNone(exchange.local_path("D:\\comfy\\out\\breeze\\demo\\ch0008\\cpp\\l0003.wav", root, anchor))
+        self.assertIsNone(exchange.local_path("/out/breeze/demo/ch0007/../../x.wav", root, anchor))
+        self.assertIsNone(exchange.local_path(None, root, anchor))
+        self.assertTrue(exchange.same_path(here / "cpp" / "l0003.wav", str(here / "cpp" / ".." / "cpp" / "l0003.wav")))
+        self.assertFalse(exchange.same_path("D:\\comfy\\out\\a.wav", "/Users/aj/out/a.wav"))
+
+    def test_take_files_reads_a_chapter_s_takes_and_tolerates_a_bad_file(self):
+        chapter = self.folder / "chapters/0001"
+        self.assertEqual(exchange.take_files(chapter), {})
+        (chapter / exchange.TAKES_FILE).write_text(json.dumps({"takes": {
+            "0": {"key": "a", "file": "D:\\out\\l0000.wav"}, "1": {"key": "b"}, "2": "junk", "3": {"file": ""}}}),
+            encoding="utf-8")
+        self.assertEqual(exchange.take_files(chapter), {"0": "D:\\out\\l0000.wav"})
+        (chapter / exchange.TAKES_FILE).write_text("not json", encoding="utf-8")
+        self.assertEqual(exchange.take_files(chapter), {})
+
     def test_damaged_upload_is_refused(self):
         with self.assertRaises(exchange.ExchangeError):
             exchange.read_result(b"not a zip")
@@ -211,6 +244,9 @@ class SchedulingTest(unittest.TestCase):
         self.assertEqual([s["class"] for s in breeze], ["llm", "breeze"])
         self.assertEqual(breeze[1]["args"].count("--engine"), 1)
         self.assertEqual(len(job_stages(job("cast", args=["cast", "demo", "--dry-run"]))), 1)
+        # A take check runs on a breeze node, and a voice pick on the app's machine.
+        self.assertEqual(job_stages(job("check-takes", args=["check-takes", "demo", "7"]))[0]["class"], "breeze")
+        self.assertIsNone(job_stages(job("pick-voice")))
 
     def test_an_unknown_cast_engine_reaches_the_cli_before_the_casting_pass(self):
         from unittest import mock
@@ -644,14 +680,47 @@ class NodeChoiceTest(unittest.TestCase):
         self.assertEqual(self.m._pick_node(job("cast", args=["cast", "demo"]), "comfyui", [])[:2],
                          ("laptop", "comfyui"))
 
-    def test_a_job_that_needs_a_node_waits_for_it_and_may_switch_class(self):
+    def test_a_job_needs_the_node_that_holds_its_takes_only_while_the_app_lacks_them(self):
         from unittest import mock
         self.m.placement = {"chapters": {"demo": {"1": "mac"}}}
         check = job("check-takes", chapters=[1], args=["check-takes", "demo", "1"])
-        self.assertEqual(self.m._pick_node(check, "comfyui", [])[:2], ("mac", "breeze"))
-        node, cls, why = self.m._pick_node(check, "comfyui", [self.running_on("mac")])
-        self.assertIsNone(node)
-        self.assertIn("mac, which holds the files", why)
+        join = job("render", chapters=[1], args=["render", "demo", "1", "--decode-only"])
+        join["meta"].update(decode_only=True, engine="breeze")
+        decode = job("render", chapters=[1], args=["render", "demo", "1", "--decode-only"], comfy=True)
+        decode["meta"].update(decode_only=True, engine="drama3")
+        # A take check is a breeze job, so the Mac runs it without a change of class.
+        self.assertEqual(job_stages(check)[0]["class"], "breeze")
+        with mock.patch.object(self.m, "_mirrored", return_value=False):
+            # A Drama 3 decode reads no Breeze takes, so it goes to the ComfyUI node whatever node holds them.
+            self.assertEqual(self.m.holder(decode), ("mac", False))
+            self.assertEqual(self.m._pick_node(decode, "comfyui", [])[:2], ("laptop", "comfyui"))
+            # The app has no copy of the takes: the check and the join get the Mac, and wait while it is busy
+            # or down.
+            self.assertEqual(self.m._pick_node(check, "breeze", [])[:2], ("mac", "breeze"))
+            self.assertEqual(self.m._pick_node(join, "breeze", [])[:2], ("mac", "breeze"))
+            node, cls, why = self.m._pick_node(check, "breeze", [self.running_on("mac")])
+            self.assertIsNone(node)
+            self.assertIn("mac, which holds the files", why)
+            # A node that does not offer the job's class cannot run it.
+            node, cls, why = self.m._pick_node(check, "comfyui", [])
+            self.assertIsNone(node)
+            self.assertEqual(why, "mac, which holds the files this job needs, does not offer comfyui jobs")
+            self.m.workers[1]["ready"], self.m.workers[1]["status"] = False, "down"
+            node, cls, why = self.m._pick_node(join, "breeze", [])
+            self.assertIsNone(node)
+            self.assertEqual(why, "waiting for mac, which holds the files this job needs: mac is down")
+        # a scheduling pass starts with no job waiting for a node
+        self.m._plan = {}
+        with mock.patch.object(self.m, "_mirrored", return_value=True):
+            # The app holds every take: with the Mac down, the check and the join run on the laptop.
+            self.assertEqual(self.m._pick_node(check, "breeze", [])[:2], ("laptop", "breeze"))
+            self.assertEqual(self.m._pick_node(join, "breeze", [])[:2], ("laptop", "breeze"))
+            # With both nodes ready they stay on the Mac, which need not fetch the takes.
+            self.m.workers[1]["ready"], self.m.workers[1]["status"] = True, "ready"
+            self.assertEqual(self.m._pick_node(check, "breeze", [])[:2], ("mac", "breeze"))
+            self.assertEqual(self.m._pick_node(join, "breeze", [])[:2], ("mac", "breeze"))
+            # With the Mac busy they take the laptop instead of waiting for it.
+            self.assertEqual(self.m._pick_node(check, "breeze", [self.running_on("mac")])[:2], ("laptop", "breeze"))
         render = job("render", chapters=[1], args=["render", "demo", "1"])
         render["meta"]["engine"] = "breeze"
         with mock.patch("serial_audio.web.nomad.reusable_takes", return_value=(200, 200)):
@@ -662,16 +731,29 @@ class NodeChoiceTest(unittest.TestCase):
         self.m.placement = {"chapters": {"demo": {"1": "mac"}}}
         render = {"kind": "render", "slug": "demo", "args": ["render", "demo", "1", "--seed", "2"],
                   "meta": {"chapters": [1], "engine": "breeze", "runner": "cpp", "lines": 255}}
-        # 25 takes on the Mac beat 255 on the laptop, and 252 on the Mac do not.
-        with mock.patch("serial_audio.web.nomad.reusable_takes", return_value=(230, 255)) as reuse:
-            self.assertEqual(self.m._pick_node(render, "breeze", [])[:2], ("mac", "breeze"))
-        reuse.assert_called_once_with("demo", 1, 2, "cpp")
-        with mock.patch("serial_audio.web.nomad.reusable_takes", return_value=(3, 255)):
+        with mock.patch.object(self.m, "_mirrored", return_value=False):
+            # The app has no copy of the takes, so only the Mac can reuse them. 25 takes on the Mac beat 255 on
+            # the laptop, and 252 on the Mac do not.
+            with mock.patch("serial_audio.web.nomad.reusable_takes", return_value=(230, 255)) as reuse:
+                self.assertEqual(self.m._pick_node(render, "breeze", [])[:2], ("mac", "breeze"))
+            reuse.assert_called_once_with("demo", 1, 2, "cpp")
+            with mock.patch("serial_audio.web.nomad.reusable_takes", return_value=(3, 255)):
+                self.assertEqual(self.m._pick_node(render, "breeze", [])[:2], ("laptop", "breeze"))
+                # With the laptop busy, waiting for it still beats a full render on the Mac.
+                node, cls, why = self.m._pick_node(render, "breeze", [self.running_on("laptop")])
+                self.assertIsNone(node)
+                self.assertTrue(why.startswith("waiting for laptop, about"), why)
+        # a scheduling pass starts with no job waiting for a node
+        self.m._plan = {}
+        with mock.patch.object(self.m, "_mirrored", return_value=True), \
+                mock.patch("serial_audio.web.nomad.reusable_takes", return_value=(230, 255)):
+            # The app holds the takes, so the laptop reuses them too: 25 takes there, plus fetching the rest,
+            # beat 25 on the Mac. With the laptop down the Mac makes the 25.
             self.assertEqual(self.m._pick_node(render, "breeze", [])[:2], ("laptop", "breeze"))
-            # With the laptop busy, waiting for it still beats a full render on the Mac.
-            node, cls, why = self.m._pick_node(render, "breeze", [self.running_on("laptop")])
-            self.assertIsNone(node)
-            self.assertTrue(why.startswith("waiting for laptop, about"), why)
+            self.assertLess(self.m._duration(render, "laptop", "mac"), 255 * self.m._rate("laptop"))
+            self.m.workers[0]["ready"] = False
+            self.assertEqual(self.m._pick_node(render, "breeze", [])[:2], ("mac", "breeze"))
+            self.m.workers[0]["ready"] = True
         # When the reuse cannot be worked out, the render is costed at all its takes, so it goes to the fast node.
         with mock.patch("serial_audio.web.nomad.reusable_takes", side_effect=FileNotFoundError("no script")):
             self.assertEqual(self.m._pick_node(render, "breeze", [])[:2], ("laptop", "breeze"))
@@ -751,24 +833,75 @@ class NodeChoiceTest(unittest.TestCase):
         self.m.workers.append(worker("laptop2", ["breeze"], "windows"))
         self.assertIsNone(self.m._node_for_paths(["D:\\comfy\\out\\a.wav"]))
 
-    def test_a_voice_pick_runs_where_its_candidate_was_made(self):
-        from unittest import mock
-        rec = {"chosen": 0, "candidates": [{"seed": 13000, "clip": "/Users/aj/serial-audio/output/k_s13000.wav"}],
-               "history": [{"candidates": [{"seed": 5002, "clip": "D:\\comfy\\out\\k_00006.flac"}]}]}
-        self.m.placement = {"voices": {"demo": {"keeper": "mac"}}}
-
+    def test_a_voice_pick_runs_on_the_app_s_machine_whichever_node_made_its_candidate(self):
+        # tests.test_casting covers the filing: a pick by seed, an approval of the current voice and a seed no
+        # candidate has, each with candidates that the laptop and the Mac made.
         def pick(*extra):
-            return {"kind": "pick-voice", "slug": "demo", "meta": {"characters": ["keeper"]},
+            return {"kind": "pick-voice", "slug": "demo", "meta": {"characters": ["keeper"]}, "heavy": False,
                     "args": ["pick-voice", "demo", "keeper", *extra]}
 
-        with mock.patch("serial_audio.library.load_yaml", return_value=rec):
-            # A pick by seed goes to the node that wrote that candidate, even after a recast on another node.
-            self.assertEqual(self.m.holder(pick("--seed", "5002")), ("laptop", True))
-            self.assertEqual(self.m.holder(pick("--seed", "13000")), ("mac", True))
-            # An approval of the current voice goes to the node that wrote its chosen candidate.
-            self.assertEqual(self.m.holder(pick()), ("mac", True))
-            # A seed that no candidate has falls back to the node that last wrote the voice.
-            self.assertEqual(self.m.holder(pick("--seed", "9")), ("mac", True))
+        self.m.placement = {"voices": {"demo": {"keeper": "mac"}}}
+        for p in (pick("--seed", "5002"), pick("--seed", "13000"), pick(), pick("--seed", "9")):
+            # No node holds a pick, and it is not a cluster job, so it runs with both GPU nodes down.
+            self.assertIsNone(job_stages(p))
+            self.assertEqual(self.m.lane(p), "local")
+            self.assertEqual(self.m.holder(p), (None, False))
+        # The pick's CLI is told where the app keeps the candidates the nodes sent it.
+        import os
+        import subprocess
+        from unittest import mock
+        from serial_audio import machine
+        with mock.patch.dict(os.environ), mock.patch.object(subprocess, "Popen") as popen:
+            popen.return_value.pid = 1
+            self.m._launch_local({**pick(), "id": "p1"})
+            self.assertEqual(popen.call_args.kwargs["env"][machine.MEDIA_MIRROR_ENV], str(self.m.media_dir))
+
+    def test_a_sync_job_runs_on_the_node_it_names_and_waits_for_no_other_job(self):
+        # Build: the job names a GPU node, has no CLI step, and is refused for a node that is not one.
+        from unittest import mock
+        with mock.patch("serial_audio.web.nomad._slug", return_value="demo"):
+            built = self.m._build("sync-media", {"slug": "demo", "node": "mac"}, {})
+            with self.assertRaises(ValueError):
+                self.m._build("sync-media", {"slug": "demo", "node": "dev"}, {})
+        self.assertEqual((built["args"], built["meta"], built["title"]),
+                         ([], {"node": "mac"}, "Send audio to the app · mac"))
+        sync = {"kind": "sync-media", "slug": "demo", **built}
+
+        # Place: one breeze dispatch pinned to that node, which waits while the node is busy.
+        self.assertEqual(job_stages(sync), [{"class": "breeze", "args": []}])
+        self.assertEqual(self.m._pick_node(sync, "breeze", [])[:2], ("mac", "breeze"))
+        node, cls, why = self.m._pick_node(sync, "breeze", [self.running_on("mac")])
+        self.assertIsNone(node)
+        self.assertIn("mac, which holds the files", why)
+
+        # Wait: it writes no library file, so it and a cast or a render of its serial do not wait for each other.
+        for other in (job("cast"), job("render", chapters=[1]), job("character-pass", chapters=[1])):
+            self.assertFalse(conflicts(sync, other))
+            self.assertFalse(conflicts(other, sync))
+
+    def test_the_mirror_holds_a_chapter_once_every_take_has_a_file_there(self):
+        from unittest import mock
+        from serial_audio import library as lib
+        with mock.patch.object(lib, "LIBRARY", Path(self.tmp.name) / "library"):
+            # A chapter without saved takes needs nothing from a node.
+            self.assertTrue(self.m._mirrored("demo", 1))
+            self.assertTrue(self.m._mirrored(None, 1))
+            files = ["D:\\comfy\\out\\breeze\\demo\\ch0001\\cpp\\l0000.wav",
+                     "D:\\comfy\\out\\breeze\\demo\\ch0001\\cpp\\l0001.wav"]
+            lib.save_json(lib.chapter_dir("demo", 1) / "breeze_takes.json",
+                          {"takes": {str(i): {"key": "k", "file": f} for i, f in enumerate(files)}})
+            self.assertFalse(self.m._mirrored("demo", 1))
+            check = job("check-takes", chapters=[1], args=["check-takes", "demo", "1"])
+            self.assertEqual(self.m.holder(check), ("laptop", True))
+
+            # One take in the mirror is not enough, and the answer follows the worker's uploads.
+            for i, raw in enumerate(files):
+                target = self.m.media_dir / exchange.mirror_rel(raw)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(b"RIFF")
+                self.m.worker_media_stored()
+                self.assertEqual(self.m._mirrored("demo", 1), i == 1)
+            self.assertEqual(self.m.holder(check), ("laptop", False))
 
     def test_a_restart_during_a_dispatch_dispatches_again_with_the_same_token(self):
         from unittest import mock
@@ -810,6 +943,367 @@ class NodeChoiceTest(unittest.TestCase):
         again.tick()
         self.assertEqual(Client.calls, [("serial-audio-llm", f"{j['id']}-0")])
         self.assertEqual(again.jobs[j["id"]]["nomad"]["dispatched"], "serial-audio-llm/dispatch-1")
+
+
+def wav_bytes(samples: bytes) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(24000)
+        w.writeframes(samples)
+    return buf.getvalue()
+
+
+def other_node(name: str) -> str:
+    """A take's path on a node of the other system than the one the test runs on."""
+    if os.name == "nt":
+        return "/Users/nobody/serial-audio/output/breeze/demo/ch0001/cpp/" + name
+    return "D:\\comfy\\ComfyUI\\output\\breeze\\demo\\ch0001\\cpp\\" + name
+
+
+class Lines:
+    def __init__(self):
+        self.lines = []
+
+    def line(self, text):
+        self.lines.append(text)
+
+
+class FakeApp:
+    """The worker's view of the app, answered by a NomadJobManager's media methods without HTTP."""
+
+    def __init__(self, manager, jid="j1", key="k"):
+        self.m, self.jid, self.key = manager, jid, key
+        self.sent, self.fetched = [], []
+
+    def request(self, method, path, data=None, timeout=60):
+        from serial_audio.web.nomad import WorkerError
+        from serial_audio.worker import AppError
+        try:
+            if path == "media/have":
+                return self.m.worker_media_have(self.jid, self.key, json.loads(data)["paths"])
+            rel = urllib.parse.unquote(path.split("path=", 1)[1])
+            target = self.m.worker_media_target(self.jid, self.key, rel)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            self.m.worker_media_stored()
+            self.sent.append(rel)
+            return {"bytes": len(data)}
+        except WorkerError as e:
+            raise AppError(e.status, str(e)) from None
+
+    def fetch(self, path, timeout=120):
+        from serial_audio.worker import AppError
+        rel = urllib.parse.unquote(path[len("/media/mirror/"):])
+        self.fetched.append(rel)
+        try:
+            return (self.m.media_dir / rel).read_bytes()
+        except OSError:
+            raise AppError(404, f"no file {rel}") from None
+
+
+class MediaTransferTest(unittest.TestCase):
+    def setUp(self):
+        from serial_audio.web.nomad import NomadClient, NomadJobManager
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        self.m = NomadJobManager(NomadClient("http://127.0.0.1:9", "token"), state_dir=base / "state", autostart=False)
+        self.m.jobs["j1"] = {"id": "j1", "status": "running", "nomad": {"key": "k"}}
+        self.app = FakeApp(self.m)
+        self.log = Lines()
+        self.root = base / "output"
+        self.folder = base / "work" / "library" / "demo"
+        self.takes_dir = self.root / "breeze" / "demo" / "ch0001" / "cpp"
+        self.takes_dir.mkdir(parents=True)
+        (self.folder / "chapters" / "0001").mkdir(parents=True)
+
+    def tearDown(self):
+        self.m._lock_file.close()
+        self.tmp.cleanup()
+
+    def mirror(self, raw: str, data: bytes) -> None:
+        path = self.m.media_dir / exchange.mirror_rel(raw)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+
+    def save_takes(self, takes: dict) -> Path:
+        path = self.folder / "chapters" / "0001" / exchange.TAKES_FILE
+        path.write_text(json.dumps({"engine": "breeze", "runner": "cpp", "takes": takes}), encoding="utf-8")
+        return path
+
+    def test_a_worker_fetches_the_takes_another_node_made(self):
+        from serial_audio import worker
+
+        # Setup: lines 0 and 1 come from another node and are in the mirror. The mirror's copy of line 2 holds other
+        # audio than its entry names, and the mirror lacks line 3. Line 4 is this node's own take, and the mirror
+        # holds an older copy of it.
+        pcm = [bytes([i + 1]) * 400 for i in range(5)]
+        wavs = [wav_bytes(p) for p in pcm]
+        ids = [hashlib.sha1(p).hexdigest()[:16] for p in pcm]
+        own = self.takes_dir / "l0004.wav"
+        own.write_bytes(wavs[4])
+        takes = {"0": {"key": "k0", "file": other_node("l0000.wav"), "audio": ids[0], "retake_rounds": 2},
+                 "1": {"key": "k1", "file": other_node("l0001.wav")},
+                 "2": {"key": "k2", "file": other_node("l0002.wav"), "audio": ids[2]},
+                 "3": {"key": "k3", "file": other_node("l0003.wav"), "audio": ids[3]},
+                 "4": {"key": "k4", "file": str(own), "audio": ids[4]}}
+        path = self.save_takes(takes)
+        self.mirror(other_node("l0000.wav"), wavs[0])
+        self.mirror(other_node("l0001.wav"), wavs[1])
+        self.mirror(other_node("l0002.wav"), wavs[3])
+        self.mirror(str(own), wavs[0])
+
+        # Fetch: the two takes land under this node's output folder, and their entries name them and keep their
+        # other fields.
+        self.assertEqual(worker.fetch_takes(self.app, self.folder, "demo", [1], self.root, self.log), 2)
+        new = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual((new["engine"], new["runner"]), ("breeze", "cpp"))
+        for i in (0, 1):
+            here = self.takes_dir / f"l000{i}.wav"
+            self.assertEqual(new["takes"][str(i)]["file"], str(here))
+            self.assertEqual(here.read_bytes(), wavs[i])
+        self.assertEqual(new["takes"]["0"], {**takes["0"], "file": str(self.takes_dir / "l0000.wav")})
+
+        # Leave: the take whose mirror copy is other audio, the take the mirror lacks and this node's own take stay
+        # as they were. The mirror's older copy does not replace the own take's file.
+        for i in (2, 3, 4):
+            self.assertEqual(new["takes"][str(i)], takes[str(i)])
+        self.assertFalse((self.takes_dir / "l0002.wav").exists())
+        self.assertEqual(own.read_bytes(), wavs[4])
+        self.assertNotIn(exchange.mirror_rel(str(own)), self.app.fetched)
+        self.assertIn("2 of the 4 takes this node lacked come from the app", self.log.lines[-1])
+
+        # Again: the fetched takes are now this node's, so a second run asks for neither.
+        self.app.fetched.clear()
+        self.assertEqual(worker.fetch_takes(self.app, self.folder, "demo", [1], self.root, self.log), 0)
+        self.assertEqual(self.app.fetched, [exchange.mirror_rel(other_node("l0002.wav"))])
+
+        # Back on the first node: a take whose file under the output folder already holds the mirror's audio is
+        # not fetched, and one that holds older audio is.
+        self.save_takes({"0": takes["0"], "1": takes["1"]})
+        (self.takes_dir / "l0001.wav").write_bytes(wavs[2])
+        self.app.fetched.clear()
+        self.assertEqual(worker.fetch_takes(self.app, self.folder, "demo", [1], self.root, self.log), 2)
+        self.assertEqual(self.app.fetched, [exchange.mirror_rel(other_node("l0001.wav"))])
+        self.assertEqual((self.takes_dir / "l0001.wav").read_bytes(), wavs[1])
+
+        # Gone: this node's own take whose file is gone comes back from the mirror at its own path.
+        self.save_takes({"4": takes["4"]})
+        self.mirror(str(own), wavs[4])
+        own.unlink()
+        self.assertEqual(worker.fetch_takes(self.app, self.folder, "demo", [1], self.root, self.log), 1)
+        self.assertEqual(own.read_bytes(), wavs[4])
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["takes"]["4"], takes["4"])
+
+        # An app that cannot be asked leaves the takes file alone and does not raise.
+        self.m.jobs["j1"]["status"] = "failed"
+        before = self.save_takes(takes).read_bytes()
+        self.assertEqual(worker.fetch_takes(self.app, self.folder, "demo", [1], self.root, self.log), 0)
+        self.assertEqual(path.read_bytes(), before)
+        self.assertIn("could not fetch the takes of chapter 1", self.log.lines[-1])
+
+    def test_a_fetch_that_fails_never_stops_the_job(self):
+        from unittest import mock
+        from serial_audio import worker
+        pcm = b"\x01" * 400
+        takes = {"0": {"key": "k0", "file": other_node("l0000.wav"), "audio": hashlib.sha1(pcm).hexdigest()[:16]}}
+        path = self.save_takes(takes)
+        self.mirror(other_node("l0000.wav"), wav_bytes(pcm))
+        before = path.read_bytes()
+        answers = []
+
+        def cut_short(url, timeout=120):
+            answers.append(url)
+            raise worker.AppError(None, "the app is not reachable: IncompleteRead(10 bytes read, 990 more expected)")
+
+        with mock.patch.object(worker, "MEDIA_RETRY", 0), mock.patch.object(worker, "MEDIA_TRIES", 3):
+            # A download the app cuts short is tried again, then given up, and the take stays as it was.
+            with mock.patch.object(self.app, "fetch", cut_short):
+                self.assertEqual(worker.fetch_takes(self.app, self.folder, "demo", [1], self.root, self.log), 0)
+            self.assertEqual(len(answers), 3)
+            self.assertEqual(path.read_bytes(), before)
+            self.assertFalse((self.takes_dir / "l0000.wav").exists())
+
+            # A download that succeeds on a later try brings the take.
+            real, calls = self.app.fetch, []
+
+            def flaky(url, timeout=120):
+                calls.append(url)
+                if len(calls) < 3:
+                    raise worker.AppError(503, "the app answered 503")
+                return real(url, timeout)
+
+            with mock.patch.object(self.app, "fetch", flaky):
+                self.assertEqual(worker.fetch_takes(self.app, self.folder, "demo", [1], self.root, self.log), 1)
+            self.assertEqual((self.takes_dir / "l0000.wav").read_bytes(), wav_bytes(pcm))
+
+        # A takes file of another shape, and an error nobody planned for, are logged and do not raise.
+        for body in ('{"takes": ["junk"]}', '["junk"]', "not json"):
+            path.write_text(body, encoding="utf-8")
+            self.assertEqual(worker.fetch_takes(self.app, self.folder, "demo", [1], self.root, self.log), 0)
+        self.save_takes(takes)
+        (self.takes_dir / "l0000.wav").unlink()
+        with mock.patch.object(worker, "app_copies", side_effect=RuntimeError("boom")):
+            self.assertEqual(worker.fetch_takes(self.app, self.folder, "demo", [1, 2], self.root, self.log), 0)
+        self.assertIn("RuntimeError: boom", self.log.lines[-1])
+
+    def test_the_http_client_reports_a_cut_answer_as_the_app_being_unreachable(self):
+        import http.client
+        from unittest import mock
+        from serial_audio import worker
+        app = worker.App("http://127.0.0.1:9", "j1", "k", "node", 0)
+
+        class Cut:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                raise http.client.IncompleteRead(b"x" * 10, 990)
+
+        with mock.patch("urllib.request.urlopen", return_value=Cut()):
+            for call in (lambda: app.fetch("/media/mirror/a.wav"), lambda: app.request("POST", "media/have", b"{}")):
+                with self.assertRaises(worker.AppError) as e:
+                    call()
+                self.assertIsNone(e.exception.status)
+
+    def test_a_worker_sends_the_app_the_audio_it_lacks(self):
+        from serial_audio import worker
+        files = [self.takes_dir / "l0000.wav", self.takes_dir / "l0001.wav", self.root / "hero_00001_.safetensors"]
+        for i, f in enumerate(files):
+            f.write_bytes(bytes([i]) * 100)
+        paths = [str(f) for f in files]
+
+        # Send: the takes and the Drama 3 voice file the mirror lacks all arrive.
+        self.assertEqual(worker.send_media(self.app, paths, self.log), {"sent": 3, "bytes": 300, "kept": 0, "failed": 0})
+        for f in files:
+            self.assertEqual((self.m.media_dir / exchange.mirror_rel(str(f))).read_bytes(), f.read_bytes())
+        self.assertIn("sent the app 3 audio file(s)", self.log.lines[-1])
+
+        # Keep: a second run sends nothing, and says nothing.
+        said = len(self.log.lines)
+        self.assertEqual(worker.send_media(self.app, paths, self.log), {"sent": 0, "bytes": 0, "kept": 3, "failed": 0})
+        self.assertEqual(len(self.log.lines), said)
+
+        # Replace: a take with new contents of the same size is sent again.
+        files[1].write_bytes(b"\x09" * 100)
+        self.app.sent.clear()
+        self.assertEqual(worker.send_media(self.app, paths, self.log)["sent"], 1)
+        self.assertEqual(self.app.sent, [exchange.mirror_rel(paths[1])])
+
+        # Refuse: a file the app refuses fails alone, and the files beside it still arrive.
+        note = self.root / "note.txt"
+        note.write_text("x", encoding="utf-8")
+        more = [self.takes_dir / f"l001{i}.wav" for i in range(6)]
+        for i, f in enumerate(more):
+            f.write_bytes(bytes([20 + i]) * 50)
+        got = worker.send_media(self.app, [str(note)] + [str(f) for f in more], self.log)
+        self.assertEqual((got["sent"], got["failed"]), (6, 1))
+        self.assertFalse((self.m.media_dir / exchange.mirror_rel(str(note))).exists())
+        self.assertIn("1 did not arrive", self.log.lines[-1])
+
+        # Outage: while the app is unreachable each request is tried again, and the audio arrives once it answers.
+        from unittest import mock
+        real, calls = self.app.request, []
+
+        def down_twice(method, path, data=None, timeout=60):
+            calls.append(path)
+            if len(calls) <= 2:
+                raise worker.AppError(None, "the app is not reachable: connection refused")
+            return real(method, path, data, timeout)
+
+        files[2].write_bytes(b"\x07" * 100)
+        with mock.patch.object(worker, "MEDIA_RETRY", 0), mock.patch.object(self.app, "request", down_twice):
+            self.assertEqual(worker.send_media(self.app, paths, self.log)["sent"], 1)
+        self.assertEqual((self.m.media_dir / exchange.mirror_rel(paths[2])).read_bytes(), b"\x07" * 100)
+
+        # An outage that lasts costs one round of tries, not one per file, and nothing raises.
+        calls.clear()
+
+        def down(method, path, data=None, timeout=60):
+            calls.append(path)
+            raise worker.AppError(None, "the app is not reachable: connection refused")
+
+        for f in more:
+            f.write_bytes(b"\x06" * 50)
+        with mock.patch.object(worker, "MEDIA_RETRY", 0), mock.patch.object(worker, "MEDIA_TRIES", 3), \
+                mock.patch.object(self.app, "request", down):
+            self.assertEqual(worker.send_media(self.app, [str(f) for f in more], self.log)["failed"], 6)
+        self.assertEqual(calls, ["media/have"] * 3)
+
+        # A job that no longer runs gets nothing into the mirror, and the worker does not raise.
+        self.m.jobs["j1"]["status"] = "failed"
+        files[0].write_bytes(b"\x08" * 100)
+        self.assertEqual(worker.send_media(self.app, paths, self.log)["failed"], 3)
+        self.assertNotEqual((self.m.media_dir / exchange.mirror_rel(paths[0])).read_bytes(), files[0].read_bytes())
+
+    def test_the_audio_a_job_sends_covers_every_take_of_a_chapter_it_changed(self):
+        from serial_audio import worker
+        import yaml
+
+        # Setup: chapter 1 has two takes on this node and one on another, chapter 2 has one, and the hero's voice
+        # has a candidate from this node with a Drama 3 voice file and an older one from another node.
+        t1, t2, t3 = self.takes_dir / "l0000.wav", self.takes_dir / "l0001.wav", self.root / "ch2.wav"
+        clip, voice = self.root / "hero_00001_.flac", self.root / "hero_00001_.safetensors"
+        for f in (t1, t2, t3, clip, voice):
+            f.write_bytes(b"x")
+        self.save_takes({"0": {"file": str(t1)}, "1": {"file": str(t2)}, "2": {"file": other_node("l0002.wav")}})
+        (self.folder / "chapters" / "0002").mkdir()
+        (self.folder / "chapters" / "0002" / exchange.TAKES_FILE).write_text(
+            json.dumps({"takes": {"0": {"file": str(t3)}}}), encoding="utf-8")
+        (self.folder / "voices").mkdir()
+        (self.folder / "voices" / "hero.yaml").write_text(yaml.safe_dump({
+            "candidates": [{"seed": 1, "clip": str(clip), "voice_file": str(voice)}],
+            "history": [{"candidates": [{"seed": 0, "clip": other_node("hero_s0.wav")}]}]}), encoding="utf-8")
+        (self.folder / "voices" / "_briefs.yaml").write_text("hero: {}\n", encoding="utf-8")
+
+        # Any changed file of a chapter brings every take of that chapter this node holds, flagged or not.
+        self.assertEqual(worker.media_files(self.folder, {"chapters/0001/chapter.yaml": {}}), sorted([str(t1), str(t2)]))
+        self.assertEqual(worker.media_files(self.folder, {"chapters/0002/take_check.json": {}}), [str(t3)])
+        # A changed voice record brings its candidates on this node, with their Drama 3 voice files.
+        self.assertEqual(worker.media_files(self.folder, {"voices/hero.yaml": {}}), sorted([str(clip), str(voice)]))
+        # The briefs and the serial's own files bring nothing.
+        self.assertEqual(worker.media_files(self.folder, {"voices/_briefs.yaml": {}, "serial.yaml": {}}), [])
+        # A sync job covers the whole serial.
+        self.assertEqual(worker.media_files(self.folder, None), sorted(str(f) for f in (t1, t2, t3, clip, voice)))
+        # An empty file is no take, and a record with a field of another shape is read for the rest.
+        t2.write_bytes(b"")
+        (self.folder / "voices" / "hero.yaml").write_text(yaml.safe_dump({
+            "candidates": [{"seed": 1, "clip": str(clip), "voice_file": [str(voice)]}, "junk"]}), encoding="utf-8")
+        self.assertEqual(worker.media_files(self.folder, None), sorted(str(f) for f in (t1, t3, clip)))
+
+    def test_the_app_takes_media_only_for_a_running_job_and_only_at_mirror_paths(self):
+        from serial_audio.web.nomad import WorkerError
+        self.mirror("D:\\out\\a.wav", b"a")
+
+        # Have: the answer names the mirror's files by hash and leaves out what is not a mirror path.
+        got = self.m.worker_media_have("j1", "k", ["D/out/a.wav", "D/out/b.wav", "../state/jobs.json", "C:/x.wav"])
+        self.assertEqual(got, {"have": {"D/out/a.wav": hashlib.sha256(b"a").hexdigest()}})
+
+        # Target: a mirror path with a kept file type maps into the mirror, and anything else is refused.
+        self.assertEqual(self.m.worker_media_target("j1", "k", "D/out/v.safetensors"),
+                         self.m.media_dir / "D/out/v.safetensors")
+        for bad in ("../state/jobs.json", "D/out/../../x.wav", "D/out/run.py", "/etc/x.wav", "C:\\x.wav", ""):
+            with self.assertRaises(WorkerError) as e:
+                self.m.worker_media_target("j1", "k", bad)
+            self.assertEqual(e.exception.status, 400, bad)
+
+        # Job: a wrong key, an unknown job and a finished job are refused. A job the app stopped while its worker
+        # still ran may send the takes it made.
+        for jid, key, status in (("j1", "wrong", 403), ("j9", "k", 404)):
+            with self.assertRaises(WorkerError) as e:
+                self.m.worker_media_have(jid, key, [])
+            self.assertEqual(e.exception.status, status)
+        self.m.jobs["j1"]["status"] = "done"
+        with self.assertRaises(WorkerError) as e:
+            self.m.worker_media_target("j1", "k", "D/out/a.wav")
+        self.assertEqual(e.exception.status, 410)
+        self.m.jobs["j1"].update(status="stopped")
+        self.m.jobs["j1"]["nomad"]["cancel"] = True
+        self.assertEqual(self.m.worker_media_have("j1", "k", [])["have"], {})
 
 
 class KeyAndLockTest(unittest.TestCase):

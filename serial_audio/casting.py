@@ -362,16 +362,38 @@ def score_candidates(cid: str, brief: dict, candidates: list[dict], *, asr: str,
         log(f"   {cid} seed {c['seed']}: match {score:.2f}{'  clipped' if run >= CLIP_RUN else ''}  {files[i].name}")
 
 
+def held_file(raw: str) -> Path | None:
+    """A candidate's clip or voice file as this machine holds it.
+
+    raw: the file's path on the node that designed the candidate.
+    Returns that path when it is a file here, else its copy in the app's media mirror, else None.
+    """
+    if Path(raw).is_file():
+        return Path(raw)
+    if machine.MEDIA_MIRROR is not None:
+        from .web.exchange import mirror_rel
+        rel = mirror_rel(raw)
+        if rel and (machine.MEDIA_MIRROR / rel).is_file():
+            return machine.MEDIA_MIRROR / rel
+    return None
+
+
 def file_voice(slug: str, cid: str, brief: dict, candidates: list[dict], chosen: int, engine: str = "qwen") -> dict:
     """Copies the chosen candidate into the library and returns the voice record, which is also saved.
 
-    engine: the engine that designed the candidates. "qwen" also copies the Drama 3 voice file into the library and
-        into ComfyUI's voice folder. "breeze" copies only the clip.
+    engine: the engine that designed the candidates. "qwen" also copies the Drama 3 voice file into the library,
+        and into ComfyUI's voice folder on a machine that has one. "breeze" copies only the clip.
+    The clip and the voice file are read through held_file. A Qwen candidate whose voice file is not held is filed
+    with its clip alone, and the record then names no Drama 3 voice. Raises FileNotFoundError when the clip is not
+    held.
     """
     voices_dir = lib.serial_dir(slug) / "voices"
     voices_dir.mkdir(parents=True, exist_ok=True)
     best = candidates[chosen]
-    clip_src = Path(best["clip"])
+    clip_src = held_file(best["clip"])
+    if clip_src is None:
+        raise FileNotFoundError(f"the clip of {cid} seed {best['seed']} is not on this machine or in the app's "
+                                f"media mirror: {best['clip']}")
     clip_dst = voices_dir / f"{cid}{clip_src.suffix}"
     shutil.copy2(clip_src, clip_dst)
     record = {
@@ -379,15 +401,15 @@ def file_voice(slug: str, cid: str, brief: dict, candidates: list[dict], chosen:
         "source": SOURCES[engine], "instruct": brief["instruct"], "sample_text": brief["sample_text"],
         "seed": best["seed"], "clip": clip_dst.name,
     }
-    if engine == "qwen":
-        voice_src = Path(best["voice_file"])
+    voice_src = held_file(best["voice_file"]) if engine == "qwen" else None
+    if voice_src is not None:
         voice_dst = voices_dir / f"{cid}.safetensors"
         shutil.copy2(voice_src, voice_dst)
-        comfy_dst = VOICES_OUTPUT / slug / f"{cid}.safetensors"   # what Load Drama 3 Voice will list
-        comfy_dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(voice_src, comfy_dst)
-        record.update(drama3_voice=voice_dst.name,
-                      comfy_voice=str(comfy_dst.relative_to(VOICES_OUTPUT)).replace("\\", "/"))
+        record.update(drama3_voice=voice_dst.name, comfy_voice=f"{slug}/{cid}.safetensors")
+        if VOICES_OUTPUT.parent.is_dir():
+            comfy_dst = VOICES_OUTPUT / slug / f"{cid}.safetensors"   # what Load Drama 3 Voice will list
+            comfy_dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(voice_src, comfy_dst)
     record.update(candidates=candidates, chosen=chosen, created_at=lib.now_iso())
     lib.save_yaml(voices_dir / f"{cid}.yaml", record)
     return record

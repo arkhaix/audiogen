@@ -40,3 +40,42 @@ The first fix for the chapter 12 case, deployed at about 13:40 and replaced that
 > A render goes back to the free node that holds its saved takes only when it would reuse at least 90% of them there. At 6x the break-even is near 84%.
 
 It picked the right node when both were free and said nothing about a busy one, so a render that became eligible while the laptop ran a short job still went to the Mac for an hour.
+
+---
+
+## 2026-11-12: jobs tied to the node that held their files
+
+### The case
+
+With the laptop off, AJ "wanted to recast a voice, but couldn't because aj-legion5 was turned off and some files were
+needed that were only stored there". The job was no longer in the app's job list that afternoon, so which job waited
+is not recorded. Three kinds of job were tied to one node then: a voice pick, a join and a take check. A render ran on
+either node, but on the other node it made every line again.
+
+Before the change, on 2026-11-12, the app's mirror held all 297 candidate clips, 269 of the 9,383 takes of The
+Hundred Reigns and none of the 141 Drama 3 voice files. None of its 42 Breeze chapters could be joined or checked
+without the node that made its takes.
+
+After the deploy, one `sync-media` job per node copied the rest. The laptop sent 8,660 files, 2.6 GB, in 67 s, and the
+Mac sent 614 files, 193 MB, in about 20 s. The mirror then held every take, 2.9 GB.
+
+The cluster test used a throwaway serial of one 11-line chapter, deleted afterwards:
+
+* A pick of a candidate the laptop made ran on containers in under a second, and the filed clip matched the mirror's copy byte for byte.
+* A join and a take check of the chapter the laptop rendered ran on the Mac while the laptop was busy. The Mac fetched the 11 takes, and the join had the same length, 36.8 s.
+* After a say-as change, a render on the Mac made 5 of the 11 lines and reused 6.
+* The laptop then joined that chapter while the Mac was busy. It fetched the 5 takes the Mac had made and already held the other 6.
+
+### Superseded text
+
+From "jsc-m1 renders Breeze, and the laptop is preferred" (2026-11-07, revised 2026-11-08):
+
+> A job that needs a node's saved files goes back to that node, and a voice pick goes to the node that made the candidate it files.
+
+From "The app picks the node for every GPU job" (2026-11-07):
+
+> It records which node holds each chapter's takes and each voice's candidates in `state/placement.json`.
+
+From the known limits in `deploy/README.md`:
+
+> Saved Breeze takes stay on the node that made them. A rerun on another node renders every line again.

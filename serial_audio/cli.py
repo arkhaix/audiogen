@@ -357,6 +357,9 @@ def cmd_pick_voice(args) -> int:
         print(f"pick-voice: {e}", file=sys.stderr)
         return 1
     print(f"{args.character}: seed {record['seed']} filed, status {record['status']}")
+    if record.get("engine") == "qwen" and not record.get("drama3_voice"):
+        print("   filed without its Drama 3 voice file, which this machine does not hold, so only Breeze can render "
+              "this voice")
     return 0
 
 

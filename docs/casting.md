@@ -31,7 +31,40 @@ until AJ listens and runs `pick-voice`.
 * A Breeze take comes out at the level of its voice's cast clip, and cast clips run from -11 to -29 dB of active speech RMS. Since 2026-11-09 the join levels each voice, so a chapter doesn't show the difference, but raw candidate clips do. Bring candidates to one level before AJ compares them by ear, or a quiet clip sounds worse than it is.
 * The casting check files the candidate whose transcript matches best. For a whisper brief that is the most voiced candidate, so pick a whispered one by seed.
 * Breeze clones the distortion of a clipped cast clip into every take, and the join can only turn it down. The Keeper's seed 13000 had a longest run of 6 full-scale samples at -10.9 dB RMS, and its chapter 11 lines sounded clipped after the join leveled them. Since 2026-11-10 the cast marks a candidate with 3 or more full-scale samples in a row as clipped, files it only when every candidate is clipped, and the casting page shows the mark. `pick-voice` still files a clipped seed when asked.
-* Use a new seed range for each round, so `pick-voice --seed` names exactly one candidate. Used so far: 1000, 4000, 5000, 6000, 7000, 9000, 10000, 11000, 12000 in a throwaway serial, and 13000, 13100, 13200 and 13300 in a scratch copy, 17000 and 18000 in the library (eole and lorimor-ancitif), and 18000, 18100, 18200 and 18300 in a scratch copy (casval and anna-paimon), 19000, 19100 and 19200 in a scratch copy (lorimor-ancitif), and 20000, 21000, 21100, 21200, 22000, 22100, 22200 and 22300 in a scratch copy (casval). The next round should start at 23000.
+* Use a new seed range for each round, so `pick-voice --seed` names exactly one candidate. Used so far: 1000, 4000, 5000, 6000, 7000, 9000, 10000, 11000, 12000 in a throwaway serial, and 13000, 13100, 13200 and 13300 in a scratch copy, 17000 and 18000 in the library (eole and lorimor-ancitif), and 18000, 18100, 18200 and 18300 in a scratch copy (casval and anna-paimon), 19000, 19100 and 19200 in a scratch copy (lorimor-ancitif), and 20000, 21000, 21100, 21200, 22000, 22100, 22200 and 22300 in a scratch copy (casval), and 41000 to 41500 in a scratch copy (argas-septic). The library used 26000 to 36003 by 2026-11-12, and 41402 for argas-septic. The Cast tab names the library's next free range, which was 42000 on 2026-11-12. Start a scratch round well above it. The next one should start at 50000.
+* A brief that names no accent leaves the accent to the seed. leticia-septic's brief names none, and AJ hears a slight southern accent in her seed 26002.
+
+---
+
+## Argas Septic's French accent
+
+From 2026-11-11 to 2026-11-12 AJ cast argas-septic once and recast him six times in the library, seeds 26000 to
+35003, and kept hearing a French accent. The first three briefs were "A man in his late seventies with a thin, reedy,
+sharp voice, slightly mushy from missing teeth. He speaks in a clipped, haggling merchant's register, quick and
+greedy, with a sneering, mean-spirited edge." The last four rounds added "a slight southern accent", "a slight
+southern American accent" or "a slight southern twang" after the teeth, to match his daughter Leticia, and the last
+one also dropped "sneering". None of that removed the French. The filed clip, seed 35000, has a median F0 of 215 Hz,
+above Leticia's 172 Hz.
+
+On 2026-11-12 a scratch trial on the laptop designed four candidates from each of six briefs. Every one matched its
+line, and the trial filed nothing. The clips can be designed again from the brief and the seed.
+
+| Seeds | Median F0 | Brief |
+|---|---|---|
+| 41000 to 41003 | 153 to 239 Hz | "An old man from the American South in his late seventies, speaking with a slight Southern drawl. His voice is thin, reedy and sharp, at a normal conversational volume, and he sounds greedy, impatient and mean-spirited." |
+| 41100 to 41103 | 207 to 253 Hz | "An elderly American man in his late seventies with a thin, reedy, sharp voice and the soft drawl of rural Georgia. A stingy old shopkeeper, shrewd, greedy and mean, speaking at a normal conversational volume." |
+| 41200 to 41203 | 189 to 239 Hz | The filed brief without the teeth: "A man in his late seventies with a thin, reedy, sharp voice and a slight southern twang. He speaks in a clipped, haggling merchant's register, quick and greedy, with a mean-spirited edge." |
+| 41300 to 41303 | 198 to 242 Hz | The filed brief without the merchant: "A man in his late seventies with a thin, reedy, sharp voice, slightly mushy from missing teeth, and a slight southern twang. He is quick and greedy, with a mean-spirited edge." |
+| 41400 to 41403 | 171 to 256 Hz | "An elderly American man in his late seventies with a thin, reedy, sharp voice. A wealthy old miser, shrewd, greedy and impatient, with a mean-spirited edge, speaking at a normal conversational volume." |
+| 41500 to 41503 | 161 to 252 Hz | The first brief, with the line "Now that price is an insult, son, and you know it as well as I do. You bring me a better offer, or quit wasting my evening." |
+
+The Recast dialog takes a brief, a first seed and a candidate count, so it can file any of the first five. It can't
+change the sample line, so the last row needs a change to `cast` before it can be filed.
+
+AJ listened the same day and picked seed 41402, at 171 Hz, from the brief that says "American" and names no southern
+accent. He did not say how the other candidates sounded. It was recast in the library with that brief, that seed and
+one candidate on aj-legion5, and the filed clip is the scratch clip byte for byte. Its status is auto. Chapters 36
+and 37, his only chapters, were rendered before the recast and still have an earlier voice.
 
 ---
 

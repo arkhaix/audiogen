@@ -2,11 +2,15 @@
 retakes of flagged takes before the join."""
 from __future__ import annotations
 
+import hashlib
 import io
 import json
+import struct
+import subprocess
 import sys
 import tempfile
 import unittest
+import wave
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
@@ -269,6 +273,70 @@ class RetakeTest(unittest.TestCase):
         self.retake(self.again(LOOP))
         self.assertEqual(self.saved["1"]["takes_tried"], 5)
 
+    def test_a_line_taken_again_records_its_round(self):
+        # Both rounds are dropped, so the line keeps its take and records the last round. The other line records none.
+        self.retake(self.again(LOOP))
+        self.assertEqual((self.saved["1"]["retake_rounds"], self.saved["1"]["audio"]), (2, "a1"))
+        self.assertNotIn("retake_rounds", self.saved["0"])
+
+    def flag_saved(self) -> None:
+        """Writes take_check.json for the saved takes, as the check of an earlier render left it."""
+        entries = takecheck.check_entries(self.saved, LINES, {}, engine="parakeet", comfy_url="", log=self.logs.append)
+        takecheck.save_entries(self.folder, entries, "parakeet")
+
+    def test_a_saved_take_that_was_flagged_is_taken_again_once(self):
+        # An earlier check flagged line 1 and passed line 0, so only line 1's saved take is one to take again.
+        self.flag_saved()
+        self.assertEqual(self.checked()["1"]["verdict"], "flagged")
+        self.assertEqual(breeze.flagged_before(self.folder, self.saved), {"1"})
+
+        # A verdict says nothing about a take with other audio, another key, or a line with no saved take.
+        self.assertEqual(breeze.flagged_before(self.folder, {**self.saved, "1": {**self.saved["1"], "audio": "b9"}}), set())
+        self.assertEqual(breeze.flagged_before(self.folder, {**self.saved, "1": {**self.saved["1"], "key": "k9"}}), set())
+        self.assertEqual(breeze.flagged_before(self.folder, {"0": self.saved["0"]}), set())
+
+        # After one round the line may still be taken again. After every round its take stands, though still flagged.
+        self.assertEqual(breeze.flagged_before(self.folder, {**self.saved, "1": {**self.saved["1"], "retake_rounds": 1}}),
+                         {"1"})
+        self.retake(self.again(LOOP))
+        self.assertEqual((self.checked()["1"]["verdict"], self.saved["1"]["retake_rounds"]),
+                         ("flagged", breeze.CHECK_RETAKES))
+        self.assertEqual(breeze.flagged_before(self.folder, self.saved), set())
+
+    def test_a_flagged_take_from_before_takes_recorded_their_audio_is_taken_again(self):
+        # Neither the take nor its verdict holds an audio hash, so they match on the key.
+        for take in self.saved.values():
+            del take["audio"]
+        self.flag_saved()
+        self.assertNotIn("audio", self.checked()["1"])
+        self.assertEqual(breeze.flagged_before(self.folder, self.saved), {"1"})
+
+    def test_a_missing_or_damaged_check_file_flags_nothing(self):
+        self.assertEqual(breeze.flagged_before(self.folder, self.saved), set())
+        for damaged in (b"{", b'{"takes": {"1": "\xff"}}', b'{"takes": {"1": "flagged"}}', b'{"takes": []}', b"[]"):
+            (self.folder / takecheck.CHECK_FILE).write_bytes(damaged)
+            self.assertEqual(breeze.flagged_before(self.folder, self.saved), set(), damaged)
+
+        # A take whose record is damaged does not hide the verdict of another line.
+        (self.folder / takecheck.CHECK_FILE).unlink()
+        self.saved["0"] = self.take(0, "The the the the harbour was quiet that morning.", "a0")
+        self.flag_saved()
+        self.assertEqual(breeze.flagged_before(self.folder, {**self.saved, "1": {**self.saved["1"], "retake_rounds": "2"}}),
+                         {"0", "1"})
+        self.assertEqual(breeze.flagged_before(self.folder, {**self.saved, "1": "l0001.wav"}), {"0"})
+
+    def test_only_a_machine_whose_parakeet_runs_takes_flagged_takes_again(self):
+        self.assertTrue(breeze.retakes_flagged_here(""))
+        self.engine = "qwen3"
+        self.assertFalse(breeze.retakes_flagged_here(""))
+
+        # Parakeet that cannot run, or a recognizer name this code does not know, is not a reason to fail a render.
+        self.engine = "parakeet"
+        with mock.patch.object(takecheck, "check_ready", side_effect=ComfyError("sherpa-onnx is missing")):
+            self.assertFalse(breeze.retakes_flagged_here(""))
+        with mock.patch.object(breeze, "choose_asr", side_effect=ComfyError("unknown speech recognizer 'x'")):
+            self.assertFalse(breeze.retakes_flagged_here(""))
+
     def test_only_parakeet_checks_before_the_join(self):
         # Qwen3-ASR needs the card that breeze-server holds, so nothing is checked or taken again.
         self.engine = "qwen3"
@@ -285,6 +353,193 @@ class RetakeTest(unittest.TestCase):
         self.assertTrue(takecheck.reusable({"key": "k1", "asr": "parakeet", "heard": "x"}, {"key": "k1"}, "parakeet"))
         self.assertFalse(takecheck.reusable({"key": "k1", "asr": "parakeet", "heard": "x"},
                                             {"key": "k1", "audio": "a1"}, "parakeet"))
+
+
+SAVED_TAKE = 2_000_000_001
+LONGER_LOOP = "Nobody nobody nobody nobody nobody nobody nobody answered the door."
+
+
+class RenderFlaggedTest(unittest.TestCase):
+    """render_breeze on a rendered chapter whose saved take of line 1 an earlier check flagged, with a fake
+    breeze-server, recognizer and join. Each take's audio holds a number: the seed that made it, or SAVED_TAKE for
+    the saved take of line 1. The recognizer hears LOOP in that saved take and new_takes_say in any other take of
+    line 1."""
+
+    RATE = 24000
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.engine, self.parakeet_runs, self.new_takes_say = "parakeet", True, LINES[1]["text"]
+        self.asked: list[int] = []
+        self.joined: dict[int, int] = {}
+        self.logs: list[str] = []
+        clip, test, real_run = b"clip", self, subprocess.run
+        (root / "ref.wav").write_bytes(b"ref")
+
+        class Server:
+            sample_rate = self.RATE
+
+            def __init__(self, log_path, log):
+                pass
+
+            def refuse_if_busy(self):
+                pass
+
+            def start(self):
+                pass
+
+            def take(self, fields, wav, label, log):
+                test.asked.append(fields["seed"])
+                return test.pcm(fields["seed"])
+
+            def __exit__(self, *exc):
+                pass
+
+        def stage(slug, voices, runner):
+            return {"narrator": {"ref": str(root / "ref.wav"), "transcript": "t", "sha1": hashlib.sha1(clip).hexdigest()}}
+
+        def hears(files, *, engine, comfy_url):
+            for i, f in enumerate(files):
+                line = int(Path(f).name[1:5])
+                said = LOOP if self.number_in(f) == SAVED_TAKE else self.new_takes_say
+                yield i, said if line == 1 else LINES[line]["text"]
+
+        def ready(engine, comfy_url):
+            if not self.parakeet_runs:
+                raise ComfyError("sherpa-onnx is missing from the audio Python")
+
+        def run(args, *a, **k):
+            if len(args) < 4 or str(args[2]) != str(breeze.JOIN_SCRIPT):
+                return real_run(args, *a, **k)
+            job = json.loads(Path(args[3]).read_text(encoding="utf-8"))
+            self.joined = {t["line"]: self.number_in(t["file"]) for t in job["takes"]}
+            Path(job["output"]).write_bytes(b"opus")
+            summary = {"takes": len(job["takes"]), "seconds": 4.0, "sample_rate": self.RATE}
+            return subprocess.CompletedProcess(args, 0, json.dumps(summary), "")
+
+        for p in (mock.patch.object(lib, "LIBRARY", root / "library"),
+                  mock.patch.object(breeze, "COMFY_OUTPUT", root / "out"),
+                  mock.patch.object(breeze, "CppServer", Server),
+                  mock.patch.object(breeze, "wait_comfy_idle", lambda *a, **k: None),
+                  mock.patch.object(breeze, "free_comfy", lambda *a, **k: None),
+                  mock.patch.object(breeze, "stage_references", stage),
+                  mock.patch.object(breeze, "choose_asr", lambda *a, **k: self.engine),
+                  mock.patch.object(takecheck, "choose", lambda *a, **k: self.engine),
+                  mock.patch.object(takecheck, "check_ready", ready),
+                  mock.patch.object(takecheck, "transcripts", hears),
+                  mock.patch.object(subprocess, "run", run)):
+            p.start()
+            self.addCleanup(p.stop)
+
+        # A serial with one voice and a rendered chapter of two lines
+        serial = root / "library" / "s"
+        (serial / "voices").mkdir(parents=True)
+        lib.save_yaml(serial / "serial.yaml", {"title": "s", "narrator_voice_id": "narrator"})
+        (serial / "voices" / "narrator.flac").write_bytes(clip)
+        lib.save_yaml(serial / "voices" / "narrator.yaml", {"clip": "narrator.flac", "sample_text": "t"})
+        self.chapter = serial / "chapters" / "0001"
+        self.chapter.mkdir(parents=True)
+        lib.save_yaml(self.chapter / "chapter.yaml", {"number": 1, "status": "rendered", "render": {
+            "engine": "breeze", "runner": "cpp", "seed": 1, "check": {"checked": 2, "flagged": [1]}}})
+        (self.chapter / "text.md").write_text("x", encoding="utf-8")
+        lib.save_json(self.chapter / "script.json", {"lines": LINES})
+
+        # Its saved takes, and the check that flagged line 1
+        plan = breeze.plan_takes(LINES, {"narrator": 0}, {0: "narrator"}, {}, 1,
+                                 {"narrator": hashlib.sha1(clip).hexdigest()}, "cpp")
+        self.voice_seed = plan[0][4]
+        take_dir = root / "out" / "breeze" / "s" / "ch0001" / "cpp"
+        take_dir.mkdir(parents=True)
+        saved = {}
+        for i, voice, text, direction, vseed, key in plan:
+            pcm = self.pcm(SAVED_TAKE if i == 1 else vseed)
+            breeze.write_wav(take_dir / f"l{i:04d}.wav", pcm, self.RATE)
+            saved[str(i)] = {"key": key, "file": str(take_dir / f"l{i:04d}.wav"), "voice": voice, "direction": direction,
+                             "seconds": 1.0, "seed": vseed, "audio": hashlib.sha1(pcm).hexdigest()[:16]}
+        breeze.save_takes(self.chapter / breeze.TAKES_FILE, saved, "cpp")
+        entries = takecheck.check_entries(saved, LINES, {}, engine="parakeet", comfy_url="", log=self.logs.append)
+        takecheck.save_entries(self.chapter, entries, "parakeet")
+
+    def pcm(self, number: int) -> bytes:
+        """Two seconds of audio that holds number."""
+        return struct.pack("<i", number) * self.RATE
+
+    def number_in(self, file) -> int:
+        with wave.open(str(file), "rb") as w:
+            return struct.unpack("<i", w.readframes(2))[0]
+
+    def seed_of_try(self, n: int) -> int:
+        """The seed cpp_take gives a line's n-th try, counted from 0 across rounds."""
+        return 1 + (self.voice_seed - 1 + n * breeze.RETAKE_SEED_STEP) % (2**31 - 2)
+
+    def render(self, **kw) -> dict:
+        self.asked.clear()
+        self.joined = {}
+        return breeze.render_breeze("s", 1, seed=1, comfy_url="", log=self.logs.append, **kw)
+
+    def take(self, line: int) -> dict:
+        return lib.load_json(self.chapter / breeze.TAKES_FILE)["takes"][str(line)]
+
+    def verdict(self, line: int) -> str:
+        return lib.load_json(self.chapter / takecheck.CHECK_FILE)["takes"][str(line)]["verdict"]
+
+    def test_a_render_takes_a_flagged_saved_take_again(self):
+        # The fixture holds what an earlier render left: line 1 flagged, and a render would take it again.
+        self.assertEqual((self.verdict(0), self.verdict(1)), ("ok", "flagged"))
+        self.assertEqual(breeze.reusable_takes("s", 1, 1, "cpp"), (1, 2))
+
+        # The render makes no line again from its own seed. It asks only for round one of line 1, which says the
+        # line, so that take is joined in place of the saved one and line 0 keeps its take.
+        record = self.render()
+        self.assertEqual(self.asked, [self.seed_of_try(breeze.RETAKES + 1)])
+        self.assertEqual(self.joined, {0: self.voice_seed, 1: self.asked[0]})
+        self.assertEqual(record["generated_takes"], 0)
+
+        # The take, its verdict and the chapter's check record all say so.
+        self.assertEqual({k: self.take(1).get(k) for k in ("seed", "retaken", "retake_rounds")},
+                         {"seed": self.asked[0], "retaken": 1, "retake_rounds": 1})
+        self.assertEqual(self.verdict(1), "ok")
+        self.assertEqual((record["check"]["flagged"], record["check"]["retaken"]), ([], [1]))
+        self.assertEqual(lib.load_chapter("s", 1)[0]["render"]["check"], record["check"])
+        self.assertFalse(list((self.chapter.parents[3] / "out").rglob("*.retake.wav")))
+
+        # A later render has nothing to take and joins the same takes.
+        self.render()
+        self.assertEqual((self.asked, self.joined[1]), ([], self.seed_of_try(breeze.RETAKES + 1)))
+        self.assertEqual(breeze.reusable_takes("s", 1, 1, "cpp"), (2, 2))
+
+    def test_the_saved_take_stays_when_no_new_take_is_closer(self):
+        # Every new take loops more than the saved one, so both rounds are asked for and the saved take is joined.
+        self.new_takes_say = LONGER_LOOP
+        record = self.render()
+        self.assertEqual(self.asked, [self.seed_of_try(n * (breeze.RETAKES + 1)) for n in (1, 2)])
+        self.assertEqual(self.joined[1], SAVED_TAKE)
+        self.assertEqual(self.number_in(self.take(1)["file"]), SAVED_TAKE)
+        self.assertEqual((self.take(1).get("retaken"), self.take(1)["retake_rounds"], self.verdict(1)),
+                         (None, breeze.CHECK_RETAKES, "flagged"))
+        self.assertEqual(record["check"]["flagged"], [1])
+
+        # The line has been through every round, so a later render leaves it alone and counts its take as reusable.
+        self.render()
+        self.assertEqual((self.asked, self.joined[1]), ([], SAVED_TAKE))
+        self.assertEqual(breeze.reusable_takes("s", 1, 1, "cpp"), (2, 2))
+
+    def test_a_render_that_cannot_check_takes_nothing_again(self):
+        # A join-only run, a machine with Qwen3-ASR, and a machine whose Parakeet cannot run all join the saved take,
+        # start no breeze-server take and keep the chapter's last check record.
+        before = lib.load_chapter("s", 1)[0]["render"]["check"]
+        for change in ({"join_only": True}, {"engine": "qwen3"}, {"parakeet_runs": False}):
+            self.engine, self.parakeet_runs = change.get("engine", "parakeet"), change.get("parakeet_runs", True)
+            record = self.render(join_only=change.get("join_only", False))
+            self.assertEqual((self.asked, self.joined[1], record["check"]), ([], SAVED_TAKE, before), change)
+            self.assertNotIn("retake_rounds", self.take(1), change)
+
+        # With Parakeet running again, the same chapter is taken again, so the cases above had something to take.
+        self.engine, self.parakeet_runs = "parakeet", True
+        self.render()
+        self.assertEqual(len(self.asked), 1)
 
 
 class FakeTakes:

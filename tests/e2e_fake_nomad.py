@@ -7,6 +7,8 @@ Run from the repo root: python tests/e2e_fake_nomad.py
 """
 from __future__ import annotations
 
+import hashlib
+import io
 import json
 import os
 import shutil
@@ -20,6 +22,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -195,7 +198,7 @@ def inside(slug: str) -> int:
     """Runs the scenarios from inside the temporary copy, where library.ROOT is that copy."""
     sys.path.insert(0, os.getcwd())
     from serial_audio import library as lib
-    from serial_audio.web import server
+    from serial_audio.web import exchange, server, views
     from serial_audio.web.nomad import NomadClient, NomadJobManager
 
     # Setup
@@ -205,11 +208,14 @@ def inside(slug: str) -> int:
     comfy = FakeComfy(slug)
     comfy.serve(comfy_port)
     config = root / "node.json"
-    config.write_text(json.dumps({"comfy_url": f"http://127.0.0.1:{comfy_port}"}), encoding="utf-8")
+    output = root / "node-output"
+    config.write_text(json.dumps({"comfy_url": f"http://127.0.0.1:{comfy_port}",
+                                  "env": {"SERIAL_AUDIO_COMFY_OUTPUT": str(output)}}), encoding="utf-8")
     fake = FakeNomad(root, app_url, config)
     fake.serve(nomad_port)
     m = NomadJobManager(NomadClient(f"http://127.0.0.1:{nomad_port}", "fake-token"), state_dir=root / "state", autostart=False)
     server.Handler.manager = m
+    views.MEDIA_MIRROR = m.media_dir
     server.Handler.machine_name = socket.gethostname().lower()
     server.Handler.allowed_names = {"127.0.0.1", "localhost"}
     httpd = server.Server(("127.0.0.1", app_port), server.Handler)
@@ -301,6 +307,90 @@ def inside(slug: str) -> int:
     check(job["status"] == "done" and len(fake.children) == dispatched and not job.get("nomad"),
           f"local job ran here ({job['status']}, note {job.get('note')}, exit {job.get('exit_code')})")
     check(not (lib.serial_dir(slug) / "bible" / "characters.yaml").exists(), "the local reset removed the bible")
+
+    # A chapter whose takes another node made: the worker fetches them from the app, the takes file then names this
+    # node's copies, and the app gets those copies under this node's paths
+    sep = "/" if os.name == "nt" else "\\"
+    far = "/Users/elsewhere/output" if os.name == "nt" else "D:\\elsewhere\\output"
+
+    def far_path(*parts):
+        return far + sep + sep.join(parts)
+
+    def wav(samples):
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(24000)
+            w.writeframes(samples)
+        return buf.getvalue()
+
+    def mirrored(raw):
+        return m.media_dir / exchange.mirror_rel(raw)
+
+    pcm = [bytes([i + 1]) * 4800 for i in range(3)]
+    takes = {str(i): {"key": f"k{i}", "file": far_path("breeze", slug, "ch0001", "cpp", f"l{i:04d}.wav"),
+                      "voice": "narrator", "audio": hashlib.sha1(pcm[i]).hexdigest()[:16]} for i in range(3)}
+    takes_path = lib.chapter_dir(slug, 1) / "breeze_takes.json"
+    lib.save_json(takes_path, {"engine": "breeze", "runner": "cpp", "takes": takes})
+    for i in range(3):
+        mirrored(takes[str(i)]["file"]).parent.mkdir(parents=True, exist_ok=True)
+        mirrored(takes[str(i)]["file"]).write_bytes(wav(pcm[i]))
+    job = submit("check-takes", {"slug": slug, "chapter": 1}, args=["chapters", slug])
+    check(run_until(finished(job)), "job on another node's takes finished")
+    text = log(job)
+    check(job["status"] == "done", f"job on another node's takes done ({job['status']}, note {job.get('note')})")
+    check(fake.children[job["nomad"]["dispatched"]]["parent"] == "serial-audio-breeze-fake-node",
+          f"a take check is dispatched as a breeze job ({job['nomad'].get('dispatched')})")
+    check("3 of the 3 takes this node lacked come from the app" in text, "the log records the fetched takes")
+    now = lib.load_json(takes_path)["takes"]
+    here = [output / "breeze" / slug / "ch0001" / "cpp" / f"l{i:04d}.wav" for i in range(3)]
+    check([now[str(i)]["file"] for i in range(3)] == [str(p) for p in here],
+          f"the takes file names this node's copies ({now['0']['file']})")
+    check(all(p.is_file() and p.read_bytes() == wav(pcm[i]) for i, p in enumerate(here)),
+          "the takes are under the node's output folder")
+    check(now["0"]["key"] == "k0" and now["0"]["audio"] == takes["0"]["audio"], "the entries keep their other fields")
+    check(all(mirrored(str(p)).is_file() for p in here) and "sent the app 3 audio file(s)" in text,
+          "the app holds the takes under this node's paths")
+    check(m.placement["chapters"][slug]["1"] == "fake-node", f"the app records the new holder ({m.placement})")
+
+    # A sync job sends the app what its node holds and the app lacks, without a CLI step
+    mirrored(str(here[0])).unlink()
+    job = m.submit([{"kind": "sync-media", "params": {"slug": slug, "node": "fake-node"}}])[0]
+    check(run_until(finished(job)), "sync job finished")
+    text = log(job)
+    check(job["status"] == "done", f"sync job done ({job['status']}, note {job.get('note')})")
+    check(mirrored(str(here[0])).is_file() and mirrored(str(here[0])).read_bytes() == wav(pcm[0]),
+          "the sync job restored the file the app lacked")
+    check("sent the app 1 audio file(s)" in text and "already had 2" in text and "$ python" not in text,
+          f"the sync job sent only what the app lacked and ran no step ({text.strip()[-300:]})")
+    try:
+        m.submit([{"kind": "sync-media", "params": {"slug": slug, "node": "nowhere"}}])
+        refused = False
+    except ValueError:
+        refused = True
+    check(refused, "a sync job for an unknown node is refused")
+
+    # A voice pick runs on the app's machine and files a candidate that only the app's mirror holds
+    clip = far_path("breeze", "cast", slug, "captain_s1000.wav")
+    mirrored(clip).parent.mkdir(parents=True, exist_ok=True)
+    mirrored(clip).write_bytes(wav(pcm[2]))
+    voices = lib.serial_dir(slug) / "voices"
+    lib.save_yaml(voices / "captain.yaml", {
+        "id": "captain", "character_id": "captain", "status": "auto", "engine": "breeze", "instruct": "A deep voice.",
+        "sample_text": "We sail at dawn.", "seed": 999, "clip": "captain.wav", "chosen": 0,
+        "candidates": [{"seed": 999, "clip": far_path("breeze", "cast", slug, "captain_s999.wav"), "score": 1.0},
+                       {"seed": 1000, "clip": clip, "score": 0.9}]})
+    dispatched = len(fake.children)
+    job = submit("pick-voice", {"slug": slug, "character": "captain", "seed": 1000})
+    check(run_until(finished(job), 60), "voice pick finished")
+    check(job["status"] == "done" and len(fake.children) == dispatched and not job.get("nomad"),
+          f"the voice pick ran here ({job['status']}, note {job.get('note')}, exit {job.get('exit_code')})")
+    filed = lib.load_yaml(voices / "captain.yaml") or {}
+    check((filed.get("seed"), filed.get("status"), filed.get("chosen")) == (1000, "approved", 1),
+          f"the pick filed the candidate ({filed.get('seed')}, {filed.get('status')})")
+    check((voices / "captain.wav").is_file() and (voices / "captain.wav").read_bytes() == wav(pcm[2]),
+          "the voice's clip comes from the mirror")
 
     # A GPU job waits while something outside it uses the machine, and stops when asked
     if os.name == "nt":

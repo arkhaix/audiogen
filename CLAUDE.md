@@ -13,13 +13,14 @@ home Nomad cluster.
 * `DECISIONS.md`: why things are the way they are, and what AJ hasn't decided yet.
 * `docs/machines.md`: what each machine holds and how to rebuild it.
 * `docs/casting.md`: how to write a voice brief that works, the cast so far and the voices still to cast.
+* `docs/take-quality/`: the plan for better checks on each take, in three phases, with the contract they share and where each phase stands.
 * `deploy/macos/ggml-metal-left-pad.patch`: the ggml fix the Mac's Metal breeze-server needs.
 * `tests/`: unit tests for the cluster, casting, the speech recognizers and the retakes of flagged takes, the backup and the audiobook folders, the parsers and the Claude passes, and the Breeze join's click repair, and a fake Nomad end-to-end test.
 
 ## Where things run
 
-* containers, a Linux VM: the web app in Docker under `/opt/serial-audio`, and the library of record in `/opt/serial-audio/library`. It runs quick library jobs itself and dispatches the rest. It backs the library up once a day to `/mnt/nfs/serial-audio/backup` on storage's NFS share.
-* aj-legion5, AJ's Windows laptop with an 8 GB RTX 3070: the fast GPU node, with the classes `breeze` and `comfyui`. ComfyUI, its models and breeze-server are in `D:\comfy`, and `D:\fish` is a dev tree. Its Nomad tasks run as SYSTEM.
+* containers, a Linux VM: the web app in Docker under `/opt/serial-audio`, and the library of record in `/opt/serial-audio/library`. It runs quick library jobs and voice picks itself and dispatches the rest. Its `state/media` holds a copy of every Breeze take and cast candidate the nodes made, so a Breeze job runs on either GPU node. It backs the library up once a day to `/mnt/nfs/serial-audio/backup` on storage's NFS share.
+* aj-legion5, AJ's Windows laptop with an 8 GB RTX 3070: the fast GPU node, with the classes `breeze` and `comfyui`. ComfyUI, its models and breeze-server are in `D:\comfy`, and `D:\fish` is a dev tree. Its Nomad tasks run as SYSTEM. Only it runs Drama 3 and Qwen jobs, which need ComfyUI.
 * jsc-m1, AJ's M1 Mac with 16 GB: a slower `breeze` node, about 0.4x realtime against the laptop's 2x. Its tools are in `/Users/aj/serial-audio`, outside this repo. It has no ComfyUI, so it checks takes and casting candidates with Parakeet.
 * dev-arch, a Linux VM: the `llm` node. The Claude passes run aj's install of `claude` there and sign in with AJ's subscription token, which the job reads from the Nomad variable `nomad/jobs/serial-audio-llm`.
 
@@ -52,6 +53,7 @@ is deployed to containers.
   * `SERIAL_AUDIO_PARAKEET_MODEL`: the Parakeet TDT 0.6B v2 int8 folder for sherpa-onnx.
   * `SERIAL_AUDIO_ASR`: `qwen3` or `parakeet` for the take check and the casting check. Unset means Parakeet when its folder exists, else Qwen3-ASR.
 * The web app reads library files directly and writes only through `python -m serial_audio.cli` jobs, so every change is logged and a job survives a server restart.
+* A take's `file` in `breeze_takes.json` and a candidate's `clip` and `voice_file` in a voice record are absolute paths on the node that last worked on them. On any other machine the file is the app's copy at `state/media/<exchange.mirror_rel(path)>`. The app sets `SERIAL_AUDIO_MEDIA_MIRROR` to that folder for the jobs it runs itself, and a worker fetches a chapter's takes from it before its steps (`deploy/README.md`, The media mirror). A new kind of file that a later job needs from a node has to go to the mirror too, in `worker.media_files`.
 * A hook rejects an en dash or an em dash anywhere. It also rejects a semicolon on any line that starts like a comment (`#`, `//`, `/*`, `--`, `* `), which includes Markdown bullets and headings. A CSS custom property on a line of its own starts with `--`, so put custom properties on one-line rules that start with the selector.
 
 ## Testing

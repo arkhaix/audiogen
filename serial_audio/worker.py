@@ -2,11 +2,17 @@
 
 deploy/nomad/bootstrap.py fetches the job's bundle from the web app, unpacks it into a work folder and calls main().
 The worker runs the job's CLI steps there against its copy of the serial, sends the log to the app every few
-seconds, stops when the app asks, and sends back every file the steps created or changed.
+seconds, stops when the app asks, and sends back every file the steps created or changed. Before the steps it fetches
+the chapter's saved takes from the app when another node made them, and after the steps it sends the app the takes
+and cast candidates this node made, so a later job can run on any node.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import datetime as _dt
+import hashlib
+import http.client
+import io
 import json
 import os
 import platform
@@ -16,12 +22,20 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import wave
 from pathlib import Path
 
+from . import library as lib
 from .web import exchange
 
 LOG_EVERY = 3.0
+MEDIA_THREADS = 4
+MEDIA_TRIES = 4
+MEDIA_RETRY = 10.0
+MEDIA_REPORT = 30.0
+HAVE_BATCH = 400
 LOG_CHUNK = 1 << 19
 BUSY_POLL = 20.0
 BUSY_REPORT = 300.0
@@ -70,7 +84,19 @@ class App:
                 return json.loads(resp.read().decode("utf-8") or "{}")
         except urllib.error.HTTPError as e:
             raise AppError(e.code, f"the app answered {e.code}: {e.read()[:300].decode('utf-8', 'replace')}") from None
-        except (urllib.error.URLError, OSError, ValueError) as e:
+        except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as e:
+            raise AppError(None, f"the app is not reachable: {getattr(e, 'reason', e)}") from None
+
+    def fetch(self, path: str, timeout: float = 120) -> bytes:
+        """The body of a GET of path on the app. Raises AppError with the HTTP status, or None when unreachable or
+        when the answer is cut short."""
+        req = urllib.request.Request(self.url + path, headers=self.headers)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as e:
+            raise AppError(e.code, f"the app answered {e.code} for {path}") from None
+        except (urllib.error.URLError, OSError, http.client.HTTPException) as e:
             raise AppError(None, f"the app is not reachable: {getattr(e, 'reason', e)}") from None
 
 
@@ -183,32 +209,244 @@ def machine_busy(comfy_url: str) -> str | None:
     return f"ComfyUI is busy with {len(items)} prompt(s)" if items else None
 
 
-def media_files(folder: Path, changed: dict) -> list[str]:
-    """Node paths of the audio the app plays from ComfyUI's output for the changed files: the candidates of each
-    changed voice record, and the takes of a changed chapter that its take check did not pass. Never raises."""
+def media_files(folder: Path, changed: dict | None) -> list[str]:
+    """Node paths of the audio this node holds that the app keeps a copy of.
+
+    folder: the worker's copy of the serial.
+    changed: the files the steps changed. The answer then covers the candidates of each changed voice record, with
+        their Drama 3 voice files, and every take of each chapter that has a changed file. None covers every voice
+        record and every chapter of the serial.
+    Returns the paths that are files on this node, sorted. Never raises.
+    """
     import yaml
+    if changed is None:
+        voices = sorted((folder / "voices").glob("*.yaml"))
+        chapters = sorted(p.parent for p in (folder / "chapters").glob(f"*/{exchange.TAKES_FILE}"))
+    else:
+        voices = [folder / rel for rel in changed if rel.startswith("voices/") and rel.endswith(".yaml")]
+        chapters = sorted({folder / "chapters" / rel.split("/")[1] for rel in changed
+                           if rel.startswith("chapters/") and rel.count("/") >= 2})
     out = set()
-    for rel in changed:
-        path = folder / rel
-        try:
-            if rel.startswith("voices/") and rel.endswith(".yaml") and rel != "voices/_briefs.yaml":
-                rec = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-                for batch in [rec] + list(rec.get("history") or []):
-                    out.update(c.get("clip") for c in batch.get("candidates") or [] if isinstance(c, dict))
-            elif rel.endswith(("/breeze_takes.json", "/take_check.json")):
-                chapter = path.parent
-                takes = json.loads((chapter / "breeze_takes.json").read_text(encoding="utf-8")).get("takes") or {}
-                check_path = chapter / "take_check.json"
-                checks = (json.loads(check_path.read_text(encoding="utf-8")).get("takes") or {}
-                          if check_path.is_file() else {})
-                for k, take in takes.items():
-                    verdict = "out_of_range" if take.get("out_of_range") else (checks.get(k) or {}).get("verdict")
-                    if verdict not in (None, "ok"):
-                        out.add(take.get("file"))
-        except (OSError, ValueError, AttributeError, yaml.YAMLError):
+    for path in voices:
+        if path.name == "_briefs.yaml":
             continue
-    return sorted(p for p in out if isinstance(p, str) and Path(p).suffix.lower() in exchange.MEDIA_SUFFIXES
-                  and Path(p).is_file())
+        try:
+            rec = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            for batch in [rec] + list(rec.get("history") or []):
+                for c in batch.get("candidates") or []:
+                    if isinstance(c, dict):
+                        out.update(v for v in (c.get("clip"), c.get("voice_file")) if isinstance(v, str))
+        except (OSError, ValueError, AttributeError, TypeError, yaml.YAMLError):
+            continue
+    for chapter in chapters:
+        out.update(exchange.take_files(chapter).values())
+
+    def sendable(p: str) -> bool:
+        try:
+            return Path(p).suffix.lower() in exchange.MIRROR_SUFFIXES and Path(p).stat().st_size > 0
+        except OSError:
+            return False
+
+    return sorted(p for p in out if sendable(p))
+
+
+def app_call(call, down: threading.Event, stop: threading.Event | None = None, fatal: tuple = (403, 404, 410)):
+    """The answer of one request to the app, tried again while the app is unreachable or answers 5xx.
+
+    call: makes the request and raises AppError when it fails.
+    down: set once the app has refused this job or a request has run out of tries. A call made after that fails
+        without a request, so one outage costs one wait and not one per file.
+    stop: when it is set, the call fails without another try.
+    fatal: the HTTP statuses that mean the app no longer takes requests for this job.
+    Returns call's answer. Raises AppError at once on any 4xx, and after MEDIA_TRIES tries otherwise.
+    """
+    error = AppError(None, "the app did not take an earlier request of this job")
+    for attempt in range(MEDIA_TRIES):
+        if down.is_set() or (stop is not None and stop.is_set()):
+            raise error
+        try:
+            return call()
+        except AppError as e:
+            error = e
+            if e.status in fatal:
+                down.set()
+            if e.status is not None and e.status < 500:
+                raise
+            if attempt + 1 < MEDIA_TRIES:
+                (stop or down).wait(MEDIA_RETRY)
+    down.set()
+    raise error
+
+
+def app_copies(app: App, rels: list[str], down: threading.Event, stop: threading.Event | None = None) -> dict[str, str]:
+    """{mirror path: SHA-256} for each path in rels that the app's media mirror holds.
+
+    down, stop: as app_call takes them. Raises AppError when the app does not answer.
+    """
+    out = {}
+    for start in range(0, len(rels), HAVE_BATCH):
+        body = json.dumps({"paths": rels[start:start + HAVE_BATCH]}).encode("utf-8")
+        answer = app_call(lambda: app.request("POST", "media/have", body, timeout=600), down, stop).get("have")
+        if isinstance(answer, dict):
+            out.update({k: v for k, v in answer.items() if isinstance(v, str)})
+    return out
+
+
+def send_media(app: App, paths: list[str], log: Log, stop: threading.Event | None = None) -> dict:
+    """Sends the app each file its media mirror lacks or holds with other contents.
+
+    app: the web app.
+    paths: files on this node, by absolute path.
+    log: the job log, which gets a progress line every MEDIA_REPORT seconds and a line at the end.
+    stop: when it is set, the files not sent yet are left out and count as failed.
+    Returns {"sent", "bytes", "kept", "failed"}: files sent, their size, files the app already had, and files that
+    did not arrive. A file the app refuses fails alone. While the app is unreachable a request is tried again for
+    MEDIA_TRIES tries, and after that the rest fail at once. Never raises.
+    """
+    by_rel = {rel: Path(p) for p in paths if (rel := exchange.mirror_rel(p))}
+    out = {"sent": 0, "bytes": 0, "kept": 0, "failed": 0}
+    if not by_rel:
+        return out
+    down = threading.Event()
+    try:
+        have = app_copies(app, sorted(by_rel), down, stop)
+    except AppError as e:
+        out["failed"] = len(by_rel)
+        log.line(f"[worker] the app did not say which audio it holds, so none was sent: {e}")
+        return out
+
+    def send(rel: str) -> int | None:
+        path = by_rel[rel]
+        try:
+            if rel in have and have[rel] == exchange.sha256_file(path):
+                return 0
+            data = path.read_bytes()
+            app_call(lambda: app.request("POST", "media/file?path=" + urllib.parse.quote(rel, safe=""), data,
+                                         timeout=300), down, stop)
+        except (OSError, AppError):
+            return None
+        return len(data)
+
+    last = time.time()
+    with concurrent.futures.ThreadPoolExecutor(MEDIA_THREADS) as pool:
+        for done, size in enumerate(pool.map(send, sorted(by_rel)), 1):
+            if size is None:
+                out["failed"] += 1
+            elif size:
+                out["sent"] += 1
+                out["bytes"] += size
+            else:
+                out["kept"] += 1
+            if time.time() - last >= MEDIA_REPORT:
+                last = time.time()
+                log.line(f"[worker] audio for the app: {done:,} of {len(by_rel):,} files done, "
+                         f"{out['bytes'] / 1e6:,.0f} MB sent")
+    if out["sent"] or out["failed"]:
+        log.line(f"[worker] sent the app {out['sent']:,} audio file(s), {out['bytes'] / 1e6:,.1f} MB"
+                 + (f", and it already had {out['kept']:,}" if out["kept"] else "")
+                 + (f". {out['failed']:,} did not arrive, so a job on another node cannot use them"
+                    if out["failed"] else ""))
+    return out
+
+
+def pcm_id(wav: bytes) -> str | None:
+    """The id a Breeze take's entry keeps of its audio: 16 hex digits of the SHA-1 of the WAV's samples.
+
+    Returns None for bytes that are not a readable WAV.
+    """
+    try:
+        with wave.open(io.BytesIO(wav), "rb") as w:
+            return hashlib.sha1(w.readframes(w.getnframes())).hexdigest()[:16]
+    except (wave.Error, EOFError):
+        return None
+
+
+def fetch_takes(app: App, folder: Path, slug: str, chapters: list, root: Path, log: Log) -> int:
+    """Brings the saved takes of the job's chapters to this node when another node made them.
+
+    app: the web app, whose media mirror holds the takes the nodes sent it.
+    folder: the worker's copy of the serial.
+    slug, chapters: the serial and the chapters the job works on.
+    root: this node's output folder.
+    log: the job log, which gets one line per chapter that needed takes.
+    Returns how many takes now come from the app. Such a take's file is under root, and its entry in the worker's
+    copy of breeze_takes.json names that file. A take this node made and still holds is left alone. A take the
+    app has no copy of, or only a copy of other audio than the entry names, is left as it is, so a render takes
+    the line again. Never raises: a failure is logged and the steps run with the takes this node has.
+    """
+    total = 0
+    down = threading.Event()
+    for n in chapters:
+        try:
+            total += fetch_chapter_takes(app, folder, slug, int(n), root, log, down)
+        except Exception as e:
+            log.line(f"[worker] could not fetch the takes of chapter {n} from the app, so the steps use the takes "
+                     f"this node has: {type(e).__name__}: {e}")
+    return total
+
+
+def fetch_chapter_takes(app: App, folder: Path, slug: str, n: int, root: Path, log: Log, down: threading.Event) -> int:
+    """fetch_takes for one chapter. down is what app_call takes. Raises when the takes file or the app fails."""
+    # Plan
+    path = folder / "chapters" / f"{n:04d}" / exchange.TAKES_FILE
+    if not path.is_file():
+        return 0
+    data = json.loads(path.read_text(encoding="utf-8"))
+    takes = data.get("takes") if isinstance(data, dict) else None
+    plan = []
+    for entry in (takes.values() if isinstance(takes, dict) else []):
+        raw = entry.get("file") if isinstance(entry, dict) else None
+        target = exchange.local_path(raw, root, f"breeze/{slug}/ch{n:04d}")
+        rel = exchange.mirror_rel(raw) if target else None
+        if rel and not (exchange.same_path(raw, target) and Path(raw).is_file()):
+            plan.append((entry, rel, Path(target)))
+    if not plan:
+        return 0
+    have = app_copies(app, sorted({rel for _, rel, _ in plan}), down)
+
+    # Fetch
+    def bring(item) -> int | None:
+        entry, rel, target = item
+        digest = have.get(rel)
+        if digest is None:
+            return None
+        try:
+            held = target.is_file() and exchange.sha256_file(target) == digest
+            if held:
+                blob = target.read_bytes()
+            else:
+                blob = app_call(lambda: app.fetch("/media/mirror/" + urllib.parse.quote(rel)), down, fatal=())
+                if hashlib.sha256(blob).hexdigest() != digest:
+                    return None
+            if entry.get("audio") and target.suffix.lower() == ".wav" and pcm_id(blob) != entry["audio"]:
+                return None
+            if not held:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                tmp = target.with_name(target.name + ".part")
+                tmp.write_bytes(blob)
+                os.replace(tmp, target)
+        except (OSError, AppError):
+            return None
+        return 0 if held else len(blob)
+
+    with concurrent.futures.ThreadPoolExecutor(MEDIA_THREADS) as pool:
+        sizes = list(pool.map(bring, plan))
+
+    # Record
+    got = [(item, size) for item, size in zip(plan, sizes) if size is not None]
+    moved = False
+    for (entry, _, target), _ in got:
+        if entry["file"] != str(target):
+            entry["file"] = str(target)
+            moved = True
+    if moved:
+        tmp = path.with_name(path.name + ".tmp")
+        lib.save_json(tmp, data)
+        os.replace(tmp, path)
+    log.line(f"[worker] chapter {n}: {len(got):,} of the {len(plan):,} takes this node lacked come from the app, "
+             f"{sum(size for _, size in got) / 1e6:,.1f} MB fetched"
+             + (f". The app has no copy of {len(plan) - len(got):,}" if len(got) < len(plan) else ""))
+    return len(got)
 
 
 def child_env(config: dict, work: Path) -> dict:
@@ -415,6 +653,11 @@ def main(app_url: str, job: str, key: str, work: str | Path) -> int:
         lock = gpu_lock(log, stop)
         wait_for_machine(comfy_url, log, stop)
     env = child_env(config, work)
+    folder = work / "library" / info["slug"]
+    if info.get("takes") and not stop.is_set():
+        from . import machine
+        root = Path(env.get("SERIAL_AUDIO_COMFY_OUTPUT", "").strip() or machine.COMFY_OUTPUT)
+        fetch_takes(app, folder, info["slug"], info.get("chapters") or [], root, log)
     code = 0
     steps = info.get("steps") or []
     signed_in, line = claude_sign_in(env)
@@ -438,11 +681,17 @@ def main(app_url: str, job: str, key: str, work: str | Path) -> int:
         lock.close()
 
     # Result
-    folder = work / "library" / info["slug"]
     changed = exchange.changes(folder, info.get("manifest") or {})
-    media = media_files(folder, changed)
-    log.line(f"[worker] {'stopped' if cancelled else f'exit {code}'}, {len(changed)} file(s) to send back"
-             + (f", {len(media)} audio file(s) for the app's media mirror" if media else ""))
+    log.line(f"[worker] {'stopped' if cancelled else f'exit {code}'}, {len(changed)} file(s) to send back")
+    sync = bool(info.get("sync"))
+    sent = send_media(app, media_files(folder, None if sync else changed), log, stop if sync else None)
+    if sync:
+        cancelled = stop.is_set()
+        if not sent["sent"] and not sent["failed"]:
+            log.line(f"[worker] the app already holds all {sent['kept']:,} audio file(s) this node has for the serial"
+                     if sent["kept"] else "[worker] this node holds no audio for the serial")
+        if sent["failed"] and code == 0:
+            code = 1
     pump.stop()
     pump.join(timeout=LOG_EVERY + 35)
     for _ in range(10):
@@ -450,7 +699,7 @@ def main(app_url: str, job: str, key: str, work: str | Path) -> int:
             break
         time.sleep(5)
     data = exchange.build_result(folder, {"job": job, "stage": info.get("stage") or 0, "exit_code": code,
-                                          "cancelled": cancelled, "node": node, "finished": now_iso()}, changed, media)
+                                          "cancelled": cancelled, "node": node, "finished": now_iso()}, changed)
     report = send_result(app, data, log)
     if report is not None:
         print(f"[worker] the app took the result: {json.dumps(report)[:2000]}", flush=True)

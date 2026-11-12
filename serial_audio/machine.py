@@ -11,6 +11,8 @@ SERIAL_AUDIO_PARAKEET_MODEL: the Parakeet TDT 0.6B v2 int8 folder for sherpa-onn
     decoder.int8.onnx, joiner.int8.onnx and tokens.txt. The audio Python needs sherpa-onnx to use it.
 SERIAL_AUDIO_ASR: the speech recognizer the take check and the casting check use, "qwen3" or "parakeet". Unset means
     parakeet when the Parakeet folder exists, else qwen3.
+SERIAL_AUDIO_MEDIA_MIRROR: the web app's copy of the audio the nodes made, which the app sets for the jobs it runs on
+    its own machine. Unset on a node.
 
 Standard library only, because fx.py and breeze_join.py run under the audio Python without the package.
 """
@@ -34,6 +36,8 @@ BREEZE_HOME = _path("SERIAL_AUDIO_BREEZE_HOME", r"D:\comfy\breeze-cpp")
 BREEZE_SERVER_NAME = "breeze-server.exe" if WINDOWS else "breeze-server"
 PARAKEET_MODEL = _path("SERIAL_AUDIO_PARAKEET_MODEL", r"D:\comfy\models\parakeet-tdt-0.6b-v2-int8")
 ASR = os.environ.get("SERIAL_AUDIO_ASR", "").strip().lower()
+MEDIA_MIRROR_ENV = "SERIAL_AUDIO_MEDIA_MIRROR"
+MEDIA_MIRROR = Path(os.environ[MEDIA_MIRROR_ENV].strip()) if os.environ.get(MEDIA_MIRROR_ENV, "").strip() else None
 
 
 def breeze_server_pids() -> list[int]:

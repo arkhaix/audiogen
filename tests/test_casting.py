@@ -8,10 +8,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from serial_audio import asr, breeze, casting
+from serial_audio import asr, breeze, casting, machine
 from serial_audio import library as lib
 from serial_audio.comfy import ComfyError
 from serial_audio.llm import LLMError, PassResult
+from serial_audio.web.exchange import mirror_rel
 
 SLUG = "design-test"
 SAMPLE = "I have waited a hundred and fifty years for this."
@@ -259,6 +260,118 @@ class BreezeCastTest(unittest.TestCase):
             picked = casting.pick_voice(SLUG, "meredith", seed=9000)
         self.assertEqual((picked["engine"], picked["drama3_voice"]), ("qwen", "meredith.safetensors"))
         self.assertTrue((lib.serial_dir(SLUG) / "voices" / "meredith.safetensors").is_file())
+        # On a machine with ComfyUI's output folder, Load Drama 3 Voice gets the file too.
+        self.assertEqual((out / "drama3_voices" / SLUG / "meredith.safetensors").read_bytes(), b"voice")
+
+    def send_to_mirror(self, mirror: Path, batch: dict, folder: str) -> None:
+        """Moves a batch's candidate files into the mirror, as if another node had made them in folder there."""
+        sep = "\\" if "\\" in folder else "/"
+        for c in batch["candidates"]:
+            for field in ("clip", "voice_file"):
+                if c.get(field):
+                    raw = folder + sep + Path(c[field]).name
+                    copy = mirror / mirror_rel(raw)
+                    copy.parent.mkdir(parents=True, exist_ok=True)
+                    Path(c[field]).replace(copy)
+                    c[field] = raw
+
+    def test_a_pick_files_a_candidate_another_node_made_from_the_app_s_mirror(self):
+        # Setup: the first cast's candidates are on a Windows node and the recast's on a Mac. This machine holds
+        # neither, and the mirror holds both.
+        self.cast(good_seed=1001)
+        self.cast(good_seed=2002, seed0=2000, recast=True)
+        voices = lib.serial_dir(SLUG) / "voices"
+        mirror = Path(self.tmp.name) / "mirror"
+        rec = lib.load_yaml(voices / "meredith.yaml")
+        self.send_to_mirror(mirror, rec, "/Users/nobody/serial-audio/output/breeze/cast/" + SLUG)
+        self.send_to_mirror(mirror, rec["history"][0], "D:\\nowhere\\output\\breeze\\cast\\" + SLUG)
+        lib.save_yaml(voices / "meredith.yaml", rec)
+        (voices / "meredith.wav").unlink()
+
+        # Without the mirror the pick fails and files nothing.
+        with self.assertRaises(FileNotFoundError):
+            casting.pick_voice(SLUG, "meredith", seed=1001)
+        self.assertFalse((voices / "meredith.wav").exists())
+
+        with mock.patch.object(machine, "MEDIA_MIRROR", mirror):
+            # A pick by seed files that candidate, from the batch the Windows node made and from the Mac's.
+            picked = casting.pick_voice(SLUG, "meredith", seed=1001)
+            self.assertEqual((picked["seed"], picked["status"], picked["engine"]), (1001, "approved", "breeze"))
+            self.assertTrue((voices / "meredith.wav").is_file())
+            (voices / "meredith.wav").unlink()
+            picked = casting.pick_voice(SLUG, "meredith", seed=2001)
+            self.assertEqual((picked["seed"], picked["chosen"]), (2001, 1))
+            self.assertTrue((voices / "meredith.wav").is_file())
+            # The record keeps the candidates' paths on their nodes, which the app plays from the mirror.
+            self.assertTrue(picked["candidates"][1]["clip"].startswith("/Users/nobody/"), picked["candidates"][1])
+
+            # An approval of the current voice files its chosen candidate again.
+            (voices / "meredith.wav").unlink()
+            picked = casting.pick_voice(SLUG, "meredith")
+            self.assertEqual((picked["seed"], picked["status"]), (2001, "approved"))
+            self.assertTrue((voices / "meredith.wav").is_file())
+
+            # A seed that no candidate has is refused, and the voice stays as it was.
+            with self.assertRaises(ValueError):
+                casting.pick_voice(SLUG, "meredith", seed=9)
+            self.assertEqual(lib.load_yaml(voices / "meredith.yaml")["seed"], 2001)
+
+    def test_a_qwen_pick_on_the_app_s_machine_files_what_the_mirror_holds(self):
+        # Setup: a Qwen batch whose clip and Drama 3 voice file are only in the mirror, on a machine with no
+        # ComfyUI output folder.
+        out = Path(self.tmp.name) / "output"
+        out.mkdir(parents=True, exist_ok=True)
+        clip, voice = out / "m_00001_.flac", out / "m_00001_.safetensors"
+        clip.write_bytes(b"flac")
+        voice.write_bytes(b"voice")
+        self.cast(good_seed=1001)
+        voices = lib.serial_dir(SLUG) / "voices"
+        rec = lib.load_yaml(voices / "meredith.yaml")
+        rec["history"] = [{"instruct": "old", "sample_text": SAMPLE, "seed": 9000, "status": "auto",
+                           "candidates": [{"seed": 9000, "clip": str(clip), "voice_file": str(voice), "score": 1.0}]}]
+        mirror = Path(self.tmp.name) / "mirror"
+        self.send_to_mirror(mirror, rec["history"][0], "D:\\nowhere\\output\\drama3\\cast\\" + SLUG)
+        lib.save_yaml(voices / "meredith.yaml", rec)
+        no_comfy = Path(self.tmp.name) / "no-comfy"
+
+        with mock.patch.object(machine, "MEDIA_MIRROR", mirror), \
+                mock.patch.object(casting, "VOICES_OUTPUT", no_comfy / "drama3_voices"):
+            # The clip and the voice file are filed in the library, and no ComfyUI folder is made here.
+            picked = casting.pick_voice(SLUG, "meredith", seed=9000)
+            self.assertEqual((picked["engine"], picked["drama3_voice"], picked["comfy_voice"]),
+                             ("qwen", "meredith.safetensors", f"{SLUG}/meredith.safetensors"))
+            self.assertEqual((voices / "meredith.flac").read_bytes(), b"flac")
+            self.assertEqual((voices / "meredith.safetensors").read_bytes(), b"voice")
+            self.assertFalse(no_comfy.exists())
+
+            # A candidate whose voice file the mirror lacks is filed with its clip alone, and the record names
+            # no Drama 3 voice, so a Drama 3 render refuses the voice instead of using an old file.
+            (mirror / mirror_rel(picked["candidates"][0]["voice_file"])).unlink()
+            picked = casting.pick_voice(SLUG, "meredith", seed=9000)
+            self.assertEqual((picked["engine"], picked["seed"]), ("qwen", 9000))
+            self.assertNotIn("drama3_voice", picked)
+            self.assertNotIn("drama3_voice", lib.load_yaml(voices / "meredith.yaml"))
+
+    def test_a_drama_3_render_copies_a_voice_the_app_filed_to_comfyui(self):
+        from serial_audio import render
+        voices = lib.serial_dir(SLUG) / "voices"
+        lib.save_yaml(voices / "meredith.yaml", {"id": "meredith", "drama3_voice": "meredith.safetensors"})
+        lib.save_yaml(voices / "ann.yaml", {"id": "ann", "engine": "breeze"})
+        (voices / "meredith.safetensors").write_bytes(b"picked on the app")
+        comfy = Path(self.tmp.name) / "comfy"
+        staged = comfy / "drama3_voices" / SLUG / "meredith.safetensors"
+        staged.parent.mkdir(parents=True)
+        staged.write_bytes(b"the voice before the pick")
+        with mock.patch.object(render, "COMFY_OUTPUT", comfy):
+            # The voice whose file differs in ComfyUI's folder is replaced. A Breeze voice and an unknown voice
+            # are skipped.
+            self.assertEqual(render.stage_drama3_voices(SLUG, {"meredith", "ann", "nobody"}), ["meredith"])
+            self.assertEqual(staged.read_bytes(), b"picked on the app")
+            # A voice that is already there is left alone, and a missing one is copied.
+            self.assertEqual(render.stage_drama3_voices(SLUG, {"meredith"}), [])
+            staged.unlink()
+            self.assertEqual(render.stage_drama3_voices(SLUG, {"meredith"}), ["meredith"])
+            self.assertTrue(staged.is_file())
 
 
 class BioTest(unittest.TestCase):

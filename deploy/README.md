@@ -1,15 +1,18 @@
 # serial_audio on the cluster
 
 The web app runs on containers and holds the library. It runs quick library jobs (fetch, add a serial, reset the
-bible) itself and dispatches everything else to the Nomad cluster. A node takes a job when its client meta offers
-the job's class:
+bible, pick a voice) itself and dispatches everything else to the Nomad cluster. A node takes a job when its client
+meta offers the job's class:
 
-* `breeze`: Breeze renders through breeze-server, and joining saved takes again. The laptop (aj-legion5) and the Mac (jsc-m1).
-* `comfyui`: Drama 3 renders, casting voices, picking a voice and checking takes, which need ComfyUI or its output folder. The laptop.
+* `breeze`: Breeze renders through breeze-server, Breeze voice design, joining saved takes again and checking takes. The laptop (aj-legion5) and the Mac (jsc-m1).
+* `comfyui`: Drama 3 renders and Qwen voice design, which need ComfyUI. The laptop.
 * `llm`: the character pass, the screenplay, the casting briefs and the casting bios, which run `claude` under AJ's subscription. dev-arch.
 
-A cast runs as two dispatches: the briefs on an `llm` node, then the voices on a `comfyui` node, which finds the
-briefs cached and doesn't call Claude.
+A cast runs as two dispatches: the briefs on an `llm` node, then the voices on a GPU node, which finds the briefs
+cached and doesn't call Claude. The voices stage is a `breeze` job, or a `comfyui` job for a Qwen cast.
+
+Every Breeze job runs while dev-arch and one of the two `breeze` nodes are up, because the app keeps a copy of the
+audio a later job needs from a node (The media mirror, below). A Drama 3 render and a Qwen cast need the laptop.
 
 ---
 
@@ -20,7 +23,7 @@ Everything lives in `/opt/serial-audio`, its own compose project beside the hous
 * `compose.yml` is a copy of `deploy/docker/compose.yml`.
 * `src/` holds the repo's code: `serial_audio`, `prompts`, `schemas` and `deploy`.
 * `library/` is the library. It is the copy of record, so nothing else should write to it.
-* `state/` holds job records, job logs, `conflicts/` and `media/` (below).
+* `state/` holds job records, job logs, `conflicts/` and `media/`, the media mirror (below).
 * `incoming/` holds uploaded EPUBs and saved pages.
 * `secrets/nomad-token` holds the dispatch token, mode 600, owned by aj.
 
@@ -146,8 +149,8 @@ packs.
 
 1. The app dispatches the job with `-meta job=<app job id> -meta key=<random per-job key>`. A Claude job goes to `serial-audio-llm`. For a GPU job the app picks the node and dispatches its pinned job (below).
 2. The task's `bootstrap.py` fetches the job's bundle from the app: the code, the prompts and schemas, and the serial's folder without its audio, about 1.5 MB for Twenty Thousand Leagues.
-3. A GPU job takes the machine's GPU lock first (`C:\ProgramData\serial-audio\gpu.lock`, or `/tmp/serial-audio-gpu.lock`), so two GPU jobs on one machine run one after the other, whoever dispatched them. It also waits while ComfyUI is busy with another prompt and, on Windows, while a render or pipeline script started by hand runs. Then the worker runs the CLI steps in its copy of the serial and sends the log to the app every 3 seconds.
-4. At the end the worker sends back every file the steps created or changed. The app writes a file only when the library copy still has the hash it had when the bundle was made. A file that changed meanwhile goes to `state/conflicts/<job id>/` instead, and the job's note says so. A failed or stopped job writes back only the files a rerun can use, such as `breeze_takes.json` and the casting briefs. A failed Claude pass writes back the chapters it finished, because the passes save each chapter as it completes.
+3. A GPU job takes the machine's GPU lock first (`C:\ProgramData\serial-audio\gpu.lock`, or `/tmp/serial-audio-gpu.lock`), so two GPU jobs on one machine run one after the other, whoever dispatched them. It also waits while ComfyUI is busy with another prompt and, on Windows, while a render or pipeline script started by hand runs. It then fetches from the app the chapter's saved takes that its node lacks (The media mirror, below). Then the worker runs the CLI steps in its copy of the serial and sends the log to the app every 3 seconds.
+4. At the end the worker sends the app the takes and cast candidates its node made, and then every file the steps created or changed. The app writes a file only when the library copy still has the hash it had when the bundle was made. A file that changed meanwhile goes to `state/conflicts/<job id>/` instead, and the job's note says so. A failed or stopped job writes back only the files a rerun can use, such as `breeze_takes.json` and the casting briefs. A failed Claude pass writes back the chapters it finished, because the passes save each chapter as it completes.
 5. Stop in the app asks the worker to stop. It kills the CLI within a few seconds, cancels the job's ComfyUI prompts and reports. A job no node has started yet is cancelled at once, and its dispatch exits as soon as a node starts it. A dispatch that fails or times out is tried again with the same idempotency token, so Nomad never runs it twice.
 
 Jobs on different chapters, serials or nodes run at the same time. Jobs on the same chapter wait for each other, and
@@ -177,15 +180,38 @@ so it waits for the import, and a failed import skips it and the jobs that wait 
 
 The app picks the node for a GPU job, one GPU job per node:
 
-* A join, a take check and picking a voice need files that live on one node, so they run there and wait for it. A take check or a pick on a node without ComfyUI runs as a `breeze` job.
-* Any other GPU job goes to the ready node where its estimated finish is earliest. The estimate is the node's running job's remaining time, from its progress log, plus the queued jobs already waiting for that node, plus the job itself: its takes times the node's seconds per take, the mean of the last three Breeze renders that finished on that node and made twenty takes or more and at least half of their chapter's lines, kept in `placement.json` (3 s for NVIDIA and 18 s for Metal until then), counting only the takes the holder lacks, plus the join and the check. A render whose reuse cannot be worked out is costed at all its takes. The job waits for a busy node when that beats every free node by two minutes or more, and its wait reason shows both estimates. A node whose running job's log has not changed for ten minutes counts as busy for a day, so nothing waits for it. A GPU job does not wait behind a blocked job in its lane.
-* The app records the node of each chapter's takes and each voice's candidates in `state/placement.json` as results come back. For a chapter or voice from before that record, it reads the node from the path style of its files, which works while one node runs each OS.
+* A join and a take check need the chapter's takes. While the media mirror lacks one of them, the job runs on the node that holds them and waits for it. The wait reason then names that node as the one "which holds the files this job needs".
+* Any other GPU job, and a join or a take check whose takes are all in the mirror, goes to the ready node where its estimated finish is earliest. The estimate is the node's running job's remaining time, from its progress log, plus the queued jobs already waiting for that node, plus the job itself: its takes times the node's seconds per take, the mean of the last three Breeze renders that finished on that node and made twenty takes or more and at least half of their chapter's lines, kept in `placement.json` (3 s for NVIDIA and 18 s for Metal until then), plus the join and the check. A Breeze render counts only the takes it has to make, on the node that holds the saved ones and, once the mirror holds them, on any node. A job on another node than the holder adds 0.05 s per take for fetching the takes and sending them back, so with both nodes free it stays where the takes are. A render whose reuse cannot be worked out is costed at all its takes. The job waits for a busy node when that beats every free node by two minutes or more, and its wait reason shows both estimates. A node whose running job's log has not changed for ten minutes counts as busy for a day, so nothing waits for it. A GPU job does not wait behind a blocked job in its lane.
+* The app records the node whose paths each chapter's takes file names in `state/placement.json` as results come back. For a chapter from before that record, it reads the node from the path style of its files, which works while one node runs each OS.
 
 The static port 19137 that GPU jobs reserve doesn't keep them apart, because Nomad checks it per address and the
 nodes have an IPv4 and an IPv6 tailnet address.
 
-Cast candidates and the takes a check didn't pass live in the node's ComfyUI output folder. The worker sends them
-with the result, and the app keeps them in `state/media/`, so the Cast tab and the take check can play them.
+### The media mirror
+
+A node writes Breeze takes and cast candidates to its own output folder, and the library names each by its path on
+that node. The app keeps a copy of all of them in `state/media/`, under that path, so no job needs one node:
+
+* After its steps, a worker sends the app every take of each chapter it changed a file of, and the candidates of each voice record it changed, with a Qwen candidate's Drama 3 voice file. It sends only the files the app lacks or holds with other contents.
+* Before its steps, a take check, a Breeze render or a Breeze join fetches the chapter's takes whose files its node lacks. It puts each under its own output folder, at `breeze/<slug>/chNNNN/...`, and its copy of `breeze_takes.json` then names that file. The takes file goes back with the result, so the library names the paths of the node that last worked on the chapter. A fetched take whose audio is not what its entry's `audio` names is left out, and a render takes that line again.
+* A node never replaces a take it made and still holds with the app's copy.
+* Picking a voice runs on the app's machine and files the candidate's clip from the mirror. A Qwen candidate's Drama 3 voice file is filed in the library too, and a Drama 3 render copies it to ComfyUI's voice folder before it generates.
+* The Cast tab and the take check play candidates and takes from the mirror.
+
+A `sync-media` job sends the app everything one node holds for a serial that the app lacks. It has no CLI step and
+no button. It writes no library file, so it does not wait for the serial's other jobs the way a cast or a render
+does. It waits for its node to be free and for a running import of its serial, and a cast, a pick, a say-as or a
+voice effect waits the few seconds until it has fetched its bundle. Queue one per GPU node after a failed upload,
+or for audio from before the mirror kept takes:
+
+```
+curl -s -X POST http://containers.goblin-truck.ts.net:8765/api/jobs -H 'X-Serial-Audio: 1' \
+  -d '{"jobs": [{"kind": "sync-media", "params": {"slug": "<slug>", "node": "aj-legion5"}}]}'
+```
+
+Its log ends with how many files it sent. While the app is unreachable, a worker tries a request again for 5 minutes
+before it gives up on the audio and goes on to the result. A job's log says so when a file did not arrive, and the
+next job on that chapter on the same node sends it again.
 
 ---
 
@@ -193,7 +219,9 @@ with the result, and the app keeps them in `state/media/`, so the Cast tab and t
 
 * A job's key is in its dispatch meta, which every tailnet device can read through Nomad's anonymous policy. It ties a worker's uploads to its own job. It is not a secret, and the app has no login either, so the tailnet stays the boundary.
 * The worker doesn't send back deleted files. Only fetch and reset-bible delete library files, and they run on the app's machine.
-* Saved Breeze takes stay on the node that made them. A rerun on another node renders every line again.
+* A Drama 3 render, a Drama 3 decode and a Qwen cast need ComfyUI, which only the laptop has.
+* A join or a take check of a chapter whose takes the mirror lacks waits for the node that holds them.
+* The mirror keeps one copy of a chapter's takes for each node that worked on the chapter, about 70 MB each, and nothing removes the copies the library no longer names. The daily backup leaves the mirror out, because the nodes hold the takes too.
 * The Claude passes run only on a Linux node with aj's install of `claude`, which today is dev-arch.
 
 ---

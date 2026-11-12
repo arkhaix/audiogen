@@ -4,8 +4,10 @@ A bundle is a zip of the pipeline code, the prompts and schemas, and one serial'
 plus bundle.json. bundle.json names the job and its CLI steps and holds a manifest of every file in the serial's
 folder, shipped or not, by SHA-256. A result is a zip of result.json and files/<path> for each file the worker
 created or changed. The app writes a file back only when its copy still has the hash the worker started from.
-A result also holds media/<path>: audio the library names by a path on the node, such as cast candidates, which the
-app keeps in a mirror so it can play them.
+The app keeps a media mirror of the audio the library names by a path on a node: Breeze takes and cast candidates.
+A worker sends the mirror every take and candidate its node made, one request per file, and fetches from it the takes
+another node made, so no job needs one node's files. A result may also hold media/<path>, which is how a worker sent
+that audio before.
 """
 from __future__ import annotations
 
@@ -26,6 +28,9 @@ NOT_SHIPPED = ("audio/*",)
 NOT_CODE = ("*/__pycache__/*", "*.pyc", "serial_audio/web/static/*", "*/._*")
 RESUMABLE = ("chapters/*/breeze_takes.json", "chapters/*/*.log", "voices/_briefs.yaml")
 MEDIA_SUFFIXES = {".flac", ".wav", ".opus", ".ogg", ".mp3", ".m4a"}
+# what the mirror keeps: audio, and the Drama 3 voice file of a Qwen cast candidate
+MIRROR_SUFFIXES = MEDIA_SUFFIXES | {".safetensors"}
+TAKES_FILE = "breeze_takes.json"
 MAX_FILES = 20_000
 
 _hash_cache: dict[str, tuple[int, int, str]] = {}
@@ -76,6 +81,45 @@ def mirror_rel(raw: str) -> str | None:
         return check_rel(rel)
     except ExchangeError:
         return None
+
+
+def local_path(raw: str, root: str | Path, anchor: str) -> str | None:
+    """Where a file that a node wrote under its output folder belongs under another node's output folder.
+
+    raw: the file's absolute path on the node that wrote it, in that node's path style.
+    root: the output folder of the node that asks.
+    anchor: the folders every node keeps the file under inside its output folder, such as breeze/<slug>/ch0007.
+    Returns root, the anchor and the rest of raw after its last anchor, or None when raw does not hold the anchor.
+    """
+    if not isinstance(raw, str):
+        return None
+    text = raw.replace("\\", "/")
+    at = text.rfind(f"/{anchor}/")
+    if at < 0:
+        return None
+    try:
+        tail = check_rel(text[at + 1:])
+    except ExchangeError:
+        return None
+    return str(Path(root).joinpath(*tail.split("/")))
+
+
+def same_path(a: str | Path, b: str | Path) -> bool:
+    """Whether two paths name one file on this machine, by spelling alone."""
+    return os.path.normcase(os.path.normpath(str(a))) == os.path.normcase(os.path.normpath(str(b)))
+
+
+def take_files(chapter: Path) -> dict[str, str]:
+    """{line: the take's path on the node that made it} from a chapter folder's breeze_takes.json.
+
+    Returns {} when the chapter has no takes file or it does not parse.
+    """
+    try:
+        takes = json.loads((chapter / TAKES_FILE).read_text(encoding="utf-8")).get("takes") or {}
+        return {k: t["file"] for k, t in takes.items() if isinstance(t, dict) and isinstance(t.get("file"), str)
+                and t["file"]}
+    except (OSError, ValueError, AttributeError):
+        return {}
 
 
 def _matches(rel: str, patterns: tuple[str, ...]) -> bool:

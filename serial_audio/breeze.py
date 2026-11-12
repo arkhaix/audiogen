@@ -453,13 +453,15 @@ def write_wav(path: Path, pcm: bytes, sample_rate: int) -> None:
 
 def retake_flagged(folder: Path, lines: list[dict], say: dict, saved: dict, made: list[str], again, *, save,
                    comfy_url: str, log, rounds: int = CHECK_RETAKES) -> list[int]:
-    """Checks the takes a render just made against the script and replaces the ones that do not say their line.
+    """Checks a render's takes against the script before the join and replaces the ones that do not say their line.
 
     folder: the chapter folder. Its take_check.json gets the verdict of every take in made.
     lines: the script lines.
     say: the bible's say-as map.
-    saved: the chapter's takes by line. The entry of a replaced take is updated in place.
-    made: the lines, as keys of saved, whose takes this render made.
+    saved: the chapter's takes by line. The entry of a replaced take is updated in place, and the entry of every
+        line taken again records its last round as retake_rounds.
+    made: the lines, as keys of saved, to check: the ones this render made, and the ones whose saved take an
+        earlier check flagged.
     again: again(line, round) takes a line again and returns its entry, with the audio in a file of its own.
     save: save() writes saved to disk. It is called after each replaced take and at the end of each round.
     comfy_url: the ComfyUI address the recognizer functions take.
@@ -492,6 +494,7 @@ def retake_flagged(folder: Path, lines: list[dict], say: dict, saved: dict, made
             for k in bad:
                 new = pending.pop(k)
                 saved[k]["takes_tried"] = saved[k].get("takes_tried", 1) + new.get("takes_tried", 1)
+                saved[k]["retake_rounds"] = round_
                 if takecheck.badness(verdicts[k]) >= takecheck.badness(results[k]):
                     Path(new["file"]).unlink(missing_ok=True)
                     continue
@@ -515,6 +518,50 @@ def retake_flagged(folder: Path, lines: list[dict], say: dict, saved: dict, made
         log(f"   could not check the new takes before the join, so the join uses them as they are: "
             f"{type(e).__name__}: {e}")
     return sorted(replaced)
+
+
+def retakes_flagged_here(comfy_url: str) -> bool:
+    """Whether retake_flagged can work on this machine: its recognizer is Parakeet, and Parakeet can run.
+
+    comfy_url: the ComfyUI address the recognizer functions take.
+    Never raises.
+    """
+    try:
+        from . import takecheck
+        engine = choose_asr()
+        if engine != "parakeet":
+            return False
+        takecheck.check_ready(engine, comfy_url)
+        return True
+    except ComfyError:
+        return False
+
+
+def flagged_before(folder: Path, saved: dict) -> set[str]:
+    """The lines whose saved take the take check flagged and that have not been through every retake round.
+
+    folder: the chapter folder, which holds take_check.json.
+    saved: the chapter's takes by line.
+    Returns the lines as keys of saved. A verdict counts only for the take and the audio it was heard in. A
+    take_check.json that cannot be read or parsed counts as no verdicts.
+    """
+    from .takecheck import CHECK_FILE
+    path = folder / CHECK_FILE
+    try:
+        checked = (lib.load_json(path).get("takes") or {}) if path.is_file() else {}
+        verdicts = list(checked.items())
+    except (OSError, ValueError, AttributeError, RecursionError):
+        return set()
+    lines = set()
+    for k, verdict in verdicts:
+        take = saved.get(k)
+        if not isinstance(verdict, dict) or not isinstance(take, dict) or verdict.get("verdict") != "flagged":
+            continue
+        rounds = take.get("retake_rounds")
+        spent = isinstance(rounds, int) and rounds >= CHECK_RETAKES
+        if verdict.get("key") == take.get("key") and verdict.get("audio") == take.get("audio") and not spent:
+            lines.add(k)
+    return lines
 
 
 def wait_comfy_idle(comfy_url: str, log, timeout: float = COMFY_IDLE_TIMEOUT) -> None:
@@ -606,7 +653,8 @@ def reusable_takes(slug: str, number: int, seed: int, runner: str | None = None)
     seed: the render's base seed.
     runner: "cpp" or "comfyui". None picks it the way a render does.
     Returns (reusable, spoken). Reads only the library, so a take counts when its key matches, even if its file is
-    gone from the node that made it. Raises when the chapter cannot be planned, for example when it has no script.
+    gone from the node that made it. Under cpp a take that a render would take again, because the take check flagged
+    it, does not count. Raises when the chapter cannot be planned, for example when it has no script.
     """
     serial = lib.load_serial(slug)
     meta, _ = lib.load_chapter(slug, number)
@@ -622,7 +670,9 @@ def reusable_takes(slug: str, number: int, seed: int, runner: str | None = None)
     takes_path = folder / TAKES_FILE
     saved = (lib.load_json(takes_path).get("takes") or {}) if takes_path.exists() else {}
     spoken = [p for p in plan if re.search(r"\w", p[2])]
-    return sum(1 for p in spoken if (saved.get(str(p[0])) or {}).get("key") == p[5]), len(spoken)
+    redo = flagged_before(folder, saved) if runner == "cpp" else set()
+    reusable = sum(1 for p in spoken if (saved.get(str(p[0])) or {}).get("key") == p[5] and str(p[0]) not in redo)
+    return reusable, len(spoken)
 
 
 def render_breeze(slug: str, number: int, *, seed: int = 1, comfy_url: str = "http://127.0.0.1:8188", log=print,
@@ -638,7 +688,9 @@ def render_breeze(slug: str, number: int, *, seed: int = 1, comfy_url: str = "ht
     runner: "cpp" or "comfyui". None uses the chapter's last runner on a join-only run, else serial.yaml
         breeze_runner, else cpp.
     Returns the chapter's render record. Under breeze-server with Parakeet, a new take that the transcript check
-    flags is taken again before the join (retake_flagged). New takes are then checked against the script with this machine's speech
+    flags is taken again before the join (retake_flagged). A saved take that an earlier check flagged goes through
+    the same check and rounds, and stays unless a new take is closer to the line. A join-only run takes nothing
+    again. New takes are then checked against the script with this machine's speech
     recognizer (asr.choose), and the result, or why the check was skipped, is stored under render.check. Raises ComfyError when the runner cannot start, a take
     fails twice, or a join-only run finds a take missing.
     """
@@ -687,10 +739,18 @@ def render_breeze(slug: str, number: int, *, seed: int = 1, comfy_url: str = "ht
     stale = [p for p in spoken if not usable(p)]
     if join_only and stale:
         raise ComfyError(f"chapter {number} is missing {len(stale)} takes (first: line {stale[0][0]}); run a full render")
+    flagged = flagged_before(folder, saved) if runner == "cpp" and not join_only else set()
+    made_now = {p[0] for p in stale}
+    retry = [p for p in spoken if str(p[0]) in flagged and p[0] not in made_now]
+    if retry and not retakes_flagged_here(comfy_url):
+        retry = []
+    if retry:
+        log(f"   an earlier check flagged the saved takes of lines {', '.join(str(p[0]) for p in retry)}, so they are "
+            f"checked with the new takes and taken again")
 
     # Takes
     generated_seconds = 0.0
-    if stale:
+    if stale or retry:
         via = "breeze-server" if runner == "cpp" else "ComfyUI"
         if runner == "comfyui":
             client = ComfyClient(comfy_url, output_dir=COMFY_OUTPUT)
@@ -704,8 +764,9 @@ def render_breeze(slug: str, number: int, *, seed: int = 1, comfy_url: str = "ht
             free_comfy(comfy_url)
             server.start()
         try:
-            log(f"   generating takes with Breeze TTS 2 via {via} (this is the slow part): {len(stale)} of "
-                f"{len(spoken)} lines, {len(spoken) - len(stale)} reused")
+            if stale:
+                log(f"   generating takes with Breeze TTS 2 via {via} (this is the slow part): {len(stale)} of "
+                    f"{len(spoken)} lines, {len(spoken) - len(stale)} reused")
             take_dir = COMFY_OUTPUT / "breeze" / slug / stem / "cpp"
             take_dir.mkdir(parents=True, exist_ok=True)
             wavs = {v: Path(r["ref"]).read_bytes() for v, r in refs.items()} if server else {}
@@ -744,13 +805,13 @@ def render_breeze(slug: str, number: int, *, seed: int = 1, comfy_url: str = "ht
 
             # Retakes
             if server is not None:
-                by_line = {str(p[0]): p for p in stale}
+                by_line = {str(p[0]): p for p in stale + retry}
 
                 def again(k: str, round_: int) -> dict:
                     i, voice, text, direction, vseed, key = by_line[k]
                     got = cpp_take(server, wavs[voice], refs[voice]["transcript"], text, direction, vseed, i, log,
                                    first=round_ * (RETAKES + 1))
-                    file = take_dir / f"l{i:04d}.retake.wav"
+                    file = Path(saved[k]["file"]).with_name(f"l{i:04d}.retake.wav")
                     write_wav(file, got["pcm"], server.sample_rate)
                     return {"key": key, "file": str(file), **take_fields(got)}
 
@@ -802,13 +863,13 @@ def render_breeze(slug: str, number: int, *, seed: int = 1, comfy_url: str = "ht
         meta["render"]["effects"] = effects
         meta["render"]["fx"] = {"treated_lines": summary["treated_lines"], "raw_seconds": summary.get("raw_seconds"),
                                 "seconds": summary["seconds"]}
-    if not stale and isinstance(last.get("check"), dict):
+    if not (stale or retry) and isinstance(last.get("check"), dict):
         meta["render"]["check"] = last["check"]
     meta["status"] = "rendered"
     lib.save_chapter_meta(slug, number, meta)
 
     # Check
-    if stale or "check" not in meta["render"]:
+    if stale or retry or "check" not in meta["render"]:
         from .takecheck import check_after_render
         meta["render"]["check"] = check_after_render(slug, number, comfy_url=comfy_url, log=log)
     log(f"   audio: {dst}")

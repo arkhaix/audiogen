@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -203,6 +204,29 @@ def _newest(folder: Path, pattern: str, seen: set[Path]) -> Path | None:
     return max(files, key=lambda p: p.stat().st_mtime) if files else None
 
 
+def stage_drama3_voices(slug: str, voices: set[str]) -> list[str]:
+    """Copies each voice's Drama 3 voice file from the library to where Load Drama 3 Voice lists it.
+
+    slug: the serial.
+    voices: the voice ids a render uses.
+    Returns the voices whose file in ComfyUI's voice folder was missing or differed and is now the library's. A
+    voice whose record names no Drama 3 voice file is skipped.
+    """
+    vdir = lib.serial_dir(slug) / "voices"
+    staged = []
+    for voice in sorted(voices):
+        name = (lib.load_yaml(vdir / f"{voice}.yaml") or {}).get("drama3_voice")
+        src = vdir / name if name else None
+        if src is None or not src.is_file():
+            continue
+        dst = COMFY_OUTPUT / "drama3_voices" / slug / f"{voice}.safetensors"
+        if not dst.is_file() or dst.read_bytes() != src.read_bytes():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, dst)
+            staged.append(voice)
+    return staged
+
+
 ENGINES = ("drama3", "breeze")
 
 
@@ -266,6 +290,10 @@ def render(slug: str, number: int, *, seed: int = 1, comfy_url: str = "http://12
         if no_voice:
             raise ComfyError(f"voices {', '.join(no_voice)} have no Drama 3 voice file, which a cast with --engine "
                              "breeze does not make; render with --engine breeze, or recast them with --engine qwen")
+        # a voice picked on the app's machine is filed only in the library
+        staged = stage_drama3_voices(slug, set(slot_voice.values()))
+        if staged:
+            log(f"   copied the Drama 3 voice of {', '.join(staged)} from the library to ComfyUI")
     effects = slot_effects(serial, slot_voice)
     say = say_as_map(bible)
     text = drama3_text([{**line, "text": apply_say_as(line["text"], say)} for line in lines], speaker_slot)

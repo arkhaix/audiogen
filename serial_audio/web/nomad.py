@@ -8,6 +8,10 @@ which the app writes into the library unless they changed there meanwhile.
 
 Jobs on different chapters, serials or nodes run at the same time. Jobs on the same chapter, and any job beside a
 job that rewrites a serial's bible or voices, wait for each other. A node runs one GPU job at a time.
+
+The app's media mirror holds a copy of every take and cast candidate a worker sent it, so a join, a take check and
+a render that reuses takes run on any breeze node, and picking a voice runs on the app's machine. A chapter whose
+takes the mirror lacks still needs the node that made them.
 """
 from __future__ import annotations
 
@@ -27,16 +31,18 @@ import urllib.request
 from pathlib import Path
 
 from .. import library as lib
+from .. import machine
 from ..breeze import reusable_takes
 from . import exchange
-from .jobs import ROOT, JobManager, now_iso, read_tail
+from .jobs import ROOT, JobManager, _slug, now_iso, read_tail
 
 NAMESPACE = "serial-audio"
 PREFIX = "serial-audio"
 CLASSES = ("breeze", "comfyui", "llm")
 GPU_CLASSES = {"breeze", "comfyui"}
 LLM_KINDS = {"character-pass", "screenplay", "bios"}
-COMFY_KINDS = {"pick-voice", "check-takes"}
+# a job with no CLI step: its worker sends the app every take and candidate its node holds for the serial
+SYNC_KIND = "sync-media"
 SERIAL_WIDE = {"character-pass", "cast", "bios", "reset-bible", "pick-voice", "fetch", "say-as", "voice-effect"}
 # serial-wide jobs that write only voices/, the bible and serial.yaml, which a chapter job took in its bundle
 CONFIG_WRITERS = {"cast", "bios", "pick-voice", "say-as", "voice-effect"}
@@ -53,6 +59,8 @@ TAKES_CACHE_SECONDS = 600.0
 STALE_LOG_SECONDS = 600.0
 JOIN_ESTIMATE = 90.0
 CHECK_PER_TAKE = 0.5
+# seconds per take to fetch a chapter's takes from the app and send them back from the new node
+MOVE_PER_TAKE = 0.05
 # a cast candidate is about nine seconds of audio, two takes' worth
 CAST_TAKES = 2
 DEFAULT_LINES = 200
@@ -204,6 +212,12 @@ def _touches(job: dict) -> tuple[str | None, set[int] | None]:
     return job.get("slug"), _chapters(job)
 
 
+def _reads_takes(job: dict) -> bool:
+    """Whether a job reads its chapter's saved Breeze takes: a take check, and a Breeze render or join."""
+    breeze = (job.get("meta") or {}).get("engine") == "breeze"
+    return job["kind"] == "check-takes" or (job["kind"] == "render" and breeze)
+
+
 def _starts_beside(job: dict) -> bool:
     """Whether a job can start beside a running chapter job of its serial."""
     return job["kind"] in CONFIG_WRITERS or job["kind"] == "character-pass" or _is_import(job)
@@ -215,7 +229,8 @@ def conflicts(job: dict, other: dict) -> bool:
     job: the job that would start, a record with kind, slug and meta.
     other: a job that runs or was queued ahead of it.
     Returns True when both work on one serial and either changes the whole serial or they share a chapter, with
-    these exceptions. A CONFIG_WRITERS job never waits for a CHAPTER_KINDS job. The two jobs of a NO_SHARED_FILE
+    these exceptions. A SYNC_KIND job writes no library file, so it and any other job never wait for each other.
+    A CONFIG_WRITERS job never waits for a CHAPTER_KINDS job. The two jobs of a NO_SHARED_FILE
     pair never wait for each other. The import of a saved page changes only its chapter, and it and a
     CONFIG_WRITERS job never wait for each other. A character pass waits for a CHAPTER_KINDS job or an import only
     on a chapter of its own, and an import waits for a character pass only on its chapter. Raises KeyError on a
@@ -224,6 +239,8 @@ def conflicts(job: dict, other: dict) -> bool:
     slug, chapters = _touches(job)
     slug_other, chapters_other = _touches(other)
     if not slug or slug != slug_other:
+        return False
+    if SYNC_KIND in (job["kind"], other["kind"]):
         return False
     if job["kind"] in CONFIG_WRITERS and other["kind"] in CHAPTER_KINDS:
         return False
@@ -273,11 +290,14 @@ def job_stages(job: dict) -> list[dict] | None:
     """The Nomad dispatches a job runs as, in order, or None when it runs on the app's machine.
 
     A cast writes its casting briefs on a Claude node first and then designs the voices on a GPU node, which finds
-    the briefs cached and calls no LLM. Only a Qwen cast needs a ComfyUI node.
+    the briefs cached and calls no LLM. Only a Qwen cast needs a ComfyUI node. A take check runs on any breeze
+    node, and picking a voice runs on the app's machine, from the media mirror.
     """
     kind, args = job["kind"], list(job["args"])
     if kind in LLM_KINDS:
         return [{"class": "llm", "args": args}]
+    if kind in ("check-takes", SYNC_KIND):
+        return [{"class": "breeze", "args": args}]
     if kind == "cast":
         if "--dry-run" in args:
             return [{"class": "llm", "args": args}]
@@ -286,8 +306,6 @@ def job_stages(job: dict) -> list[dict] | None:
         voices = [a for a in args if a != "--redo-brief"] + flag
         return [{"class": "llm", "args": args + flag + ["--dry-run"], "label": "casting briefs"},
                 {"class": "comfyui" if engine == "qwen" else "breeze", "args": voices, "label": "voices"}]
-    if kind in COMFY_KINDS:
-        return [{"class": "comfyui", "args": args}]
     if kind == "render":
         return [{"class": "comfyui" if job.get("comfy") else "breeze", "args": args}]
     return None
@@ -309,6 +327,7 @@ class NomadJobManager(JobManager):
         self._picked: dict[str, tuple[str, str]] = {}
         self._plan: dict[str, float] = {}
         self._takes_cache: dict[str, tuple[float, int]] = {}
+        self._mirror_cache: dict[tuple[str, int], tuple[tuple, bool]] = {}
         super().__init__(**kwargs)
         self.media_dir = self.state_dir / "media"
         self.placement_file = self.state_dir / PLACEMENT_FILE
@@ -333,6 +352,19 @@ class NomadJobManager(JobManager):
             return st["class"]
         return "local-heavy" if job["heavy"] else "local"
 
+    def _build(self, kind, params, coming) -> dict:
+        if kind != SYNC_KIND:
+            return super()._build(kind, params, coming)
+        if not isinstance(params, dict):
+            raise ValueError("each job needs a kind and a params object")
+        slug = _slug(params)
+        node = str(params.get("node") or "")
+        nodes = sorted(w["name"] for w in self.workers if GPU_CLASSES & set(w["classes"]))
+        if node not in nodes:
+            raise ValueError(f"{SYNC_KIND} needs a GPU node: {', '.join(nodes) or 'none is known yet'}")
+        return {"args": [], "heavy": True, "gpu": False, "comfy": False, "title": f"Send audio to the app · {node}",
+                "slug": slug, "meta": {"node": node}}
+
     # Persistence
 
     def _load(self) -> None:
@@ -355,7 +387,7 @@ class NomadJobManager(JobManager):
         return data if isinstance(data, dict) else {}
 
     def _record_placement(self, job: dict, node: str | None, report: dict, success: bool) -> None:
-        """Remembers the node that now holds a chapter's takes or a voice's candidates after a stage it ran."""
+        """Remembers the node that ran a chapter's render or take check as the node that holds its takes."""
         slug = job.get("slug")
         if not node or not slug:
             return
@@ -368,10 +400,7 @@ class NomadJobManager(JobManager):
             if success and job["kind"] == "render" and f"chapters/{int(n):04d}/chapter.yaml" in touched:
                 self._record_rate(slug, int(n), node)
         self._takes_cache.clear()
-        voices = self.placement.setdefault("voices", {}).setdefault(slug, {})
-        for rel in touched:
-            if rel.startswith("voices/") and rel.endswith(".yaml") and rel != "voices/_briefs.yaml":
-                voices[rel[len("voices/"):-len(".yaml")]] = node
+        self._mirror_cache.clear()
         tmp = self.placement_file.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.placement, indent=1), encoding="utf-8")
         os.replace(tmp, self.placement_file)
@@ -387,38 +416,47 @@ class NomadJobManager(JobManager):
         return None
 
     def holder(self, job: dict) -> tuple[str | None, bool]:
-        """The node that holds the takes or candidates a job works on, or None, and whether the job must run there.
+        """The node that holds the takes a job works on, or None, and whether the job must run there.
 
-        A join, a take check and picking a voice must run there. A render would rather, so it can reuse its takes.
-        A pick goes to the node that made the candidate it files, because a recast may have run on another node.
+        A Breeze join and a take check must run there while the media mirror lacks a take of the chapter. With
+        every take in the mirror they run on any node, and a render reuses its takes on any node. The holder is
+        then only the node that need not fetch them. A Drama 3 decode reads no takes, so no node holds it. A
+        SYNC_KIND job must run on the node it names.
         """
         slug, kind, meta = job.get("slug"), job["kind"], job.get("meta") or {}
         if kind in ("render", "check-takes") and meta.get("chapters"):
             n = int(meta["chapters"][0])
             node = ((self.placement.get("chapters") or {}).get(slug) or {}).get(str(n))
             if not node:
-                takes = lib.load_yaml(lib.chapter_dir(slug, n) / "breeze_takes.json", {}) or {}
-                node = self._node_for_paths([t.get("file") or "" for t in (takes.get("takes") or {}).values()
-                                             if isinstance(t, dict)][:5])
-            return node, kind == "check-takes" or bool(meta.get("decode_only"))
-        if kind == "pick-voice" and meta.get("characters"):
-            cid = meta["characters"][0]
-            rec = lib.load_yaml(lib.serial_dir(slug) / "voices" / f"{cid}.yaml", {}) or {}
-            cands = [c for b in [rec] + list(rec.get("history") or []) for c in (b.get("candidates") or [])
-                     if isinstance(c, dict)]
-            seed = _int_flag(list(job.get("args") or []), "--seed")
-            if seed is None:
-                chosen = rec.get("chosen")
-                filed = (rec.get("candidates") or [])[chosen:chosen + 1] if isinstance(chosen, int) else []
-            else:
-                filed = [c for c in cands if c.get("seed") == seed][:1]
-            node = self._node_for_paths([c.get("clip") or "" for c in filed])
-            if not node:
-                node = ((self.placement.get("voices") or {}).get(slug) or {}).get(cid)
-            if not node:
-                node = self._node_for_paths([c.get("clip") or "" for c in cands][:5])
-            return node, True
+                node = self._node_for_paths(list(exchange.take_files(lib.chapter_dir(slug, n)).values())[:5])
+            needs_takes = kind == "check-takes" or (bool(meta.get("decode_only")) and _reads_takes(job))
+            return node, needs_takes and not self._mirrored(slug, n)
+        if kind == SYNC_KIND:
+            return meta.get("node"), True
         return None, False
+
+    def _mirrored(self, slug: str | None, n: int) -> bool:
+        """Whether the media mirror holds a file for every take the chapter's takes file names.
+
+        slug, n: the serial and the chapter.
+        Returns True for a chapter without a takes file. Cached until the takes file changes or a worker sends
+        the mirror a file.
+        """
+        if not slug:
+            return True
+        folder = lib.chapter_dir(slug, n)
+        try:
+            st = (folder / exchange.TAKES_FILE).stat()
+        except OSError:
+            return True
+        stamp = (st.st_mtime_ns, st.st_size)
+        hit = self._mirror_cache.get((slug, n))
+        if hit and hit[0] == stamp:
+            return hit[1]
+        rels = [exchange.mirror_rel(raw) for raw in exchange.take_files(folder).values()]
+        held = all(rel and (self.media_dir / rel).is_file() for rel in rels)
+        self._mirror_cache[(slug, n)] = (stamp, held)
+        return held
 
     def _save(self) -> None:
         with self._io_lock:
@@ -622,6 +660,7 @@ class NomadJobManager(JobManager):
         job.update({"status": status, "finished": now_iso(), "note": note, "exit_code": code})
         job.pop("stopping", None)
         self._takes_cache.clear()
+        self._mirror_cache.clear()
         self._append_log(job, f"\n[web] {note}\n")
         if status != "done":
             self._skip_batch(job, f"an earlier job in the batch {status}")
@@ -734,11 +773,11 @@ class NomadJobManager(JobManager):
     def _pick_node(self, job: dict, lane: str, running: list[dict]) -> tuple[str | None, str | None, str | None]:
         """The node and class a GPU job runs on, as (node, class, None), or (None, None, why it waits).
 
-        A node runs one GPU job at a time. A job that needs a node's files gets that node, and may switch to the
-        other GPU class when that node offers only that one. Any other job goes to the ready node where its
-        estimated finish is earliest, counting the node's running job and the queued jobs already waiting for it,
-        and waits for a busy node when that beats every free one by WAIT_MARGIN. A job that waits adds its estimate
-        to the node's timeline for the rest of the pass.
+        A node runs one GPU job at a time. A job that needs a node's files, because the media mirror has no copy
+        of them, gets that node. Any other job goes to the ready node where its estimated finish is earliest,
+        counting the node's running job and the queued jobs already waiting for it, and waits for a busy node when
+        that beats every free one by WAIT_MARGIN. A job that waits adds its estimate to the node's timeline for
+        the rest of the pass.
         """
         busy = {j["nomad"].get("target") or j["nomad"].get("node") for j in running
                 if j.get("nomad") and self.lane(j) in GPU_CLASSES}
@@ -753,10 +792,9 @@ class NomadJobManager(JobManager):
             if holder in busy:
                 self._plan[holder] = self._plan.get(holder, 0.0) + self._duration(job, holder, holder)
                 return None, None, f"waiting for {need} and is running another GPU job"
-            cls = lane if lane in w["classes"] else next((c for c in ("comfyui", "breeze") if c in w["classes"]), None)
-            if cls is None:
-                return None, None, f"{need}, offers no GPU class"
-            return holder, cls, None
+            if lane not in w["classes"]:
+                return None, None, f"{need}, does not offer {lane} jobs"
+            return holder, lane, None
         offering = [w for w in self.workers if lane in w["classes"]]
         if not offering:
             return None, None, f"no Nomad node offers {lane} jobs yet (client meta serial_audio, see deploy/README.md)"
@@ -820,19 +858,28 @@ class NomadJobManager(JobManager):
         job: the job record, whose meta gives its lines, engine, candidates and characters.
         node: the node it would run on.
         holder: the node that holds its saved takes, or None.
-        Returns the estimate. A Breeze render on its holder counts only the takes the holder lacks.
+        Returns the estimate. A Breeze render counts only the takes it has to make where the saved ones are at
+        hand: on its holder, and on any node when the media mirror holds them. A job on another node than its
+        holder also counts fetching the takes and sending them back.
         """
         meta = job.get("meta") or {}
         lines = meta.get("lines") or DEFAULT_LINES
         rate = self._rate(node)
         kind = job["kind"]
+        chapter = int(meta["chapters"][0]) if meta.get("chapters") else None
+        move = MOVE_PER_TAKE * lines if holder and node != holder else 0.0
         if kind == "render":
             if meta.get("decode_only"):
-                return JOIN_ESTIMATE
-            takes = self._takes_needed(job, lines) if meta.get("engine") == "breeze" and node == holder else lines
-            return takes * rate + _overhead(lines)
+                return JOIN_ESTIMATE + move
+            if meta.get("engine") != "breeze":
+                return lines * rate + _overhead(lines)
+            if node == holder:
+                return self._takes_needed(job, lines) * rate + _overhead(lines)
+            if chapter is not None and self._mirrored(job.get("slug"), chapter):
+                return self._takes_needed(job, lines) * rate + _overhead(lines) + move
+            return lines * rate + _overhead(lines)
         if kind == "check-takes":
-            return 30 + CHECK_PER_TAKE * lines
+            return 30 + CHECK_PER_TAKE * lines + move
         if kind == "cast":
             count = (meta.get("candidates") or 3) * (len(meta.get("characters") or []) or 3)
             return 60 + count * CAST_TAKES * rate
@@ -966,6 +1013,8 @@ class NomadJobManager(JobManager):
     # Local jobs
 
     def _launch_local(self, job: dict) -> None:
+        # the job's CLI inherits this, and a voice pick reads its candidates from the mirror
+        os.environ[machine.MEDIA_MIRROR_ENV] = str(self.media_dir)
         if os.name == "nt":
             self._launch(job)
             return
@@ -1042,8 +1091,10 @@ class NomadJobManager(JobManager):
             if n.get("cancel"):
                 raise WorkerError(410, "the job was stopped")
             st = n["stages"][n["stage"]]
-            info = {"job": jid, "stage": n["stage"], "steps": [st["args"]], "class": st["class"],
-                    "gpu": st["class"] in GPU_CLASSES, "title": job["title"], "kind": job["kind"],
+            sync = job["kind"] == SYNC_KIND
+            info = {"job": jid, "stage": n["stage"], "steps": [] if sync else [st["args"]], "class": st["class"],
+                    "gpu": st["class"] in GPU_CLASSES and not sync, "sync": sync, "takes": _reads_takes(job),
+                    "title": job["title"], "kind": job["kind"],
                     "chapters": (job.get("meta") or {}).get("chapters") or []}
             slug = job["slug"]
 
@@ -1091,6 +1142,56 @@ class NomadJobManager(JobManager):
                 n["log_got"] = got
                 self._save()
             return {"offset": got, "cancel": bool(n.get("cancel"))}
+
+    def _media_job(self, jid: str, key: str) -> None:
+        """Raises WorkerError unless the key is the job's and the job runs or was stopped while its worker ran."""
+        job = self.jobs.get(jid)
+        if job is None:
+            raise WorkerError(404, f"no job {jid}")
+        n = job.get("nomad")
+        if not n or not _key_ok(n, key):
+            raise WorkerError(403, "wrong key for this job")
+        if job["status"] != "running" and not (job["status"] == "stopped" and n.get("cancel")):
+            raise WorkerError(410, f"the job is {job['status']}")
+
+    def worker_media_have(self, jid: str, key: str, paths: list[str]) -> dict:
+        """Tells a worker which media mirror files the app holds.
+
+        jid, key: the job and its key.
+        paths: mirror paths, as exchange.mirror_rel gives them.
+        Returns {"have": {path: SHA-256}} for the paths that are files in the mirror. A path that is not a mirror
+        path is left out. Raises WorkerError on a wrong key or a job that no longer runs.
+        """
+        with self.lock:
+            self._media_job(jid, key)
+        have = {}
+        for rel in paths:
+            if exchange.mirror_rel(rel) != rel:
+                continue
+            try:
+                if (self.media_dir / rel).is_file():
+                    have[rel] = exchange.sha256_file(self.media_dir / rel)
+            except OSError:
+                continue
+        return {"have": have}
+
+    def worker_media_target(self, jid: str, key: str, rel: str) -> Path:
+        """Where the mirror keeps the file a worker is about to send.
+
+        jid, key: the job and its key.
+        rel: the file's mirror path.
+        Returns the path inside the mirror. Raises WorkerError on a wrong key, a job that no longer runs, a path
+        that is not a mirror path, or a file type the mirror does not keep.
+        """
+        with self.lock:
+            self._media_job(jid, key)
+        if exchange.mirror_rel(rel) != rel or os.path.splitext(rel)[1].lower() not in exchange.MIRROR_SUFFIXES:
+            raise WorkerError(400, f"bad media path {rel!r}")
+        return self.media_dir / rel
+
+    def worker_media_stored(self) -> None:
+        """Notes that a worker's file reached the mirror, so the next node choice looks at the mirror again."""
+        self._mirror_cache.clear()
 
     def _result_job(self, jid: str, key: str, stage: str | None) -> tuple[dict, dict | None]:
         """The job a result belongs to and the report the app already gave for that stage, or None."""

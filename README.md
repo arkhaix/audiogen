@@ -84,7 +84,7 @@ disk is mounted. `--publish-skip <slug>` keeps a serial out. The header says "au
 Every change goes through `python -m serial_audio.cli` as a background job, under `serial_audio/web/runjob.py`,
 so a job keeps running when the server stops and is picked up again when it starts. Job records and logs live in
 `.webapp/`. The rest of this paragraph is the one-machine executor (`--executor local`), and `deploy/README.md` has
-the cluster's rules. Heavy jobs (character pass, screenplay, cast, casting bios, render) run one at a time, in order, and wait while
+the cluster's rules, with the media mirror that lets a Breeze job run on either GPU node. Heavy jobs (character pass, screenplay, cast, casting bios, render) run one at a time, in order, and wait while
 any pipeline process the app did not start is running, including a PowerShell script that calls the CLI, or
 while ComfyUI is busy with a prompt the app did not queue. A render or cast that queues ComfyUI prompts also waits
 for ComfyUI to answer. A Breeze render under `breeze-server` does not, so it runs with ComfyUI down. A render job is
@@ -148,7 +148,9 @@ its override removes the entry.
    Before the join, when the recognizer is Parakeet, `render` transcribes the new takes while breeze-server is still
    up. It takes a flagged line again with new seeds, in up to two rounds, and keeps a new take only when its transcript is
    closer to the line. `breeze_takes.json` marks a replaced take with `retaken`, and `render.check` lists those lines.
-   A take that came from an earlier render is not taken again.
+   A saved take that an earlier check flagged goes through the same check and rounds, and it stays unless a new take
+   is closer to the line. `retake_rounds` on a take records the last round its line went through, so a line that
+   stays flagged after every round is left alone.
    After the join, `render` checks the new takes, and reuses the transcripts made before the join: a speech recognizer transcribes each one, the words are aligned
    with the script line, and a take with three or more inserted or dropped words is flagged, in `take_check.json`
    beside the script and as `render.check` in `chapter.yaml`. A take with a high word error rate but fewer slips is

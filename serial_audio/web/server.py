@@ -10,6 +10,7 @@ import os
 import re
 import socket
 import sys
+import threading
 import traceback
 import unicodedata
 import urllib.parse
@@ -24,6 +25,7 @@ from .nomad import WorkerError
 
 STATIC = Path(__file__).with_name("static")
 MAX_UPLOAD = 300 * 1024 * 1024
+MAX_MEDIA = 64 * 1024 * 1024
 MAX_JSON = 1024 * 1024
 RECENT_FINISHED = 40
 CSRF_HEADER = "X-Serial-Audio"
@@ -63,6 +65,12 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         if self.command != "GET":
             sys.stderr.write(f"{self.address_string()} {fmt % args}\n")
+
+    def log_request(self, code="-", size="-"):
+        # a worker sends a chapter's takes as some 250 requests
+        if "/media/file" in (getattr(self, "path", None) or "") and str(getattr(code, "value", code)) == "200":
+            return
+        super().log_request(code, size)
 
     def _name_ok(self, name: str) -> bool:
         return name in self.allowed_names or bool(self.machine_name and name.startswith(self.machine_name + "."))
@@ -447,6 +455,43 @@ def post_worker_result(h: Handler, q, jid):
                                                       data)))
 
 
+def post_worker_media_have(h: Handler, q, jid):
+    m = _worker_manager(h)
+    paths = h.body_json().get("paths")
+    if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
+        raise HTTPError(400, "give a list of media mirror paths")
+    h._send_json(_worker_call(lambda: m.worker_media_have(jid, h.headers.get(KEY_HEADER) or "", paths)))
+
+
+def post_worker_media_file(h: Handler, q, jid):
+    m = _worker_manager(h)
+    length = int(h.headers.get("Content-Length") or 0)
+    if length <= 0:
+        raise HTTPError(400, "empty upload")
+    if length > MAX_MEDIA:
+        h.close_connection = True
+        raise HTTPError(413, "the file is too large")
+    target = _worker_call(lambda: m.worker_media_target(jid, h.headers.get(KEY_HEADER) or "", q.get("path") or ""))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = target.with_name(f"{target.name}.{threading.get_ident()}.part")
+    left = length
+    h._body = b""
+    with tmp.open("wb") as fh:
+        while left > 0:
+            chunk = h.rfile.read(min(262_144, left))
+            if not chunk:
+                break
+            fh.write(chunk)
+            left -= len(chunk)
+    if left:
+        tmp.unlink(missing_ok=True)
+        h.close_connection = True
+        raise HTTPError(400, "the upload was cut short")
+    tmp.replace(target)
+    m.worker_media_stored()
+    h._send_json({"bytes": length})
+
+
 SLUG = r"([a-z0-9][a-z0-9-]*)"
 JOB = r"([0-9]{8}-[0-9]{6}-[0-9a-f]{6})"
 GET_ROUTES = [
@@ -475,6 +520,8 @@ POST_ROUTES = [
     (r"/api/upload", post_upload),
     (rf"/api/worker/{JOB}/log", post_worker_log),
     (rf"/api/worker/{JOB}/result", post_worker_result),
+    (rf"/api/worker/{JOB}/media/have", post_worker_media_have),
+    (rf"/api/worker/{JOB}/media/file", post_worker_media_file),
 ]
 
 

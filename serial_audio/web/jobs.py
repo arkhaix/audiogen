@@ -728,7 +728,7 @@ class JobManager:
             if not isinstance(r, dict):
                 raise ValueError("each job must be an object with a kind and params")
             params = r.get("params") if r.get("params") is not None else {}
-            b = build(r.get("kind"), params, self.comfy_url, coming)
+            b = self._build(r.get("kind"), params, coming)
             if r.get("kind") == "fetch":
                 coming.setdefault(b["slug"], set()).update(b["meta"].get("chapters") or [])
             built.append((r.get("kind"), params, b))
@@ -748,6 +748,10 @@ class JobManager:
                 out.append(job)
             self._save()
         return out
+
+    def _build(self, kind, params, coming) -> dict:
+        """The job fields for one request, as build returns them. Raises ValueError on a bad request."""
+        return build(kind, params, self.comfy_url, coming)
 
     def cancel(self, jid: str) -> dict:
         """Cancels a queued job, or stops a running one and cancels its ComfyUI prompts. Returns the job."""
