@@ -253,6 +253,7 @@ details.cands[open] > summary::before { content: "▾ "; }
 .cand { display: grid; grid-template-columns: auto 1fr auto; gap: 8px; align-items: center; padding: 6px 0; border-top: 1px solid var(--border); font-size: 0.85rem; }
 .cand.chosen { font-weight: 600; }
 .cand .tr { color: var(--muted); font-size: 0.8rem; }
+.cand .tr.off { color: var(--warn); }
 .cand .btns { display: flex; gap: 4px; }
 .round { margin-top: 8px; padding: 8px 10px; border-radius: 8px; background: var(--panel-2); }
 .round .instruct { -webkit-line-clamp: unset; }

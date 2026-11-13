@@ -11,6 +11,7 @@ audio Python (machine.AUDIO_PYTHON), applies voice effects, and matches the loud
 from __future__ import annotations
 
 import ctypes
+import functools
 import hashlib
 import http.client
 import json
@@ -29,6 +30,7 @@ from pathlib import Path
 
 from . import library as lib
 from . import machine
+from . import screenplay
 from .asr import choose as choose_asr
 from .asr import word_map, words
 from .comfy import ComfyClient, ComfyError
@@ -197,33 +199,35 @@ def placed_names(plain: list[dict], found: list[tuple[str, str]]) -> list[dict]:
     return out
 
 
-def voice_text(line: dict, bible: dict) -> tuple[str, list[dict]]:
-    """The text Breeze is sent for a script line, and the line's token map.
+def name_marks(bible: dict) -> tuple[dict[str, tuple[str, str]], dict[str, tuple[str, str]], re.Pattern | None]:
+    """What voice_text reads of a bible to find the names in a line.
 
-    line: the script line.
-    bible: the serial's bible. Its say-as overrides replace their terms in the text.
-    Returns (text, tokens). tokens has one {"w", "name", "after"} per word of the text, in order: the word as
-    asr.words gives it, the term of name_terms it belongs to or "", and every character that is not a space
-    between it and the next word. A vocal event in parentheses is not a word. A name that cannot be placed is a
-    word without a name.
+    bible: the serial's bible.
+    Returns (terms, spelled, pattern): name_terms(bible), the same by each string as a line may spell it, and the
+    expression that finds a name in a line. pattern is None for a bible without names. The three are shared between
+    calls, so a caller must not change them.
     """
-    text = speakable(apply_say_as(line["text"], say_as_map(bible)))
-    plain = [{"w": w, "name": "", "after": after} for w, after in word_map(without_events(text))]
+    said = tuple((term, entry.get("say") if isinstance(entry, dict) else None)
+                 for term, entry in (bible.get("pronunciations") or {}).items())
+    names = tuple(str((character or {}).get("name") or "") for character in (bible.get("characters") or {}).values())
+    try:
+        return _name_marks(said, names)
+    except TypeError:
+        # a say-as that can't be hashed
+        return _name_marks.__wrapped__(said, names)
+
+
+@functools.lru_cache(maxsize=16)
+def _name_marks(said: tuple, names: tuple) -> tuple[dict, dict, re.Pattern | None]:
+    """name_marks for a bible with these (term, say-as) pairs and these character names, each in the bible's order."""
+    bible = {"pronunciations": {term: {"say": say} for term, say in said},
+             "characters": dict(enumerate({"name": name} for name in names))}
     terms = name_terms(bible)
     if not terms:
-        return text, plain
-
-    # Mark each name with a word that survives asr.words
-    found: list[tuple[str, str]] = []
+        return terms, {}, None
     exact = set(say_as_map(bible))
-    loose = {str(term) for term in bible.get("pronunciations") or {} if NAME_WORD_RE.fullmatch(str(term))} - exact
+    loose = {str(term) for term in bible["pronunciations"] if NAME_WORD_RE.fullmatch(str(term))} - exact
     spelled = {(t[0].lower() + t[1:] if t in loose else t).replace("’", "'"): v for t, v in terms.items()}
-
-    def mark(m: re.Match) -> str:
-        hit = m.group(0)
-        straight = hit.replace("’", "'")
-        found.append(terms[hit] if hit in terms else spelled.get(straight) or spelled[straight[0].lower() + straight[1:]])
-        return NAME_MARK.format(len(found) - 1)
 
     def loosely(term: str) -> str:
         """A pattern for a name: either apostrophe, and either case of the first letter of a pronunciation term."""
@@ -234,7 +238,55 @@ def voice_text(line: dict, bible: dict) -> tuple[str, list[dict]]:
     # a say-as term matches where and as apply_say_as matches it
     pattern = "|".join([re.escape(t) for t in sorted(exact, key=len, reverse=True)]
                        + [loosely(t) for t in sorted(terms, key=len, reverse=True) if t not in exact])
-    marked = without_events(speakable(re.sub(rf"(?<!\w)(?:{pattern})(?!\w)", mark, line["text"])))
+    return terms, spelled, re.compile(rf"(?<!\w)(?:{pattern})(?!\w)")
+
+
+def unbroken(text: str, bible: dict) -> list[tuple[int, int]]:
+    """The parts of a line's text that an asterisk must not split, as (start, end).
+
+    text: the line's text.
+    bible: the serial's bible.
+    Returns each say-as term where apply_say_as matches it, and each vocal event with its parentheses.
+    """
+    found = [m.span() for m in re.finditer(r"\(([^()]*)\)", text) if m.group(1).strip().lower() in VOCAL_EVENTS]
+    say = say_as_map(bible)
+    if say:
+        pattern = "|".join(re.escape(term) for term in sorted(say, key=len, reverse=True))
+        found += [m.span() for m in re.finditer(rf"(?<!\w)(?:{pattern})(?!\w)", text)]
+    return found
+
+
+def voice_text(line: dict, bible: dict) -> tuple[str, list[dict]]:
+    """The text Breeze is sent for a script line, and the line's token map.
+
+    line: the script line.
+    bible: the serial's bible. Its say-as overrides replace their terms in the text.
+    Returns (text, tokens). tokens has one {"w", "name", "after"} per word of the text, in order: the word as
+    asr.words gives it, the term of name_terms it belongs to or "", and every character that is not a space
+    between it and the next word. A vocal event in parentheses is not a word. A name that cannot be placed is a
+    word without a name. In text, each word or phrase of the line's `emphasis` that screenplay.emphasis_spans
+    places stands between asterisks. A phrase whose asterisk would land inside a part that unbroken() names is
+    not marked. tokens is the same with and without the asterisks.
+    """
+    text = speakable(apply_say_as(line["text"], say_as_map(bible)))
+    plain = [{"w": w, "name": "", "after": after} for w, after in word_map(without_events(text))]
+    if line.get("emphasis"):
+        starred = screenplay.emphatic(line["text"], line["emphasis"], unbroken(line["text"], bible))
+        text = speakable(apply_say_as(starred, say_as_map(bible)))
+    terms, spelled, pattern = name_marks(bible)
+    if not terms:
+        return text, plain
+
+    # Mark each name with a word that survives asr.words
+    found: list[tuple[str, str]] = []
+
+    def mark(m: re.Match) -> str:
+        hit = m.group(0)
+        straight = hit.replace("’", "'")
+        found.append(terms[hit] if hit in terms else spelled.get(straight) or spelled[straight[0].lower() + straight[1:]])
+        return NAME_MARK.format(len(found) - 1)
+
+    marked = without_events(speakable(pattern.sub(mark, line["text"])))
 
     # Put the spoken words of each name back
     tokens = []
@@ -732,19 +784,19 @@ def retake_flagged(folder: Path, lines: list[dict], bible: dict, saved: dict, ma
     comfy_url: the ComfyUI address the recognizer functions take.
     log: receives the progress lines.
     rounds: how many rounds a flagged line gets, over every render of its take.
-    Returns {"replaced", "findings", "names", "left"}: the lines whose take was replaced, the voice findings from
-    takecheck.voice_findings, the name findings from takecheck.name_findings, and the flagged lines that the
-    render's ceiling left for a later render. A new take
+    Returns {"replaced", "findings", "left"}: the lines whose take was replaced, the voice findings from
+    takecheck.voice_findings, and the flagged lines that the render's ceiling left for a later render. A new take
     replaces the old one only when takecheck.better ranks it above. A line goes on from the round its retake_rounds
     records, so a line that has been through every round is heard and not taken again. A take is not taken again
-    when a finding covers every reason it is flagged for: a voice finding for the reason, or for the reason "name"
-    a name finding for each name the take misses. The render takes lines again at most retake_ceiling
-    times, the worst lines first. Does nothing unless this machine's recognizer is Parakeet, which leaves the card
-    to breeze-server.
+    when a voice finding covers every reason it is flagged for. No finding covers the reason "name", so a take
+    that adds a sound to a name is taken again however many takes of the name do. The render takes lines again at
+    most retake_ceiling times: the lines with the most word errors first, and of lines with as many, one that is
+    flagged for a name alone last. Does nothing unless this machine's recognizer is Parakeet, which leaves the
+    card to breeze-server.
     Never raises. A failure is logged, and the takes replaced before it stay replaced, in saved and in
     take_check.json.
     """
-    out: dict = {"replaced": [], "findings": [], "names": [], "left": []}
+    out: dict = {"replaced": [], "findings": [], "left": []}
     replaced: list[int] = out["replaced"]
     pending: dict[str, dict] = {}
     try:
@@ -758,24 +810,15 @@ def retake_flagged(folder: Path, lines: list[dict], bible: dict, saved: dict, ma
         results = takecheck.check_entries({k: saved[k] for k in made}, lines, bible, **check)
         takecheck.save_entries(folder, results, engine, **record)
 
-        # Voice and name findings
+        # Voice findings
         judged = takecheck.saved_entries(folder, saved)
         out["findings"] = takecheck.voice_findings(judged, saved)
-        out["names"] = takecheck.name_findings(judged)
         tripped = {(f["voice"], f["reason"]) for f in out["findings"]}
-        off = {f["term"] for f in out["names"]}
-
-        def explained(k: str, reason: str) -> bool:
-            missed = results[k].get("missed") or []
-            if reason == "name" and missed and all(term in off for term in missed):
-                return True
-            return (saved[k].get("voice"), reason) in tripped
-
         held, changed = set(), False
         for k in made:
             reasons = sorted(results[k].get("reasons") or [])
             covered = (results[k]["verdict"] == "flagged" and bool(reasons)
-                       and all(explained(k, r) for r in reasons))
+                       and all((saved[k].get("voice"), r) in tripped for r in reasons))
             if covered:
                 held.add(k)
             if saved[k].get("retake_held") != (reasons if covered else None):
@@ -786,9 +829,6 @@ def retake_flagged(folder: Path, lines: list[dict], bible: dict, saved: dict, ma
         for f in out["findings"]:
             log(f"   voice finding: {f['reason']} flags {len(f['lines'])} of the {f['of']} takes of {f['voice']}, so "
                 f"the cause is the voice and those takes are not taken again")
-        for f in out["names"]:
-            log(f"   name finding: {len(f['lines'])} of the {f['of']} takes that say {f['term']} add a sound to its "
-                f"spelling, so the cause is the spelling and those takes are not taken again")
         if changed:
             save()
 
@@ -801,7 +841,8 @@ def retake_flagged(folder: Path, lines: list[dict], bible: dict, saved: dict, ma
         for _ in range(rounds):
             bad = [k for k in made if results[k]["verdict"] == "flagged" and k not in held and spent(k) < rounds]
             if len(bad) > budget:
-                worst = sorted(bad, key=lambda k: -(results[k]["sub"] + results[k]["del"] + results[k]["ins"]))
+                worst = sorted(bad, key=lambda k: (-(results[k]["sub"] + results[k]["del"] + results[k]["ins"]),
+                                                   results[k].get("reasons") == ["name"]))
                 left.update(worst[budget:])
                 bad = [k for k in bad if k in worst[:budget]]
             budget -= len(bad)
@@ -874,8 +915,9 @@ def flagged_before(folder: Path, saved: dict, lines: list[dict] | None = None, b
     lines, bible: the script lines and the serial's bible. With them, a file that takecheck.stale names, for older
         rules or other picked spellings, is judged again from its evidence first, without being written.
     Returns the lines as keys of saved. A verdict counts only for the take and the audio it was heard in. A line
-    that has been through every retake round is left out, and so is a take whose reasons a voice finding or a name
-    finding covered (retake_held). A take_check.json that cannot be read or parsed counts as no verdicts.
+    that has been through every retake round is left out, and so is a take whose reasons a voice finding covered
+    (retake_held). No hold covers the reason "name". A take_check.json that cannot be read or parsed counts as no
+    verdicts.
     """
     from . import takecheck
     path = folder / takecheck.CHECK_FILE
@@ -899,7 +941,7 @@ def flagged_before(folder: Path, saved: dict, lines: list[dict] | None = None, b
         spent = isinstance(rounds, int) and rounds >= CHECK_RETAKES
         held, reasons = take.get("retake_held"), verdict.get("reasons")
         covered = (isinstance(held, list) and isinstance(reasons, list) and bool(reasons)
-                   and all(isinstance(r, str) and r in held for r in reasons))
+                   and all(isinstance(r, str) and r != "name" and r in held for r in reasons))
         if (verdict.get("key") == take.get("key") and verdict.get("audio") == take.get("audio") and not spent
                 and not covered):
             lines.add(k)
@@ -1038,10 +1080,10 @@ def render_changes(slug: str, number: int, seed: int | None = None, runner: str 
     script.
     """
     serial = lib.load_serial(slug)
-    meta, _ = lib.load_chapter(slug, number)
+    meta, text = lib.load_chapter(slug, number)
     folder = lib.chapter_dir(slug, number)
-    lines = lib.load_json(folder / "script.json")["lines"]
     bible = lib.load_bible(slug)
+    lines = screenplay.emphasized(lib.load_json(folder / "script.json"), text, bible)[0]
     speaker_slot, slot_voice, _ = plan_slots(serial, bible, lines)
     last = meta.get("render") if isinstance(meta.get("render"), dict) else {}
     runner = choose_runner(serial, last, runner=runner)
@@ -1116,7 +1158,8 @@ def render_breeze(slug: str, number: int, *, seed: int | None = None, comfy_url:
     script_path = folder / "script.json"
     if not script_path.exists():
         raise ComfyError(f"chapter {number} has no script.json; run the screenplay pass first")
-    lines = lib.load_json(script_path)["lines"]
+    # a join-only run keeps the script as its takes were made from it
+    lines = lib.load_json(script_path)["lines"] if join_only else screenplay.write_emphasis(slug, number, log)
     bible = lib.load_bible(slug)
     speaker_slot, slot_voice, notes = plan_slots(serial, bible, lines)
     effects = {slot_voice[s]: spec for s, spec in slot_effects(serial, slot_voice).items()}
@@ -1171,7 +1214,6 @@ def render_breeze(slug: str, number: int, *, seed: int | None = None, comfy_url:
         log(f"   {len(retry) - len(again_lines)} saved takes don't have evidence from the current check, so they "
             f"are heard before the join")
     findings = last.get("voice_findings") if isinstance(last.get("voice_findings"), list) else []
-    names_off = last.get("name_findings") if isinstance(last.get("name_findings"), list) else []
 
     # Takes
     generated_seconds = 0.0
@@ -1242,7 +1284,7 @@ def render_breeze(slug: str, number: int, *, seed: int | None = None, comfy_url:
 
                 checked = retake_flagged(folder, lines, bible, saved, list(by_line), again, comfy_url=comfy_url,
                                          log=log, save=lambda: save_takes(takes_path, saved, runner))
-                findings, names_off = checked["findings"], checked["names"]
+                findings = checked["findings"]
         finally:
             if server is not None:
                 server.__exit__(None, None, None)
@@ -1301,8 +1343,6 @@ def render_breeze(slug: str, number: int, *, seed: int | None = None, comfy_url:
                                 "seconds": summary["seconds"]}
     if findings:
         meta["render"]["voice_findings"] = findings
-    if names_off:
-        meta["render"]["name_findings"] = names_off
     if not (stale or retry) and isinstance(last.get("check"), dict):
         meta["render"]["check"] = last["check"]
     meta["status"] = "rendered"

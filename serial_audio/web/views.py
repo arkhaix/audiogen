@@ -550,10 +550,11 @@ def names_heard(slug: str) -> dict:
     _ways: how its sayings sort into ways by sound, the first being the usual saying of its spelling when the
     bible has one and else its usual way. A term is "held" while it has a say-as and takecheck.NAME_FLAGS is on,
     and then "adds" is [the takes that say it with an added sound, the takes that say it], over the chapters
-    whose check was judged by the rules and the picked spellings as they are now. "findings" lists the chapters
-    where a render found so many takes with an added sound that it took none again, as {"chapter", "takes",
-    "of"}. The options are {"line", "voice", "at", "candidates"}, and a candidate is {"say", "why", "heard",
-    "seconds", "media", "steady", "typical", "offered"}, where heard is how the recognizer wrote the spelling in
+    whose check was judged by the rules as they are now and with the term's spelling as it is now. "waiting"
+    counts the chapters that say the term whose check was not. "unsteady" is whether the takes with an added
+    sound are takecheck.BREAKER_MIN or more and over takecheck.BREAKER_SHARE of the takes that say it. The
+    options are {"line", "voice", "at", "candidates"}, and a candidate is {"say", "why", "heard", "seconds",
+    "media", "steady", "typical", "offered"}, where heard is how the recognizer wrote the spelling in
     the candidate's take, steady is [the screening takes without an added sound, the screening takes] or None,
     typical is whether the clip is one of those, and offered is False for a screened candidate that
     pronounce.steady rejects. The candidate that is the term as written has no count and is offered. While
@@ -571,7 +572,7 @@ def names_heard(slug: str) -> dict:
     where: dict[str, list[int]] = {}
     spans: dict[str, list] = {}
     adds: dict[str, list[int]] = {}
-    findings: dict[str, list[dict]] = {}
+    counted: dict[str, set[int]] = {}
     known, unknown, judged, stamps = [], [], [], []
     for n in lib.list_chapters(slug):
         folder = lib.chapter_dir(slug, n)
@@ -585,11 +586,13 @@ def names_heard(slug: str) -> dict:
         stamps.append(stamp)
         if not stale(check, bible):
             judged.append(n)
-            for term, (missed, saying) in check["missed"].items():
-                if term in held:
-                    count = adds.setdefault(term, [0, 0])
-                    count[0] += missed
-                    count[1] += saying
+        with_names = check["names"] if isinstance(check.get("names"), dict) else {}
+        for term, (missed, saying) in () if stale(check) else check["missed"].items():
+            if term in held and with_names.get(term) == held[term]:
+                count = adds.setdefault(term, [0, 0])
+                count[0] += missed
+                count[1] += saying
+                counted.setdefault(term, set()).add(n)
         for term, spellings in found.items():
             counts.setdefault(term, Counter()).update(spellings)
             where.setdefault(term, []).append(n)
@@ -598,10 +601,6 @@ def names_heard(slug: str) -> dict:
             counts.setdefault(term, Counter())
             if n not in where.setdefault(term, []):
                 where[term].append(n)
-        off = (_chapter_meta(slug, n).get("render") or {}).get("name_findings")
-        for f in off if isinstance(off, list) else []:
-            if isinstance(f, dict) and isinstance(f.get("term"), str) and isinstance(f.get("lines"), list):
-                findings.setdefault(f["term"], []).append({"chapter": n, "takes": len(f["lines"]), "of": f.get("of")})
     refs = {str(term): entry["said"] for term, entry in pronunciations.items()
             if isinstance(entry, dict) and isinstance(entry.get("said"), str) and entry["said"]}
     key = (tuple(stamps), tuple(sorted(refs.items())))
@@ -611,12 +610,15 @@ def names_heard(slug: str) -> dict:
 
     def view(term: str, entry: dict, spellings: Counter) -> dict:
         sent = " ".join(words(str(entry.get("say") or term)))
+        count = adds.get(term, [0, 0])
+        often = count[0] >= takecheck.BREAKER_MIN and count[0] > takecheck.BREAKER_SHARE * count[1]
         return {"term": term, "say": str(entry.get("say") or ""), "respelling": str(entry.get("respelling") or ""),
                 "heard": sum(spellings.values()), "spellings": len(spellings), "as_written": spellings.get(sent, 0),
                 "top": [[s, c] for s, c in spellings.most_common(NAMES_SHOWN)], "chapters": where.get(term, []),
                 "options": _options_view(entry.get("options"), term), "held": term in held,
-                **({"adds": adds.get(term, [0, 0])} if term in held else {}),
-                "findings": findings.get(term, []), **({"ways": ways[term]} if ways.get(term, {}).get("said") else {})}
+                **({"adds": count, "unsteady": often,
+                    "waiting": sum(n not in counted.get(term, ()) for n in where.get(term, []))} if term in held else {}),
+                **({"ways": ways[term]} if ways.get(term, {}).get("said") else {})}
 
     terms = [view(term, pronunciations.get(term) if isinstance(pronunciations.get(term), dict) else {}, spellings)
              for term, spellings in counts.items()]

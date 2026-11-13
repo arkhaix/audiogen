@@ -654,13 +654,164 @@ class ScreenplayPassTest(unittest.TestCase):
         self.assertEqual((marks["properties"]["energy"]["enum"], marks["properties"]["pace"]["enum"]),
                          (["", "whisper", "soft", "normal", "raised", "shout"], ["", "slow", "fast", "halting"]))
 
-    def test_the_fields_leave_every_take_key_as_it_was(self):
+    def test_only_emphasis_changes_a_take_key_and_only_of_its_line(self):
         slots, voices, clips = {"narrator": 0, "mira": 1}, {0: "narrator", 1: "mira"}, {"narrator": "a" * 40, "mira": "b" * 40}
         bare = [{k: line[k] for k in ("speaker", "text", "direction")} for line in HARBOUR_SCRIPT]
         bible = {"characters": {"mira": {"name": "Mira"}}, "pronunciations": {}}
+
+        # The focus, the heteronyms, the emotion, the energy and the pace leave every take key as it was.
+        others = [{**line, "emphasis": []} for line in HARBOUR_SCRIPT]
         for runner in ("cpp", "comfyui"):
-            self.assertEqual(breeze.plan_takes(HARBOUR_SCRIPT, slots, voices, bible, 3, clips, runner),
+            self.assertEqual(breeze.plan_takes(others, slots, voices, bible, 3, clips, runner),
                              breeze.plan_takes(bare, slots, voices, bible, 3, clips, runner), runner)
+
+        # The emphasis of line 1 puts its word between asterisks in the text the voice is sent, so that line has
+        # another key, and every other line keeps its own.
+        for runner in ("cpp", "comfyui"):
+            marked = breeze.plan_takes(HARBOUR_SCRIPT, slots, voices, bible, 3, clips, runner)
+            plain = breeze.plan_takes(bare, slots, voices, bible, 3, clips, runner)
+            self.assertEqual([i for i, (a, b) in enumerate(zip(marked, plain)) if a != b], [1], runner)
+            self.assertEqual(marked[1][2], "Mira woke before dawn and found the harbour *empty*.")
+            self.assertNotEqual(marked[1][5], plain[1][5], runner)
+
+
+STORM = ("# Chapter 2: The Storm\n\n"
+         "“I *told* you the tide would turn,” said Mira. “*Now* we *have to* row, and I mean *all of us at once*.”\n\n"
+         "*Shadowchain* snapped across the deck, and the crew called it *the Long Night* ever after.\n\n"
+         "“*Mira* said it would hold. Did *Mira* check? Because *I* did not, and *we’re* done for,” said Tam.\n\n"
+         "*It will not hold.*\n\n"
+         "The rope *held*. The rope held for an hour, and the *far shore* came no nearer. A *lost* line follows.\n")
+STORM_SCRIPT = [
+    {"speaker": "narrator", "text": "Chapter 2. The Storm.", "direction": ""},
+    {"speaker": "mira", "text": "I told you the tide would turn,", "direction": ""},
+    {"speaker": "narrator", "text": "said Mira.", "direction": ""},
+    {"speaker": "mira", "text": "Now we have to row, and I mean all of us at once.", "direction": "shouting"},
+    {"speaker": "narrator", "text": "Shadowchain snapped across the deck, and the crew called it the Long Night ever "
+                                    "after.", "direction": ""},
+    {"speaker": "tam", "text": "Mira said it would hold. Did Mira check? Because I did not, and we’re done for,",
+     "direction": ""},
+    {"speaker": "narrator", "text": "said Tam.", "direction": ""},
+    {"speaker": "tam", "text": "It will not hold.", "direction": "thought"},
+    {"speaker": "narrator", "text": "The rope held. The rope held for an hour, and the far", "direction": ""},
+    {"speaker": "narrator", "text": "shore came no nearer.", "direction": ""}]
+STORM_BIBLE = {"characters": {"mira": {"name": "Mira"}, "tam": {"name": "Tam"}},
+               "pronunciations": {"Shadowchain": {"respelling": "SHAD-oh-chayn"}}}
+
+
+class EmphasisTest(unittest.TestCase):
+    def test_the_authors_italics_for_stress_are_found_in_the_script(self):
+        found = screenplay.italic_emphasis(STORM, STORM_SCRIPT, STORM_BIBLE)
+
+        # A word, a word that opens a sentence, and a phrase of two words are emphasis. A span of over three words
+        # is not.
+        self.assertEqual((found[1], found[3]), (["told"], ["Now", "have to"]))
+
+        # A term of the bible and a title are not, also where the title's first word is in lower case.
+        self.assertNotIn(4, found)
+
+        # A character's name is not, even where it opens a sentence. The pronoun I is, and so is a word with a
+        # curly apostrophe, spelled as the line spells it.
+        self.assertEqual(found[5], ["I", "we’re"])
+
+        # An italic sentence that is a whole line is a thought and not emphasis. A word that stands twice in its
+        # line can't be placed, a span that crosses two lines is not one stress, and a word the script doesn't
+        # have is left out.
+        self.assertEqual(sorted(found), [1, 3, 5])
+
+        # A term of the bible's pronunciations is not emphasis, also in lower case and of several words.
+        bible = {"pronunciations": {"coup de grace": {"respelling": "koo duh GRAHS"}, "manatree": {}}}
+        text = "# 1\n\nHe dealt the *coup de grace* by the old *manatree*, and it was *over*.\n"
+        script = [{"text": "He dealt the coup de grace by the old manatree, and it was over."}]
+        self.assertEqual(screenplay.italic_emphasis(text, script, bible), {0: ["over"]})
+
+        # A chapter without italics has none. One with a stressed word, an italic line and a scene break has the
+        # word alone.
+        self.assertEqual(screenplay.italic_emphasis("# 1\n\nNo stress here.\n", [{"text": "No stress here."}], {}), {})
+        self.assertEqual(screenplay.italic_emphasis(HARBOUR, HARBOUR_BARE, {}), {1: ["empty"]})
+
+    def test_the_marked_words_stand_between_asterisks_where_they_can_be_placed(self):
+        # Each phrase that stands once in the text as whole words gets its asterisks, in the text's order.
+        self.assertEqual(screenplay.emphatic("Now we have to row, and I mean it.", ["have to", "Now"]),
+                         "*Now* we *have to* row, and I mean it.")
+
+        # A phrase the text has twice or not at all, part of a longer word, and one that overlaps an earlier
+        # phrase are left alone, and so is anything that is not a list of phrases.
+        self.assertEqual(screenplay.emphatic("The rope held. The rope held for an hour.", ["held"]),
+                         "The rope held. The rope held for an hour.")
+        self.assertEqual(screenplay.emphatic("He told them, untold times.", ["told", "gone", "told them", ""]),
+                         "He *told* them, untold times.")
+        for wrong in (None, "told", [3, None], {"told": 1}):
+            self.assertEqual(screenplay.emphatic("He told them.", wrong), "He told them.", wrong)
+
+        # A name with a say-as keeps its spoken spelling inside the asterisks, and the line's token map is the one
+        # the line has without the field.
+        bible = {"characters": {}, "pronunciations": {"Eole": {"say": "Ay-ohl"}}}
+        line = {"speaker": "narrator", "text": "Only Eole’s song could wake them.", "direction": ""}
+        text, tokens = breeze.voice_text({**line, "emphasis": ["Eole", "could"]}, bible)
+        self.assertEqual(text, "Only *Ay-ohl*’s song *could* wake them.")
+        self.assertEqual(tokens, breeze.voice_text(line, bible)[1])
+        self.assertEqual([t["name"] for t in tokens if t["name"]], ["Eole", "Eole"])
+        accented = {"characters": {}, "pronunciations": {"Eole": {"say": "Éole"}}}
+        text, tokens = breeze.voice_text({**line, "emphasis": ["Eole"]}, accented)
+        self.assertEqual(text, "Only *Éole*’s song could wake them.")
+        self.assertEqual((tokens, tokens[1]["name"]), (breeze.voice_text(line, accented)[1], "Eole"))
+
+        # An asterisk never lands inside a say-as term of several words, which would stop its spoken spelling, nor
+        # inside a vocal event, which would be read aloud. The whole term can be marked.
+        bible = {"characters": {}, "pronunciations": {"sea wyrm": {"say": "seaworm"}}}
+        line = {"speaker": "narrator", "text": "(sigh) The sea wyrm rose again.", "direction": ""}
+        for stressed, sent in ((["wyrm"], "(sigh) The seaworm rose again."), (["sea"], "(sigh) The seaworm rose again."),
+                               (["sigh"], "(sigh) The seaworm rose again."),
+                               (["sea wyrm", "again"], "(sigh) The *seaworm* rose *again*.")):
+            text, tokens = breeze.voice_text({**line, "emphasis": stressed}, bible)
+            self.assertEqual((text, tokens), (sent, breeze.voice_text(line, bible)[1]), stressed)
+
+    def test_a_script_gets_the_field_once_and_keeps_its_other_fields(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(screenplay.lib, "LIBRARY", Path(tmp)):
+            lib = screenplay.lib
+            lib.save_yaml(lib.serial_dir("storm") / "bible" / "characters.yaml", STORM_BIBLE["characters"])
+            lib.save_yaml(lib.serial_dir("storm") / "bible" / "pronunciations.yaml", STORM_BIBLE["pronunciations"])
+            lib.chapter_dir("storm", 2).mkdir(parents=True)
+            (lib.chapter_dir("storm", 2) / "text.md").write_text(STORM, encoding="utf-8")
+            lib.save_chapter_meta("storm", 2, {"number": 2})
+            path = lib.chapter_dir("storm", 2) / "script.json"
+            marked = [dict(line) for line in STORM_SCRIPT]
+            marked[2] = {**marked[2], "emphasis": ["Mira"], "focus": "Mira"}
+            lib.save_json(path, {"lines": marked, "notes": "n"})
+
+            # The lines with italics for stress get the field, a line that had it without them gets an empty one
+            # and keeps its other fields, and every other line stays as it was.
+            logs: list[str] = []
+            lines = screenplay.write_emphasis("storm", 2, logs.append)
+            saved = lib.load_json(path)
+            self.assertEqual((saved["emphasis"], saved["notes"], saved["lines"]), (screenplay.EMPHASIS_V, "n", lines))
+            self.assertEqual({i: line["emphasis"] for i, line in enumerate(lines) if "emphasis" in line},
+                             {1: ["told"], 2: [], 3: ["Now", "have to"], 5: ["I", "we’re"]})
+            self.assertEqual(lines[2]["focus"], "Mira")
+            self.assertEqual([{k: v for k, v in line.items() if k != "emphasis"} for line in lines],
+                             [{k: v for k, v in line.items() if k != "emphasis"} for line in marked])
+            self.assertEqual(logs, ["chapter 2: 3 of 10 lines have a word the chapter sets in italics for stress"])
+
+            # A script that records the version is left alone, also when its text has other italics by now.
+            (lib.chapter_dir("storm", 2) / "text.md").write_text(STORM.replace("*told*", "told"), encoding="utf-8")
+            before = path.read_bytes()
+            self.assertEqual(screenplay.write_emphasis("storm", 2, logs.append), lines)
+            self.assertEqual((path.read_bytes(), len(logs)), (before, 1))
+
+            # A script from an older version gets the field again from the text as it is: line 1 lost its italics,
+            # so its field is empty and the voice gets its text without asterisks.
+            lib.save_json(path, {**saved, "emphasis": screenplay.EMPHASIS_V - 1})
+            again = screenplay.write_emphasis("storm", 2, logs.append)
+            self.assertEqual((again[1], again[3]["emphasis"]), ({**STORM_SCRIPT[1], "emphasis": []}, ["Now", "have to"]))
+            self.assertEqual(breeze.voice_text(again[1], STORM_BIBLE)[0], "I told you the tide would turn")
+            self.assertEqual(breeze.voice_text(lines[1], STORM_BIBLE)[0], "I *told* you the tide would turn")
+
+            # A file without lines is not a script, and it is left as it was.
+            lib.save_json(path, {"notes": "n"})
+            before = path.read_bytes()
+            with self.assertRaises(KeyError):
+                screenplay.write_emphasis("storm", 2, logs.append)
+            self.assertEqual(path.read_bytes(), before)
 
 
 class AuditScriptsTest(unittest.TestCase):

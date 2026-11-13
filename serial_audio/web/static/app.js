@@ -1399,8 +1399,10 @@ function nameOptions(t, slug, busy, screens) {
     const use = isCurrent ? `<span class="small muted nowrap">in use</span>`
       : c.offered ? `<button class="sm" data-act="name-use" data-term="${esc(t.term)}" data-say="${esc(c.say)}">Use this</button>`
         : `<span class="small muted nowrap">not steady</span>`;
-    const screened = !c.steady ? ""
-      : `<div class="tr">${c.steady[0]} of ${c.steady[1]} takes say it without an added sound${c.typical ? "" : ", and this clip is not one of them"}</div>`;
+    const screened = (!c.steady ? ""
+      : `<div class="tr">${c.steady[0]} of ${c.steady[1]} takes say it without an added sound${c.typical ? "" : ", and this clip is not one of them"}</div>`)
+      + (isCurrent && t.held && t.adds && t.adds[1]
+        ? `<div class="tr${t.unsteady ? " off" : ""}">In the chapters, ${t.adds[1] - t.adds[0]} of ${t.adds[1]} takes say it without an added sound</div>` : "");
     return `<div class="cand${isCurrent ? " chosen" : ""}">
       ${c.media ? playBtn(c.media.url, `${t.term} as ${c.say}`) : `<span class="small muted">no clip</span>`}
       <div><div>${esc(c.say)}${c.say === t.term ? " · as written" : ""}</div>
@@ -1424,9 +1426,14 @@ function namesTab(nm, sd, slug) {
     const top = t.top.map(([s, n]) => `${esc(s)} <span class="muted">${n}</span>`).join(" · ");
     const w = t.ways;
     const sounds = w ? w.ways.map(([s, n]) => `<span class="mono">${esc(s)}</span> <span class="muted">${n}</span>`).join(" · ") : "";
-    const found = (t.findings || []).map((f) => `chapter ${f.chapter} (${f.takes} of ${f.of})`).join(", ");
     const adds = t.held && t.adds && t.adds[1] ? t.adds : null;
-    const waiting = nm.chapters.with.length - (nm.chapters.judged || []).length;
+    const unsteady = Boolean(adds && t.unsteady);
+    const tenths = adds ? Math.round(10 * adds[0] / adds[1]) : 0;
+    const share = !adds ? "" : adds[0] === adds[1] ? "every one of them" : tenths > 9 ? "nearly all of them" : `about ${tenths} in 10`;
+    const warn = unsteady
+      ? `The voice adds a sound to this spelling in ${adds[0]} of the ${adds[1]} takes that say it, ${share}, so the spelling is the likely fault. A render takes such a take again, up to twice, and at this rate some stay. Try other spellings, and listen to the one you pick: its count says how steadily it is said, not that it is said right.`
+      : "";
+    const waiting = t.held ? t.waiting || 0 : 0;
     const said = saving.has(t.term) ? `<span class="small muted nowrap">saving…</span>`
       : (working.has(t.term) ? "" : `<button class="sm" data-act="name-hear" data-term="${esc(t.term)}" title="Add this spelling to the options and have the voice say it">Hear it</button>`)
         + `<button class="sm" data-act="name-say" data-term="${esc(t.term)}" title="Use this spelling from the next render on">Save</button>`
@@ -1436,10 +1443,10 @@ function namesTab(nm, sd, slug) {
         ${w ? `<span class="tag">${plural(w.count, "way")}</span>` : t.spellings ? `<span class="tag">${plural(t.spellings, "spelling")}</span>` : ""}
         <span class="small muted hide-sm">${adds ? `${adds[0]} of ${adds[1]} takes add a sound` : w ? `${w.usual} of ${w.said} takes sound alike to the check` : t.heard ? `heard ${t.heard} times, ${t.as_written} as sent` : "not heard yet"}</span>
         <span class="grow"></span>
-        ${t.say ? `<span class="pill approved">${esc(t.say)}</span>` : t.options ? `<span class="pill auto">options</span>` : ""}
+        ${t.say ? `<span class="pill ${unsteady ? "review" : "approved"}">${esc(t.say)}${unsteady ? " · unsteady" : ""}</span>` : t.options ? `<span class="pill auto">options</span>` : ""}
       </summary>
       <div class="body">
-        ${found ? `<div class="notice warn small">So many takes add a sound to this spelling that a render did not take them again for it: ${esc(found)}. Screen the options, and pick a spelling that comes out clean.</div>` : ""}
+        ${warn ? `<div class="notice warn small">${warn}</div>` : ""}
         ${w ? `<div class="small"><b>Said as.</b> ${sounds}${w.count > w.ways.length ? ` · and ${w.count - w.ways.length} more` : ""}</div>` : ""}
         ${t.heard ? `<div class="small"><b>Written as.</b> ${top}${t.spellings > t.top.length ? ` · and ${t.spellings - t.top.length} more` : ""}</div>` : ""}
         ${t.held ? `<div class="small muted">The take check holds every take of this name to its spelling. A take in which both recognizers hear a sound the spelling doesn't have, such as an added syllable, is taken again by a render.${adds ? ` ${adds[0]} of ${adds[1]} takes add one` : " No take has been judged by this rule yet"}${waiting > 0 ? `, and ${plural(waiting, "chapter")} ${waiting === 1 ? "is" : "are"} still to be judged by it.` : "."}</div>` : ""}

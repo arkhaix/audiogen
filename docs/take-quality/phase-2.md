@@ -54,6 +54,7 @@ Do P0 first and wait for AJ. Then P1, P2 and P3 can run side by side. P4 comes a
 * Respell the rarer sense for that line only, in `voice_text()`. This changes the key of those lines, so count them before the deploy.
 * Check the take between the two known readings with the phoneme recognizer.
 * Nobody has measured how often Breeze misreads a heteronym. Measure that first, and stop here if it is rare.
+* Measured on 2026-11-13, and it is rare, so P5 stopped there and nothing was built (`DECISIONS.md`, "A heteronym gets no respelling and no check"). Of 253 sayings in The Hundred Reigns that the audio could judge, 249 have the reading their line means and 4 are doubtful. The measurement also found that ZIPA writes one reading of a spelling whatever the take says, so the check of the third point can't use its phones. The pass of the first point was not added. The package of phase 3 that first reads a mark adds its job.
 
 ## The end of the phase
 

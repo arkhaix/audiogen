@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import random
 import struct
 import subprocess
 import sys
@@ -12,10 +13,11 @@ import tempfile
 import unittest
 import wave
 from contextlib import redirect_stdout
+from fractions import Fraction
 from pathlib import Path
 from unittest import mock
 
-from serial_audio import asr, breeze, machine, parakeet_asr, phones, takecheck
+from serial_audio import asr, breeze, machine, parakeet_asr, phones, screenplay, takecheck
 from serial_audio import library as lib
 from serial_audio.asr import words
 from serial_audio.comfy import ComfyError
@@ -208,6 +210,30 @@ class VoiceTextTest(unittest.TestCase):
         self.assertEqual(breeze.voice_text({"text": "Nobody answered."}, {})[1],
                          [{"w": "nobody", "name": "", "after": ""}, {"w": "answered", "name": "", "after": "."}])
 
+    def test_the_names_are_those_of_the_bible_as_it_is_at_each_call(self):
+        def mapped(bible: dict) -> tuple[str, list[tuple[str, str]]]:
+            text, tokens = breeze.voice_text({"text": "Eole met Simon."}, bible)
+            return text, [(t["w"], t["name"]) for t in tokens]
+
+        # A say-as that is set, changed or cleared in the same bible shows in the next line's text and names.
+        bible = {"characters": {}, "pronunciations": {"Eole": {"note": "a siren"}}}
+        self.assertEqual(mapped(bible), ("Eole met Simon.", [("eole", "Eole"), ("met", ""), ("simon", "")]))
+        bible["pronunciations"]["Eole"]["say"] = "Eh-ole"
+        self.assertEqual(mapped(bible), ("Eh-ole met Simon.", [("eh", "Eole"), ("ole", "Eole"), ("met", ""), ("simon", "")]))
+        bible["pronunciations"]["Eole"]["say"] = "Ay-ole"
+        self.assertEqual(mapped(bible)[1][:2], [("ay", "Eole"), ("ole", "Eole")])
+        del bible["pronunciations"]["Eole"]["say"]
+        self.assertEqual(mapped(bible)[1][0], ("eole", "Eole"))
+        # So does a character who is added, and a term that is taken out.
+        bible["characters"]["simon"] = {"name": "Simon"}
+        self.assertEqual(mapped(bible)[1], [("eole", "Eole"), ("met", ""), ("simon", "Simon")])
+        del bible["pronunciations"]["Eole"]
+        self.assertEqual(mapped(bible)[1], [("eole", ""), ("met", ""), ("simon", "Simon")])
+
+        # A say-as that is not text leaves a line without its term as it is.
+        odd = {"pronunciations": {"Vouivre": {"say": ["Vweevra"]}}}
+        self.assertEqual(mapped(odd), ("Eole met Simon.", [("eole", ""), ("met", ""), ("simon", "")]))
+
 
 class GapTest(unittest.TestCase):
     def gap(self, text: str, then: str | None = "Nobody answered.", speakers=("narrator", "narrator")) -> float:
@@ -350,6 +376,29 @@ def heard_file_text(files, *, engine, comfy_url):
         yield i, record(text.removeprefix("#clipped "), clip_run=40 if text.startswith("#clipped ") else 0)
 
 
+def every_cell(ref: list[str], hyp: list[str]) -> list[tuple]:
+    """The steps takecheck.align has to give, from the costs of every pair of a line's word and a heard word."""
+    rows = [[((j, 0, 0, j, 0.0), "ins") for j in range(len(hyp) + 1)]]
+    for i in range(1, len(ref) + 1):
+        row = [((i, 0, i, 0, 0.0), "del")]
+        for j in range(1, len(hyp) + 1):
+            if ref[i - 1] == hyp[j - 1]:
+                row.append((rows[i - 1][j - 1][0], "="))
+                continue
+            s, d, n = rows[i - 1][j - 1][0], rows[i - 1][j][0], row[j - 1][0]
+            apart = takecheck.spelling_distance(ref[i - 1], hyp[j - 1])
+            row.append(min(((s[0] + 1, s[1] + 1, s[2], s[3], s[4] + apart), "sub"),
+                           ((d[0] + 1, d[1], d[2] + 1, d[3], d[4]), "del"),
+                           ((n[0] + 1, n[1], n[2], n[3] + 1, n[4]), "ins")))
+        rows.append(row)
+    out, i, j = [], len(ref), len(hyp)
+    while i or j:
+        kind = rows[i][j][1]
+        i, j = i - (kind != "ins"), j - (kind != "del")
+        out.append((kind, None if kind == "ins" else i, None if kind == "del" else j))
+    return out[::-1]
+
+
 class JudgeTest(unittest.TestCase):
     def tokens(self, text: str) -> list[dict]:
         return breeze.voice_text({"text": text}, {})[1]
@@ -404,6 +453,27 @@ class JudgeTest(unittest.TestCase):
         self.assertEqual(steps, [("del", 0, None), ("sub", 1, 0), ("sub", 2, 1)])
         self.assertEqual(takecheck.align([], ["a"]), [("ins", None, 0)])
         self.assertEqual(takecheck.align(["a"], []), [("del", 0, None)])
+
+    def test_the_alignment_is_the_same_however_few_edits_it_first_looks_for(self):
+        # Lines of a few similar words, heard with up to four slips or as other words altogether, so that many
+        # alignments have the same number of edits.
+        rng = random.Random(7)
+        vocab = "a b ab ba abc the then them cat cot coat x".split()
+        pairs = []
+        for _ in range(600):
+            ref = [rng.choice(vocab) for _ in range(rng.randrange(14))]
+            hyp = list(ref) if rng.random() < 0.6 else [rng.choice(vocab) for _ in range(rng.randrange(14))]
+            for _ in range(rng.randrange(5)):
+                at = rng.randrange(len(hyp) + 1)
+                hyp[at:at + rng.randrange(2)] = [rng.choice(vocab)] * rng.randrange(2)
+            pairs.append((ref, hyp, every_cell(ref, hyp)))
+        self.assertGreater(max(sum(kind != "=" for kind, _, _ in steps) for _, _, steps in pairs), 9)
+
+        # Whatever ALIGN_BAND is, the steps are those that the costs of every pair of words give.
+        for band in (0, 2, 9):
+            with mock.patch.object(takecheck, "ALIGN_BAND", band):
+                for ref, hyp, steps in pairs:
+                    self.assertEqual(takecheck.align(ref, hyp), steps, (band, ref, hyp))
 
     def test_a_name_stands_for_the_way_it_was_heard(self):
         # The recognizer spells an invented name its own way, in one word or in two. Neither counts as a wrong
@@ -1324,6 +1394,46 @@ class RenderFlaggedTest(unittest.TestCase):
         record = breeze.render_breeze("s", 1, seed=1, comfy_url="", log=self.logs.append)
         self.assertEqual((len(self.asked), record["seed"], record["generated_takes"]), (2, 1, 2))
 
+    def test_a_render_gives_the_script_its_emphasis_and_makes_those_lines_again(self):
+        # The chapter's text sets a word of line 0 in italics, and the script doesn't have the field yet.
+        (self.chapter / "text.md").write_text("The harbour was *quiet* that morning.\n\nNobody answered the door.\n",
+                                              encoding="utf-8")
+        before = (self.chapter / "script.json").read_bytes()
+
+        # The list of what a render would change counts line 0 as a take to make, and writes nothing.
+        self.assertEqual({k: v for k, v in breeze.render_changes("s", 1).items() if k in ("make", "retake")},
+                         {"make": 1, "retake": 1})
+        self.assertEqual((self.chapter / "script.json").read_bytes(), before)
+
+        # A join-only run joins the takes the chapter has and leaves the script as their keys were made from it.
+        self.render(join_only=True)
+        self.assertEqual((self.asked, (self.chapter / "script.json").read_bytes()), ([], before))
+
+        # A render writes the field, sends line 0 to the voice with its word between asterisks, and saves the take
+        # under the key of that text. It also takes flagged line 1 again, as any render does.
+        sent: list[str] = []
+        real = breeze.CppServer.take
+
+        def take(server, fields, wav, label, log):
+            sent.append(fields["text"])
+            return real(server, fields, wav, label, log)
+
+        with mock.patch.object(breeze.CppServer, "take", take):
+            self.render()
+        script = lib.load_json(self.chapter / "script.json")
+        self.assertEqual((script["emphasis"], script["lines"][0]["emphasis"]), (screenplay.EMPHASIS_V, ["quiet"]))
+        self.assertNotIn("emphasis", script["lines"][1])
+        self.assertEqual(sent, ["The harbour was *quiet* that morning.", "Nobody answered the door."])
+        plan = breeze.plan_takes(script["lines"], {"narrator": 0}, {0: "narrator"}, {}, 1,
+                                 {"narrator": hashlib.sha1(b"clip").hexdigest()}, "cpp")
+        self.assertEqual((self.take(0)["key"], self.verdict(0)), (plan[0][5], "ok"))
+
+        # Nothing is left to make, and a second render asks the voice for nothing.
+        self.assertEqual({k: v for k, v in breeze.render_changes("s", 1).items() if k in ("make", "retake")},
+                         {"make": 0, "retake": 0})
+        self.render()
+        self.assertEqual(self.asked, [])
+
     def check_file(self) -> dict:
         return lib.load_json(self.chapter / takecheck.CHECK_FILE)
 
@@ -1776,7 +1886,8 @@ class NamesHeardTest(unittest.TestCase):
         self.assertEqual(eole["ways"], {"said": 6, "usual": 3, "count": 3,
                                         "ways": [["eɪoʊl", 3], ["kæzvɔl", 2], ["hɛli", 1]]})
         self.assertNotIn("ways", lauriane)
-        self.assertEqual(eole["findings"], [{"chapter": 1, "takes": 3, "of": 6}])
+        # The name finding in a render record is not shown.
+        self.assertNotIn("findings", eole)
 
         # A name with a say-as is held to its spelling, and the usual saying of the spelling leads the ways.
         bible = lib.load_bible("s")
@@ -1787,7 +1898,8 @@ class NamesHeardTest(unittest.TestCase):
         self.assertEqual((eole["held"], eole["ways"]["usual"], eole["ways"]["ways"][0]), (True, 2, ["kæzvɔl", 2]))
 
         # The takes that add a sound to the spelling are counted over the chapters whose check was judged by the
-        # rules and the spellings as they are now. This chapter's was not, so it counts for nothing yet.
+        # rules as they are now, with the name's spelling as it is now. This chapter's was not, so it counts for
+        # nothing yet.
         self.assertEqual((eole["adds"], got["chapters"]["judged"]), ([0, 0], []))
         check = lib.load_json(one / takecheck.CHECK_FILE)
         check.update(rules=takecheck.JUDGE_V, names=takecheck.picked_spellings(bible))
@@ -1798,6 +1910,30 @@ class NamesHeardTest(unittest.TestCase):
         self.assertEqual((got["terms"][0]["term"], got["terms"][0]["adds"], got["chapters"]["judged"]),
                          ("Eole", [4, 6], [1]))
         self.assertEqual(got["terms"][1]["adds"], [0, 0])
+        # A spelling is unsteady when its takes that add a sound are BREAKER_MIN or more and over BREAKER_SHARE
+        # of the takes that say it.
+        self.assertEqual([t["unsteady"] for t in got["terms"]], [True, False])
+        for limit, value in (("BREAKER_MIN", 5), ("BREAKER_SHARE", Fraction(4, 6))):
+            with mock.patch.object(takecheck, limit, value):
+                self.assertFalse(views.names_heard("s")["terms"][0]["unsteady"], limit)
+        # A name's count waits for the chapters that say it whose check was not judged with its spelling. The
+        # one take of Lauriane has no phones, so its chapter still waits for it.
+        self.assertEqual([t["waiting"] for t in got["terms"]], [0, 1])
+
+        # A new spelling for another name leaves this name's count, though the chapter's check is no longer
+        # current. A new spelling for this name puts its chapter back to waiting.
+        other = lib.load_bible("s")
+        other["pronunciations"]["Lauriane"]["say"] = "Lorry Ann"
+        lib.save_bible("s", other)
+        got = views.names_heard("s")
+        eole = got["terms"][0]
+        self.assertEqual((eole["adds"], eole["unsteady"], eole["waiting"], got["chapters"]["judged"]),
+                         ([4, 6], True, 0, []))
+        other["pronunciations"]["Eole"]["say"] = "Kazvol"
+        lib.save_bible("s", other)
+        eole = next(t for t in views.names_heard("s")["terms"] if t["term"] == "Eole")
+        self.assertEqual((eole["adds"], eole["unsteady"], eole["waiting"]), ([0, 0], False, 1))
+        lib.save_bible("s", bible)
 
         # A candidate that was screened shows its count, and one that is not steady is not offered. A count from
         # an older screen is not shown, and its candidate is offered as an unscreened one is. So is the name as
@@ -1822,6 +1958,7 @@ class NamesHeardTest(unittest.TestCase):
             eole = got["terms"][0]
             self.assertEqual((got["screens"], eole["held"], eole["ways"]["ways"][0]), (False, False, ["kæzvɔl", 2]))
             self.assertNotIn("adds", eole)
+            self.assertNotIn("unsteady", eole)
             self.assertEqual([(c["steady"], c["offered"]) for c in eole["options"]["candidates"]], [(None, True)] * 4)
 
 
@@ -2311,6 +2448,10 @@ def name_heard(name: str) -> str:
     return f"Tell {NAME_HEARD.get(name, 'Aol')} to wait."
 
 
+# one saying AJ marked on a listening page per line, with what the name rule reads of it
+MARKS = Path(__file__).parent / "data" / "name_marks.jsonl"
+
+
 class PhonesTest(unittest.TestCase):
     def test_a_window_holds_a_reference_whatever_stands_around_it(self):
         # The reference as a part of the window is no distance, whatever is before and after it.
@@ -2411,6 +2552,30 @@ class PhonesTest(unittest.TestCase):
         for case in (("eh ole", "aol", "", "to", ""), ("eh ole", "", "eɪoʊl", "to", ""), ("", "aol", "eɪoʊl", "to", "")):
             self.assertEqual(adds(*case), [], case)
 
+    def test_the_rule_is_scored_on_the_sayings_aj_marked(self):
+        # A record's mark is y for a name he hears as picked, n for one he hears another way, and u for one he
+        # couldn't judge. Its phones are those within half a second of the saying's span, t0 to t1.
+        marks = [json.loads(raw) for raw in MARKS.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([sum(1 for m in marks if m["mark"] == mark) for mark in "ynu"], [95, 72, 2])
+        self.assertTrue(all(len(m["phones"]) == len(m["starts"]) for m in marks))
+
+        def flagged(m: dict) -> bool:
+            near = "".join(p for p, s in zip(m["phones"], m["starts"])
+                           if m["t0"] - takecheck.NAME_NEAR <= s < m["t1"] + takecheck.NAME_NEAR)
+            return bool(phones.adds(m["said"], m["heard"], near, m["after"], m["before"]))
+
+        # The rule agrees with him on 129 of the 167 he judged. It flags two sayings he hears as picked, and it
+        # passes 36 he hears another way, each named by its page and clip. On pages 1 and 2 those are nine.
+        apart = {mark: [f'{m["page"]}.{m["clip"]}' for m in marks if m["mark"] == mark and flagged(m) != (mark == "n")]
+                 for mark in "ny"}
+        self.assertEqual(apart["y"], ["2.E04", "2.V11"])
+        self.assertEqual(apart["n"][:9], ["1.E02", "2.E03", "2.E09", "2.E35", "2.V02", "2.V03", "2.V05", "2.V08", "2.V09"])
+        # Of the others, 26 are every take of "Ay-ohl" on page 3 that he rejected. They add no sound and say the
+        # name with the first vowel of "eye", which the rule doesn't hear. The last is the one take of "Éole" he
+        # rejected on page 5, of 30 the rule passes.
+        eye = [1, 2, 3, 5, 6, 7, 8, 9, 10, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30]
+        self.assertEqual(apart["n"][9:], [f"3.E{n:02d}" for n in eye] + ["5.E17"])
+
     def test_the_child_gives_a_takes_phones_as_one_string_with_their_seconds(self):
         # sherpa-onnx times ZIPA's tokens at twice their seconds. The word boundary and a token that is not one
         # symbol are left out with their times.
@@ -2505,16 +2670,17 @@ class NameTest(unittest.TestCase):
             self.assertIsNone(takecheck.badness(wrong)[2])
             self.assertFalse(takecheck.better(self.judge("eɪoʊl"), wrong))
 
-    def test_a_name_that_many_takes_miss_is_a_name_finding(self):
-        def entry(missed: bool) -> dict:
-            return {"verdict": "flagged" if missed else "ok", "reasons": ["name"] if missed else [],
-                    "said": {"Eole": [["x", "x"]]}, "missed": ["Eole"] if missed else []}
+    def test_a_name_that_many_takes_miss_is_no_finding(self):
+        def entry(missed: bool, reason: str) -> dict:
+            return {"verdict": "flagged" if missed else "ok", "reasons": [reason] if missed else [],
+                    "said": {"Eole": [["x", "x"]]}, "missed": ["Eole"] if missed and reason == "name" else []}
 
-        self.assertEqual(takecheck.name_findings({str(i): entry(i < 4) for i in range(12)}),
-                         [{"term": "Eole", "lines": [0, 1, 2, 3], "of": 12}])
-        # Fewer than BREAKER_MIN takes, or a quarter or less of the takes that say the name, is not a finding.
-        self.assertEqual(takecheck.name_findings({str(i): entry(i < 3) for i in range(6)}), [])
-        self.assertEqual(takecheck.name_findings({str(i): entry(i < 4) for i in range(16)}), [])
+        # Four takes of a voice's twelve that add a sound to a name are over the breaker's limits, and they give
+        # no finding, so a render takes each of them again. Another reason at the same count is a voice finding.
+        takes = {str(i): {"voice": "narrator"} for i in range(12)}
+        self.assertEqual(takecheck.voice_findings({k: entry(int(k) < 4, "name") for k in takes}, takes), [])
+        self.assertEqual(takecheck.voice_findings({k: entry(int(k) < 4, "clipped") for k in takes}, takes),
+                         [{"voice": "narrator", "reason": "clipped", "lines": [0, 1, 2, 3], "of": 12}])
 
 
 class NameRetakeTest(unittest.TestCase):
@@ -2530,8 +2696,9 @@ class NameRetakeTest(unittest.TestCase):
 
         def hears(files, *, engine, comfy_url, blocks=("asr", "signal")):
             for i, f in enumerate(files):
-                name = Path(f).read_text(encoding="utf-8")
-                yield i, {**record(name_heard(name)), "phone": name_phones(name)}
+                text = Path(f).read_text(encoding="utf-8")
+                name = text.removeprefix("#clipped ")
+                yield i, {**record(name_heard(name), clip_run=40 if text != name else 0), "phone": name_phones(name)}
 
         for p in (mock.patch.object(takecheck, "records", hears),
                   mock.patch.object(takecheck, "NAME_FLAGS", True),
@@ -2563,24 +2730,42 @@ class NameRetakeTest(unittest.TestCase):
         # One take of six adds a sound to the name. It alone is taken again, and its new take is kept.
         saved = self.takes(["eɪoʊl", "eɪɔl", "jol", "eɪoʊl", "eɪjoʊl", "eɪoʊl"])
         got = self.retake(saved)
-        self.assertEqual((got["replaced"], got["names"], self.asked), ([2], [], [("2", 1)]))
+        self.assertEqual((got["replaced"], self.asked), ([2], [("2", 1)]))
         self.assertEqual(Path(saved["2"]["file"]).read_text(encoding="utf-8"), "eɪoʊl")
         self.assertEqual([saved[k]["audio"] for k in saved], ["a0", "a1", "b2", "a3", "a4", "a5"])
         checked = lib.load_json(self.folder / takecheck.CHECK_FILE)["takes"]
         self.assertEqual({k: e["verdict"] for k, e in checked.items()}, {str(i): "ok" for i in range(6)})
         self.assertEqual(checked["2"]["phone"], name_phones("eɪoʊl"))
 
-    def test_a_name_most_takes_miss_is_reported_and_not_taken_again(self):
-        # Four of six takes add a sound to the name, so the cause is the spelling. No line is taken again, each
-        # take records that it is held, and the render gets the finding.
+    def test_a_name_most_takes_miss_is_taken_again_all_the_same(self):
+        # Four of six takes add a sound to the name, all in one voice. Each of the four is taken again and its
+        # new take is kept. No take is held, and the render gets no finding for the name.
         saved = self.takes(["jol", "jol", "ɪtɔl", "jol", "eɪoʊl", "eɪoʊl"])
         got = self.retake(saved)
-        self.assertEqual((got["replaced"], self.asked), ([], []))
-        self.assertEqual(got["names"], [{"term": "Eole", "lines": [0, 1, 2, 3], "of": 6}])
-        self.assertEqual([saved[k].get("retake_held") for k in saved], [["name"]] * 4 + [None, None])
-        self.assertTrue(any("name finding" in line and "Eole" in line for line in self.logs), self.logs)
-        # A later render leaves the held takes alone.
+        self.assertEqual((got["replaced"], self.asked), ([0, 1, 2, 3], [("0", 1), ("1", 1), ("2", 1), ("3", 1)]))
+        self.assertEqual((got["findings"], "names" in got), ([], False))
+        self.assertEqual([saved[k].get("retake_held") for k in saved], [None] * 6)
+        self.assertFalse(any("finding" in line for line in self.logs), self.logs)
+        self.assertEqual([saved[k]["audio"] for k in saved], ["b0", "b1", "b2", "b3", "a4", "a5"])
+        # A later render finds nothing flagged.
         self.assertEqual(breeze.flagged_before(self.folder, saved), set())
+
+    def test_a_take_flagged_for_a_name_alone_is_the_last_under_the_ceiling(self):
+        # Three takes add a sound to the name, and a fourth is clipped. A file that starts with "#clipped " is a
+        # take with a long run of full-scale samples. With two retakes to spend, the clipped take and the first
+        # of the three are taken again, and the other two are left for a later render.
+        saved = self.takes(["jol", "jol", "jol", "#clipped eɪoʊl"])
+        with mock.patch.object(breeze, "RETAKE_FLOOR", 2), mock.patch.object(breeze, "RETAKE_SHARE", 0.0):
+            got = self.retake(saved)
+        self.assertEqual((got["replaced"], self.asked, got["left"]), ([0, 3], [("0", 1), ("3", 1)], [1, 2]))
+
+    def test_a_hold_does_not_cover_a_name(self):
+        # A take whose retake_held names the reason "name" counts as flagged, so a render takes it again.
+        saved = self.takes(["jol", "eɪoʊl"])
+        breeze.retake_flagged(self.folder, [NAME_LINE] * 2, NAME_BIBLE, saved, list(saved), None, comfy_url="",
+                              log=self.logs.append, save=lambda: None, rounds=0)
+        saved["0"]["retake_held"] = ["name"]
+        self.assertEqual(breeze.flagged_before(self.folder, saved), {"0"})
 
     def test_a_spelling_that_comes_after_the_check_gets_the_saved_takes_judged_again(self):
         # The chapter is checked while the name is not held to a spelling, so no take is flagged for it.

@@ -22,6 +22,13 @@ ITALIC_RE = re.compile(r"(?<![\w*])\*[^\s*](?:[^*]*[^\s*])?\*(?![\w*])")
 MAX_DROPPED_RUN = 4
 MAX_ADDED_RUN = 4
 QUOTE_WORDS = 4
+# the version of italic_emphasis, which a script records as "emphasis" once its lines have the field from it
+EMPHASIS_V = 1
+MAX_EMPHASIS_WORDS = 3
+EMPHASIS_PHRASE = re.compile(r"[^\W_]+(?:['’-][^\W_]+)*(?: [^\W_]+(?:['’-][^\W_]+)*)*")
+FIRST_PERSON = re.compile(r"I(?:['’][^\W_]+)?")
+SENTENCE_OPENS = ".!?:" + chr(0x2026)
+QUOTES = "\"'()" + chr(0x201C) + chr(0x201D) + chr(0x2018) + chr(0x2019)
 
 
 def cast_list(bible: dict, present: list[str] | None) -> str:
@@ -137,6 +144,175 @@ def _occurs(phrase: str, text: str) -> bool:
     return bool(phrase) and re.search(rf"(?<!\w){re.escape(phrase)}(?!\w)", fold(text)) is not None
 
 
+def emphasis_spans(text: str, phrases) -> list[tuple[int, int]]:
+    """Where a line's emphasized words stand in its text.
+
+    text: the line's text.
+    phrases: the line's `emphasis`. Anything that is not a list gives no span, and so does an entry of it that
+        is not a string.
+    Returns (start, end) for each phrase that stands in text exactly once as whole words, in the text's order. Of
+    two that overlap, the earlier one stays.
+    """
+    found = []
+    for phrase in phrases if isinstance(phrases, list) else []:
+        if not isinstance(phrase, str) or not phrase.strip():
+            continue
+        hits = list(re.finditer(rf"(?<![\w*]){re.escape(phrase)}(?![\w*])", text))
+        if len(hits) == 1:
+            found.append(hits[0].span())
+    out: list[tuple[int, int]] = []
+    for start, end in sorted(set(found)):
+        if not out or start >= out[-1][1]:
+            out.append((start, end))
+    return out
+
+
+def emphatic(text: str, phrases, whole=()) -> str:
+    """text with an asterisk on either side of each emphasized word or phrase that emphasis_spans places.
+
+    text: the line's text.
+    phrases: the line's `emphasis`.
+    whole: (start, end) for each part of text that has to stay in one piece. A phrase that would put an asterisk
+        inside one is left as it is.
+    """
+    for start, end in reversed(emphasis_spans(text, phrases)):
+        if any(a < at < b for a, b in whole for at in (start, end)):
+            continue
+        text = f"{text[:start]}*{text[start:end]}*{text[end:]}"
+    return text
+
+
+def _names(bible: dict) -> set[str]:
+    """The capitalized words of the bible's terms and of its characters' names and aliases, in lower case."""
+    found = [str(term) for term in bible.get("pronunciations") or {}]
+    for character in (bible.get("characters") or {}).values():
+        record = character if isinstance(character, dict) else {}
+        found += [str(record.get("name") or "")] + [str(a) for a in record.get("aliases") or []]
+    return {m.group(0).lower() for text in found for m in COMPARE_WORD.finditer(text) if m.group(0)[0].isupper()}
+
+
+def italic_emphasis(text: str, lines: list[dict], bible: dict) -> dict[int, list[str]]:
+    """The words of each script line that the chapter's text sets in italics for stress.
+
+    text: the chapter's text.md, where italics stand between asterisks.
+    lines: the script lines.
+    bible: the serial's bible.
+    Returns {line: [phrase, ...]} for the lines that have any, each phrase as the line's text spells it and in the
+    line's order. An italic span counts when it has one to MAX_EMPHASIS_WORDS words with nothing but spaces
+    between them, all of them in one line, is not the whole line, and stands in the line's text exactly once. A
+    span that holds a term of the bible's pronunciations doesn't count. Nor does a span with a capitalized word,
+    unless the word is its first, opens a sentence and is not a word of a term or of a character's name. The
+    pronoun I counts anywhere. A word that a line spells with a combining accent is not found.
+    """
+    body = unicodedata.normalize("NFC", text.partition("\n")[2] if text.startswith("#") else text)
+    spans = [m.span() for m in ITALIC_RE.finditer(body)]
+    if not spans:
+        return {}
+
+    # The words of the chapter with the italic span each is in, and the words of the script with their places
+    chapter: list[tuple[str, int | None]] = []
+    at = 0
+    for m in COMPARE_WORD.finditer(body):
+        while at < len(spans) and spans[at][1] <= m.start():
+            at += 1
+        inside = at if at < len(spans) and spans[at][0] <= m.start() else None
+        chapter.append((m.group(0).lower().replace("’", "'"), inside))
+    script: list[tuple[str, int, int, int]] = []
+    for i, line in enumerate(lines):
+        script += [(m.group(0).lower().replace("’", "'"), i, m.start(), m.end())
+                   for m in COMPARE_WORD.finditer(str(line.get("text") or ""))]
+    matcher = difflib.SequenceMatcher(None, [k for k, _ in chapter], [k for k, _, _, _ in script], autojunk=False)
+    placed: dict[int, list[int]] = {}
+    count: dict[int, int] = {}
+    for _, inside in chapter:
+        if inside is not None:
+            count[inside] = count.get(inside, 0) + 1
+    for tag, i1, i2, j1, _ in matcher.get_opcodes():
+        if tag == "equal":
+            for d in range(i2 - i1):
+                if chapter[i1 + d][1] is not None:
+                    placed.setdefault(chapter[i1 + d][1], []).append(j1 + d)
+
+    # The spans that are emphasis
+    names = _names(bible)
+    terms = [str(term).lower().replace("’", "'") for term in bible.get("pronunciations") or {} if str(term).strip()]
+    words_of = {}
+    for _, i, _, _ in script:
+        words_of[i] = words_of.get(i, 0) + 1
+    out: dict[int, list[str]] = {}
+    for span in sorted(placed):
+        found = placed[span]
+        if len(found) != count[span] or not 1 <= len(found) <= MAX_EMPHASIS_WORDS:
+            continue
+        i = script[found[0]][1]
+        if found != list(range(found[0], found[0] + len(found))) or script[found[-1]][1] != i:
+            continue
+        if len(found) == words_of[i]:
+            continue
+        said = str(lines[i].get("text") or "")
+        start, end = script[found[0]][2], script[found[-1]][3]
+        phrase = said[start:end]
+        if not EMPHASIS_PHRASE.fullmatch(phrase) or emphasis_spans(said, [phrase]) != [(start, end)]:
+            continue
+        plain = phrase.lower().replace("’", "'")
+        if any(re.search(rf"(?<!\w){re.escape(term)}(?!\w)", plain) for term in terms):
+            continue
+        words = phrase.split(" ")
+        before = said[:start].rstrip(" " + QUOTES)
+        opens = not before or before[-1] in SENTENCE_OPENS
+        if any(w[0].isupper() and not FIRST_PERSON.fullmatch(w)
+               and (n or not opens or w.lower().replace("’", "'") in names) for n, w in enumerate(words)):
+            continue
+        if phrase not in out.setdefault(i, []):
+            out[i].append(phrase)
+    return {i: found for i, found in out.items() if found}
+
+
+def emphasized(script: dict, text: str, bible: dict) -> tuple[list[dict], bool]:
+    """A script's lines with the `emphasis` that EMPHASIS_V gives them.
+
+    script: the content of a script.json.
+    text: the chapter's text.md.
+    bible: the serial's bible.
+    Returns (lines, changed). A script that records EMPHASIS_V gives its lines as they are and False. Any other
+    gives a copy of each line and True: a line with italics for stress gets them as `emphasis`, a line without
+    gets an empty one when it had the field, and stays without the field when it didn't. Raises KeyError for a
+    script without lines.
+    """
+    lines = script["lines"]
+    if script.get("emphasis") == EMPHASIS_V:
+        return lines, False
+    found = italic_emphasis(text, lines, bible)
+    out = []
+    for i, line in enumerate(lines):
+        new = {k: v for k, v in line.items() if k != "emphasis"}
+        if i in found or "emphasis" in line:
+            new["emphasis"] = found.get(i, [])
+        out.append(new)
+    return out, True
+
+
+def write_emphasis(slug: str, number: int, log=print) -> list[dict]:
+    """Gives a chapter's script the `emphasis` of EMPHASIS_V, and returns its lines.
+
+    slug, number: the chapter. It has to have a script.
+    log: receives one line when the script is written.
+    A script that records EMPHASIS_V is left alone. Any other is saved with the field and the version, and each
+    line's speaker, text and direction stay as they are. A line whose `emphasis` changes gets another take key.
+    """
+    path = lib.chapter_dir(slug, number) / "script.json"
+    script = lib.load_json(path)
+    _, text = lib.load_chapter(slug, number)
+    lines, changed = emphasized(script, text, lib.load_bible(slug))
+    if changed:
+        script["lines"] = lines
+        script["emphasis"] = EMPHASIS_V
+        lib.save_json(path, script)
+        log(f"chapter {number}: {sum(1 for line in lines if line.get('emphasis'))} of {len(lines)} lines have a word "
+            f"the chapter sets in italics for stress")
+    return lines
+
+
 def validate_script(out: dict, bible: dict, text: str) -> tuple[list[str], dict]:
     """Checks a screenplay pass's answer against the rules the schema can't express.
 
@@ -243,7 +419,8 @@ def marks_pass(slug: str, number: int, *, backend="auto", model="opus", effort=N
     backend, model, effort, on_limit: as run_pass uses them.
     log: receives the progress lines.
     Returns the pass's result. A line the answer doesn't name gets the six fields empty, and marks from an earlier
-    pass are replaced. Each line's speaker, text and direction stay as they are, so no take key changes. Raises
+    pass are replaced. `emphasis` is not the answer's: it comes from the chapter's italics, by emphasized(). Each
+    line's speaker, text and direction stay as they are, so a take key changes only where `emphasis` does. Raises
     LLMError when the pass fails and FileNotFoundError when the chapter doesn't have a script, and leaves the
     script as it was.
     """
@@ -257,6 +434,8 @@ def marks_pass(slug: str, number: int, *, backend="auto", model="opus", effort=N
                       instruction="Return the marks of the script above as the JSON object only.", log=log)
     placed, dropped = placed_marks(result.data.get("marks"), lines)
     script["lines"] = [with_marks(line, placed.get(i)) for i, line in enumerate(lines)]
+    script["lines"] = emphasized({"lines": script["lines"]}, text, lib.load_bible(slug))[0]
+    script["emphasis"] = EMPHASIS_V
     script["marks"] = result.provenance()
     lib.save_json(path, script)
     meta.setdefault("passes", {})["marks"] = result.provenance()

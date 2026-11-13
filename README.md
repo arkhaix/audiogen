@@ -129,7 +129,7 @@ its override removes the entry.
 The Names tab lists the names of the bible by how many ways the takes said them, the most takes off the usual way
 first. The ways are sorted by sound, from the phones the take check decodes, and shown in phonetic letters with their
 counts. That sorting is a hint. A name that has a say-as comes before the others when takes add a sound to its
-spelling, and shows how many do, over the chapters whose check was judged by the rules as they are now. A name whose takes have not been heard for sound yet is listed by how the recognizer spelled it. Get options
+spelling, and shows how many do, over the chapters whose check was judged by the rules as they are now and with the name's spelling as it is now. The option in use shows that count under its screen's count. When four takes or more add a sound, and over a quarter of the takes that say the name, the tab marks the spelling unsteady: on the closed card, in a warning at the top of the open card, and in the colour of that count. A name whose takes have not been heard for sound yet is listed by how the recognizer spelled it. Get options
 queues a `say-options` job for a name: a Claude pass proposes four to six respellings, and the voice that says one
 of the script's lines with the name says that line once for the name as written and once for each respelling, from
 the seed the chapter's render uses for the line. Each option has a play button, how the recognizer wrote the name in
@@ -184,15 +184,24 @@ checks it again.
    more than 4 chapter words that the script leaves out, or of more than 4 script words that the chapter doesn't
    have there, such as a repeated passage, is a problem that quotes the run. `audit-scripts <slug> [chapters]` lists
    the existing scripts that have such a run, and it writes nothing.
-   A second pass, the marks pass, reads a saved script beside the chapter's text and gives each line six
-   fields that nothing reads yet and that no take key holds: `emphasis` (the words the author set in italics for
-   stress), `focus` (the word a contrast or a correction stresses), `heteronyms` (each word whose reading the
+   A second pass, the marks pass, reads a saved script beside the chapter's text and gives each line five
+   fields that nothing reads yet and that no take key holds: `focus` (the word a contrast or a correction stresses), `heteronyms` (each word whose reading the
    context decides, with a respelling of how it sounds here), and `emotion`, `energy` and `pace`, which restate the
    direction. Its answer names only the lines that have a mark. A word it names that its line doesn't have is left
    out. A screenplay pass runs it only with `--marks`, and no job asks for it yet, because nothing reads the
    fields and the pass costs about a third of a screenplay pass again. `marks <slug> <chapters>` runs it on a
-   chapter that has a script. It never changes a line's speaker, text or direction, so it never changes a take.
+   chapter that has a script. It never changes a line's speaker, text or direction. Its answer also names an
+   `emphasis` for a line, which is not kept, because that field comes from the chapter's italics.
    Until a job runs it, use it only in a scratch copy.
+   `emphasis` holds the words of a line that the chapter's text sets in italics for stress.
+   `screenplay.italic_emphasis()` finds them without a Claude pass: an italic span of one to three words that
+   lies in one line, is not the whole line and stands in it once. A span with a capitalized word is a name or a
+   title and doesn't count, unless the word opens a sentence and the bible doesn't have it. A render that makes
+   takes writes the field into a script that doesn't record `screenplay.EMPHASIS_V` yet, and a join-only run
+   leaves the script alone. `breeze.voice_text()` then puts each of those words between asterisks in the text
+   the voice is sent, which moves the stress onto the word. A line with the field has another take key, so a
+   chapter's first render after this makes those lines again, 9 lines in a median chapter of The Hundred Reigns.
+   The token map and the take check are the same with and without the asterisks.
 5. `render` maps speakers to Drama 3 slots (narrator = 0, unvoiced speakers read by the narrator),
    generates codes with the cast voices in one ComfyUI run, frees the card, decodes in a second run,
    and encodes the audio as Ogg Opus to `audio/chNNNN.opus`; status `rendered`. Every render writes Opus,
@@ -263,10 +272,9 @@ checks it again.
    or a direction about pace keeps its pauses. The file also holds each voice's baseline for the chapter, the median
    and spread of its level and of its seconds of speech per word, the centre of its embeddings with the median and
    spread of their similarity to it, and the version of the rules. Each entry of a take with a phone block
-   records under `said` the phones of every name in it, and under `missed` the names the `name` rule found. When
-   `name` flags four takes or more and over a quarter of the takes that say a name in a chapter, the cause is the
-   spelling: the render records a name finding, takes none of them again for the name, and the Names tab shows it. A
-   take that another reason flags as well is still taken again. The file records the picked spellings it was judged
+   records under `said` the phones of every name in it, and under `missed` the names the `name` rule found. A
+   render takes a take that `name` flags again however many takes of the name it flags, and `name` gives no voice
+   finding. A spelling that many takes miss shows on the Names tab as unsteady. The file records the picked spellings it was judged
    with, under `names`, and it is judged again when a name gets, changes or loses its say-as. A render judges the
    saved evidence again when the rules are newer than the file's. `render.check` in `chapter.yaml` has the summary.
    After the join, `render` runs the check over the whole chapter and reuses the evidence gathered before the join.

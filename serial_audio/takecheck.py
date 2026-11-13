@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import functools
 import json
 import math
 import re
@@ -52,6 +53,8 @@ SHORT_WORDS = 3
 NAME_HEARD = 2
 NAME_DISTANCE = 0.75
 JOIN_DISTANCE = 0.25
+# the edits beyond the difference in length that align() first looks for
+ALIGN_BAND = 2
 PAUSE_OVER = 0.6
 PAUSE_KEEP = 0.25
 # how far inside a silent run a word's time from the recognizer may lie, whose times are on an 80 ms grid
@@ -122,22 +125,50 @@ def align(ref: list[str], hyp: list[str]) -> list[tuple[str, int | None, int | N
     """
     if ref == hyp:
         return [("=", i, i) for i in range(len(ref))]
-    rows = [[((j, 0, 0, j, 0.0), "ins") for j in range(len(hyp) + 1)]]
-    for i in range(1, len(ref) + 1):
-        row = [((i, 0, i, 0, 0.0), "del")]
-        for j in range(1, len(hyp) + 1):
-            if ref[i - 1] == hyp[j - 1]:
-                row.append((rows[i - 1][j - 1][0], "="))
-                continue
-            s, d, n = rows[i - 1][j - 1][0], rows[i - 1][j][0], row[j - 1][0]
-            apart = spelling_distance(ref[i - 1], hyp[j - 1])
-            row.append(min(((s[0] + 1, s[1] + 1, s[2], s[3], s[4] + apart), "sub"),
-                           ((d[0] + 1, d[1], d[2] + 1, d[3], d[4]), "del"),
-                           ((n[0] + 1, n[1], n[2], n[3] + 1, n[4]), "ins")))
-        rows.append(row)
-    out, i, j = [], len(ref), len(hyp)
+    n, m = len(ref), len(hyp)
+    lean = m - n
+    apart: dict[tuple[str, str], float] = {}
+    width = abs(lean) + ALIGN_BAND
+
+    # Costs, in the cells that an alignment of width edits or fewer can pass
+    while True:
+        slack = (width - abs(lean)) // 2
+        low, high = min(0, lean) - slack, max(0, lean) + slack
+        rows = [(0, [((j, 0, 0, j, 0.0), "ins") for j in range(min(m, high) + 1)])]
+        for i in range(1, n + 1):
+            first = max(0, i + low)
+            above_first, above = rows[i - 1]
+            above_last = above_first + len(above) - 1
+            word, row = ref[i - 1], []
+            for j in range(first, min(m, i + high) + 1):
+                if j == 0:
+                    row.append(((i, 0, i, 0, 0.0), "del"))
+                    continue
+                s = above[j - 1 - above_first][0]
+                if word == hyp[j - 1]:
+                    row.append((s, "="))
+                    continue
+                pair = (word, hyp[j - 1])
+                if pair not in apart:
+                    apart[pair] = spelling_distance(*pair)
+                found = [((s[0] + 1, s[1] + 1, s[2], s[3], s[4] + apart[pair]), "sub")]
+                if j <= above_last:
+                    d = above[j - above_first][0]
+                    found.append(((d[0] + 1, d[1], d[2] + 1, d[3], d[4]), "del"))
+                if j > first:
+                    k = row[-1][0]
+                    found.append(((k[0] + 1, k[1], k[2], k[3] + 1, k[4]), "ins"))
+                row.append(min(found))
+            rows.append((first, row))
+        # with more edits than width, a better alignment may leave the cells
+        if rows[n][1][-1][0][0] <= width:
+            break
+        width = 2 * width + 2
+
+    # Steps, from the last cell back
+    out, i, j = [], n, m
     while i or j:
-        kind = rows[i][j][1]
+        kind = rows[i][1][j - rows[i][0]][1]
         if kind in ("=", "sub"):
             i, j = i - 1, j - 1
             out.append((kind, i, j))
@@ -374,8 +405,14 @@ def word_times(asr: dict) -> list[tuple[str, float, float]] | None:
             if spoken:
                 spans[-1][1] = start if spans[-1][1] is None else spans[-1][1]
                 spans[-1][2] = start + length
-    out = [(w, a, b) for text, a, b in spans if a is not None for w in words(text)]
+    out = [(w, a, b) for text, a, b in spans if a is not None for w in span_words(text)]
     return out if [w for w, _, _ in out] == words(asr.get("heard") or "") else None
+
+
+@functools.lru_cache(maxsize=1 << 15)
+def span_words(text: str) -> tuple[str, ...]:
+    """The words asr.words gives for the text of one span of a transcript."""
+    return tuple(words(text))
 
 
 def name_spans(asr: dict, phone, tokens: list[dict], edits: list[tuple]) -> list[dict]:
@@ -1058,7 +1095,7 @@ def voice_findings(entries: dict, takes: dict) -> list[dict]:
     takes: {line: breeze_takes.json entry}, which names each take's voice.
     Returns [{"voice", "reason", "lines", "of"}, ...] for each voice and reason that flags BREAKER_MIN of the
     voice's takes or more and over BREAKER_SHARE of them. lines are the flagged lines and of counts the voice's
-    judged takes.
+    judged takes. The reason "name" gives no finding.
     """
     counted: dict[str, int] = {}
     hits: dict[tuple[str, str], list[int]] = {}
@@ -1069,32 +1106,11 @@ def voice_findings(entries: dict, takes: dict) -> list[dict]:
         counted[voice] = counted.get(voice, 0) + 1
         if entry["verdict"] == "flagged":
             for reason in entry.get("reasons") or []:
-                hits.setdefault((voice, reason), []).append(int(k))
+                if reason != "name":
+                    hits.setdefault((voice, reason), []).append(int(k))
     return [{"voice": voice, "reason": reason, "lines": sorted(found), "of": counted[voice]}
             for (voice, reason), found in sorted(hits.items())
             if len(found) >= BREAKER_MIN and len(found) > BREAKER_SHARE * counted[voice]]
-
-
-def name_findings(entries: dict) -> list[dict]:
-    """The names that so many takes say with an added sound that the cause is the spelling and not a take.
-
-    entries: {line: entry} of the chapter's judged takes.
-    Returns [{"term", "lines", "of"}, ...] for each term that BREAKER_MIN flagged takes or more miss, and over
-    BREAKER_SHARE of the takes that say it. lines are those flagged lines and of counts the takes that say the term.
-    """
-    said: dict[str, int] = {}
-    hits: dict[str, list[int]] = {}
-    for k, entry in entries.items():
-        if entry.get("verdict") not in VERDICTS or not isinstance(entry.get("said"), dict):
-            continue
-        for term in entry["said"]:
-            said[term] = said.get(term, 0) + 1
-        if entry["verdict"] == "flagged" and "name" in (entry.get("reasons") or []):
-            for term in entry.get("missed") or []:
-                hits.setdefault(term, []).append(int(k))
-    return [{"term": term, "lines": sorted(found), "of": said.get(term, len(found))}
-            for term, found in sorted(hits.items())
-            if len(found) >= BREAKER_MIN and len(found) > BREAKER_SHARE * said.get(term, len(found))]
 
 
 def summarize(results: dict, takes: dict | None = None) -> dict:
