@@ -83,6 +83,7 @@ Everything in tracks A and D reads what this package stores.
 * Apply the length guard to each piece, and keep `usable()` in `render_breeze` in step with it, so a take made in pieces isn't judged out of range on the next render.
 * This is for breeze-server only.
 * It is done when a test with the fake server shows a flagged long line retaken in pieces and a passing long line left alone, and a scratch render shows the same on a real line.
+* Built on 2026-11-12 with a limit of 60 words for the line, 40 for a piece and 0.25 s between pieces.
 
 ## B1: mastering
 
@@ -96,12 +97,14 @@ Everything in tracks A and D reads what this package stores.
 * The join job needs more for each take: the class of its direction, its cuts and the gap after it. `render_breeze` has the line and the plan at hand where it writes the job.
 * Make two short clips of one chapter for AJ, the old join and the new one. He listens once and sets the offsets and the gaps. Don't run the backlog pass before that.
 * It is done when `tests/test_fx.py` covers the loudness measure, the cuts and the limiter with known answers, a scratch join of chapter 33 measures -18 LUFS and stays under -1 dB true peak, and AJ has heard the clips.
+* Built on 2026-11-12. Two things differ from the list above. The cuts are the spans the take check recorded, each in the middle of its silent run, with a fade of 10 ms across the cut. The loudness and the true peak are measured on the Opus file as it plays, because the encoder moves both.
 
 ## B2: cast clips
 
 * A Breeze take comes out at the level of its voice's cast clip, and the clips ran from -11 to -29 dB RMS. BreezeBlue's own platform normalizes a clone reference to -18 LUFS.
 * Bring a newly filed cast clip to -18 LUFS. Don't touch an existing voice, because the clip's hash is part of every take key.
 * It is done when a cast in a scratch copy files a clip at -18 LUFS and every key of an existing voice is unchanged.
+* Built on 2026-11-12. The cast levels every candidate on the node that made it, because a pick runs on the app's machine, which doesn't have the audio Python.
 
 ## C1: script fields
 
@@ -110,6 +113,7 @@ Everything in tracks A and D reads what this package stores.
 * Nothing reads the fields yet, and none of them enters the key.
 * The Royal Road parser keeps italics as asterisks. The EPUB parser drops all inline markup, so teach it italics. The screenplay prompt says to drop the asterisks at one place and to keep italics at another. Fix that, and have the pass move the marked words into the new field.
 * It is done when a screenplay pass in a scratch copy writes the fields for a chapter that has italics, the script's text has no asterisks, and every take key of an existing script is unchanged.
+* Built on 2026-11-12 with six fields: `emphasis`, `focus`, `heteronyms`, and the direction as `emotion`, `energy` and `pace`. Phases 2 and 3 read these names. A marks pass writes them after the screenplay pass, because as fields of the screenplay pass they took chapter 6 from 29,776 to 53,405 output tokens. The marks pass can also run for a script that exists, with `marks <slug> <chapters>`, and it has no job kind yet.
 
 ## C2: text repair
 
@@ -117,6 +121,7 @@ Everything in tracks A and D reads what this package stores.
 * Repair in `voice_text()` only what the data supports. `speakable` turns `(x)` into `, x,` today unless x is a vocal event, and it passes an unclosed parenthesis, asterisks and `[image: ...]` through.
 * A repair changes the text of the lines it touches, so their keys change and a render makes them again. Count those lines before the deploy, by contract point 7.
 * It is done when the measurement is in `DECISIONS.md`, each repair has a test, and the count of lines a render would make again is known and explained.
+* Measured on 2026-11-12. The measurement didn't call for a repair, so a render doesn't make any line again.
 
 ## C3: the script against the chapter
 
@@ -124,6 +129,7 @@ Everything in tracks A and D reads what this package stores.
 * Diff the script's words against the chapter's. Send a dropped or repeated run back to the model in the pass's retry loop, as `validate_script` does with its other problems.
 * Add a read-only audit that lists existing scripts with gaps. Don't write an existing script again. AJ decides that chapter by chapter, because it remakes the whole chapter.
 * It is done when a test shows a dropped paragraph caught and sent back, and the audit has run over The Hundred Reigns with its output given to AJ.
+* Built on 2026-11-12 with a limit of 4 words for a dropped and for an added run, and without the heading line in the comparison.
 
 ## D1: unstable names
 

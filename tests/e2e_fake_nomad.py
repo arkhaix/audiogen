@@ -279,6 +279,20 @@ def inside(slug: str) -> int:
     check(job["status"] == "done" and job["nomad"]["stage"] == 1, f"two-stage job done at stage 2 ({job['status']})")
     check(f"cli chapters {slug}" in text and f"cli bible {slug}" in text, "both stages' commands are in the log")
 
+    # Backlog work queued ahead of another job runs after it, one job at a time
+    trio = m.submit([{"kind": "render", "params": {"slug": slug, "chapter": 2, "backlog": True}},
+                     {"kind": "render", "params": {"slug": slug, "chapter": 3, "backlog": True}},
+                     {"kind": "render", "params": {"slug": slug, "chapter": 4}}], stop_on_failure=False)
+    for job in trio:
+        job["args"] = ["chapters", slug]
+    check(run_until(lambda: all(finished(j)() for j in trio)), "the backlog jobs and the other job finished")
+    check(all(j["status"] == "done" for j in trio), f"all three are done ({[j['status'] for j in trio]})")
+    sent = [j["nomad"].get("dispatched_at") or "" for j in trio]
+    check(sent[2] <= sent[0] <= sent[1] and trio[2]["finished"] <= sent[0] and trio[0]["finished"] <= sent[1],
+          f"the job that is not backlog work ran first, then the backlog jobs in turn ({sent})")
+    check([j.get("backlog") for j in m.snapshot()["jobs"] if j["id"] in {t["id"] for t in trio}].count(True) == 2,
+          "the job list marks the two backlog jobs")
+
     # Stopped before a node starts it: the late worker exits without running anything
     fake.delay_next = 6
     job = submit("screenplay", {"slug": slug, "chapters": "1"}, args=["chapters", slug])

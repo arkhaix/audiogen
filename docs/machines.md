@@ -68,7 +68,7 @@ nothing. It was copied from the Mac, and its sha256 hashes match:
 * `joiner.int8.onnx`: 7946164367946e7f9f29a122407c3252b680dbae9a51343eb2488d057c3c43d2
 * `tokens.txt`: ec182b70dd42113aff6c5372c75cac58c952443eb22322f57bbd7f53977d497d
 
-To check that it runs, transcribe a few takes with `serial_audio.asr.transcripts(files, engine="parakeet",
+To check that it runs, hear a few takes with `serial_audio.asr.records(files, engine="parakeet",
 comfy_url="")`. Three takes took 4.8 s, including the model load.
 
 ---
@@ -141,6 +141,41 @@ serial_audio_config = "/Users/aj/serial-audio/node.json"
 After a change, copy the ansible file over the live one and run `launchctl kickstart -k
 gui/$(id -u)/net.ajgray.nomad`. The agent runs as aj under that LaunchAgent and listens on the tailnet address, not
 on 127.0.0.1, so query it with `NOMAD_ADDR=http://containers.goblin-truck.ts.net:4646`.
+
+---
+
+## The take check's other models
+
+Phase 2 of the take quality plan (`docs/take-quality/phase-2.md`) adds four sherpa-onnx models beside Parakeet on
+each breeze node. AJ approved the list on 2026-11-12, and that evening the four folders were copied to both nodes
+from the copies below, every file checked against these hashes, and each node's take check loaded all three blocks. The code reads a folder only
+when it holds all its files and its model loads. A node without them gathers Parakeet's two blocks as before, and the
+rules that need the other blocks don't fire there. The tail rule and the cut of a tail need only those two blocks,
+so they work without the models.
+
+| folder | files | source | licence |
+|---|---|---|---|
+| `silero-vad-v5` | `silero_vad_v5.onnx`, 2,313,101 bytes, sha256 6b99cbfd39246b6706f98ec13c7c50c6b299181f2474fa05cbc8046acc274396 | https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad_v5.onnx | MIT |
+| `titanet-small` | `nemo_en_titanet_small.onnx`, 40,257,283 bytes, sha256 ad4a1802485d8b34c722d2a9d04249662f2ece5d28a7a039063ca22f515a789e | https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/nemo_en_titanet_small.onnx | the NeMo toolkit's, Apache 2.0 |
+| `moonshine-base-en-2026-02-27` | `encoder_model.ort`, 31,326,816 bytes, sha256 7c66495948d0d08ec1af454cd4b5514862ae6511e94712a60e6d83eaec8dc8cf. `decoder_model_merged.ort`, 109,424,400 bytes, sha256 d9d7b333af34bc552580576ddcf248a1c6c839e0d3b43b09afb9376ed009899d. `tokens.txt`, 549,350 bytes, sha256 2870d843e14c1e187bf1913a521562a63b53933814bd7f2145120468f494a049 | `sherpa-onnx-moonshine-base-en-quantized-2026-02-27.tar.bz2` in https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models | MIT, for the English models |
+| `zipa-small-crctc-300k` | `model.int8.onnx`, 70,677,672 bytes, sha256 8f0505173e4606b4afe041f19477b38d6a72a98a19863562749066dc496e86ae. `tokens.txt`, 769 bytes, sha256 f8e042a0c9130532b22d03ec7cae2f75a23fbec70c450c31a8efb51787b2b8fe | https://huggingface.co/anyspeech/zipa-small-crctc-300k, revision 2f458a4d | CC BY 4.0 |
+
+* The four folders hold 255 MB. On the laptop they go in `D:\comfy\models`, beside `parakeet-tdt-0.6b-v2-int8`. On
+  the Mac they go in `/Users/aj/serial-audio/models`, beside its Parakeet folder.
+* `machine.py` defaults each folder to its name beside the Parakeet folder, so neither node's `serial_audio_config`
+  needs a line, and no Nomad client config changes. `SERIAL_AUDIO_VAD_MODEL`, `SERIAL_AUDIO_SPEAKER_MODEL`,
+  `SERIAL_AUDIO_ASR2_MODEL` and `SERIAL_AUDIO_PHONE_MODEL` move one.
+* No package changes. sherpa-onnx 2.0.0 is in both audio Pythons and loads all four. ZIPA goes through its
+  Zipformer CTC loader, so neither node needs torch or lhotse.
+* A copy of each folder, with the hashes above, is in `D:\fish.wt\scratch\models` on the laptop, and the files the
+  spike used are in `/Users/aj/serial-audio/scratch/spike/models` on the Mac. Installing them is a copy and a hash
+  check.
+* Nothing reads ZIPA until package P4.
+* Once a node has the folders, the first render or check of each chapter there hears the chapter's saved takes for
+  the three new blocks, at about 0.5 s a take on the laptop's CPU, or about 2 minutes for a chapter of 220 takes.
+  aj-legion5 hard-reset three times on 2026-11-12, and two of those came while a scratch gathering of these blocks
+  ran on its CPU. With the folders on the Mac first, the chapters the Mac checks get the blocks there, and the
+  laptop hears only the rest once it has them.
 
 ---
 

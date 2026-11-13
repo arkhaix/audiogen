@@ -252,13 +252,14 @@ def plan_engine(serial: dict, last: dict | None, *, skip_generate: bool = False,
     return engine, choose_runner(serial, last, join_only=skip_generate, runner=runner)
 
 
-def render(slug: str, number: int, *, seed: int = 1, comfy_url: str = "http://127.0.0.1:8188", log=print,
+def render(slug: str, number: int, *, seed: int | None = None, comfy_url: str = "http://127.0.0.1:8188", log=print,
            skip_generate: bool = False, engine: str | None = None, runner: str | None = None) -> dict:
     """Renders a scripted chapter to audio/chNNNN.opus and marks it rendered.
 
     slug: the serial.
     number: the chapter.
-    seed: the generation seed. Breeze derives each voice's seed from it.
+    seed: the generation seed. Breeze derives each voice's seed from it. None is 1 for Drama 3. For Breeze it is
+        the seed of the chapter's last Breeze render, else 1.
     comfy_url: the ComfyUI that renders.
     log: receives the progress lines.
     skip_generate: reuse the saved generation, decoding Drama 3 codes or joining Breeze takes again.
@@ -276,6 +277,7 @@ def render(slug: str, number: int, *, seed: int = 1, comfy_url: str = "http://12
         from .breeze import render_breeze
         return render_breeze(slug, number, seed=seed, comfy_url=comfy_url, log=log, join_only=skip_generate,
                              runner=runner)
+    seed = 1 if seed is None else seed
     bible = lib.load_bible(slug)
     script_path = lib.chapter_dir(slug, number) / "script.json"
     if not script_path.exists():

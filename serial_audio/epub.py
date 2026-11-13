@@ -3,7 +3,9 @@
 Reads the OPF spine in order, splits each document at its `div.chapter` sections,
 treats a heading like "PART ONE" as a part marker and any other heading followed by
 paragraphs as a chapter. Figures, captions, and Project Gutenberg boilerplate are
-dropped. Output is plain paragraphs: no markup, soft line breaks collapsed.
+dropped. Output is plain paragraphs with soft line breaks collapsed. Italics inside a
+paragraph are kept as `*markers*`, as the Royal Road parser keeps them, and headings
+stay plain.
 """
 from __future__ import annotations
 
@@ -14,6 +16,8 @@ import zipfile
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 from xml.etree import ElementTree as ET
+
+from .royalroad import close_italic, fix_italics
 
 NS = {
     "c": "urn:oasis:names:tc:opendocument:xmlns:container",
@@ -61,6 +65,9 @@ class _SectionParser(HTMLParser):
         self._in_heading = False
         self._block: list[str] | None = None
         self._heading: list[str] = []
+        self._italics = 0
+        self._italic_opened = False
+        self._marked = False
 
     def handle_starttag(self, tag, attrs):
         a = dict(attrs)
@@ -79,6 +86,11 @@ class _SectionParser(HTMLParser):
             self._heading = [""]
         elif tag in self.BLOCK and "caption" not in cls:
             self._block = [""]
+            self._italics, self._italic_opened, self._marked = 0, False, False
+        elif tag in ("em", "i") and self._block is not None and not self._in_heading:
+            self._block[-1] += "*"
+            self._italics += 1
+            self._italic_opened = self._marked = True
         elif tag == "br":
             if self._in_heading:
                 self._heading.append("")
@@ -96,8 +108,12 @@ class _SectionParser(HTMLParser):
             self._in_heading = False
             lines = [_clean(x) for x in self._heading]
             self.sections[-1].heading_lines.extend(l for l in lines if l)
+        elif tag in ("em", "i") and self._block is not None and self._italics:
+            self._block[-1] = close_italic(self._block[-1])
+            self._italics -= 1
         elif tag in self.BLOCK and self._block is not None:
             text = _clean(" ".join(self._block))
+            text = fix_italics(text) if self._marked else text
             if text:
                 self.sections[-1].paragraphs.append(text)
             self._block = None
@@ -108,6 +124,13 @@ class _SectionParser(HTMLParser):
         if self._in_heading:
             self._heading[-1] += data
         elif self._block is not None:
+            if self._italic_opened:
+                # '* word' -> ' *word': leading whitespace of the first italic text moves before the marker
+                self._italic_opened = False
+                lead = data[:len(data) - len(data.lstrip())]
+                if lead and self._block[-1].endswith("*"):
+                    self._block[-1] = self._block[-1][:-1] + lead + "*"
+                    data = data.lstrip()
             self._block[-1] += data
 
 

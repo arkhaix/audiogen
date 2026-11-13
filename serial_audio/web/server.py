@@ -318,6 +318,10 @@ def get_voices(h: Handler, q, slug):
     h._send_json(views.voices(slug))
 
 
+def get_names(h: Handler, q, slug):
+    h._send_json(views.names_heard(slug))
+
+
 def get_bible(h: Handler, q, slug):
     h._send_json(views.bible(slug))
 
@@ -352,8 +356,9 @@ def post_jobs(h: Handler, q):
     requests = body.get("jobs")
     if not isinstance(requests, list) or not requests:
         raise HTTPError(400, "give a list of jobs")
-    jobs = h.manager.submit(requests, stop_on_failure=body.get("stop_on_failure", True) is not False)
-    h._send_json({"jobs": jobs})
+    covered: list[dict] = []
+    jobs = h.manager.submit(requests, stop_on_failure=body.get("stop_on_failure", True) is not False, covered=covered)
+    h._send_json({"jobs": jobs, "already": len(covered)})
 
 
 def post_cancel(h: Handler, q, jid):
@@ -502,6 +507,7 @@ GET_ROUTES = [
     (rf"/api/serials/{SLUG}", get_serial),
     (rf"/api/serials/{SLUG}/chapters/(\d+)", get_chapter),
     (rf"/api/serials/{SLUG}/voices", get_voices),
+    (rf"/api/serials/{SLUG}/names", get_names),
     (rf"/api/serials/{SLUG}/bible", get_bible),
     (rf"/api/jobs/{JOB}/log", get_log),
     (r"/media/lib/(.+)", get_lib_media),

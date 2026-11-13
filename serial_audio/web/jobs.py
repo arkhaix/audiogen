@@ -34,9 +34,11 @@ LOG_DIR = STATE_DIR / "jobs"
 INCOMING = ROOT / "incoming"
 COMFY_URL = "http://127.0.0.1:8188"
 
-HEAVY = {"render", "cast", "bios", "check-takes", "character-pass", "screenplay"}
+HEAVY = {"render", "cast", "bios", "check-takes", "character-pass", "screenplay", "say-options"}
 BIBLE_WRITERS = {"character-pass", "cast", "bios"}
 SERIAL_WRITERS = {"voice-effect"}    # rewrites serial.yaml in place, so it waits for any job on that serial
+# a render's own changes show in render_changes, and no render reads a name's options
+RENDER_NEUTRAL = {"render", "say-options"}
 FINISHED = {"done", "failed", "cancelled", "stopped", "skipped", "lost"}
 SETTLE_SECONDS = 15
 TICK_SECONDS = 2.0
@@ -210,10 +212,11 @@ def build(kind: str, p: dict, comfy_url: str = COMFY_URL, coming: dict | None = 
         n = _int(p, "chapter", 1, 99999)
         if n is None:
             raise ValueError("render needs a chapter")
-        seed = _int(p, "seed", 0, 2**31, 1)
+        seed = _int(p, "seed", 0, 2**31)
         decode_only = bool(p.get("decode_only"))
         engine, runner = _render_plan(slug, n, decode_only)
-        args = ["render", slug, str(n), "--seed", str(seed), "--comfy-url", comfy_url, "--engine", engine]
+        args = ["render", slug, str(n)] + (["--seed", str(seed)] if seed is not None else [])
+        args += ["--comfy-url", comfy_url, "--engine", engine]
         if runner:
             args += ["--runner", runner]
         if decode_only:
@@ -315,6 +318,24 @@ def build(kind: str, p: dict, comfy_url: str = COMFY_URL, coming: dict | None = 
         return {"args": args, "heavy": False, "gpu": False, "comfy": False, "title": title, "slug": slug,
                 "meta": {"term": term}}
 
+    if kind == "say-options":
+        slug = _slug(p)
+        term = _text(p, "term", 80)
+        if not term:
+            raise ValueError("say-options needs a term")
+        again = bool(p.get("render_only"))
+        say = _text(p, "say", 120)
+        if p.get("say") is not None and not re.search(r"[^\W\d_]", say or ""):
+            raise ValueError("say-options needs a letter in the spelling to hear")
+        if say and again:
+            raise ValueError("say-options takes a spelling to add or render_only, not both")
+        args = ["say-options", slug, "--comfy-url", comfy_url] + _llm_args(p)
+        args += ([f"--add={say}"] if say else ["--render-only"] if again else []) + ["--", term]
+        title = (f"Hear {term} as {say}" if say else f"Say the options for {term} again" if again
+                 else f"Options for {term}")
+        return {"args": args, "heavy": True, "gpu": True, "comfy": False, "title": title, "slug": slug,
+                "meta": {"term": term}}
+
     if kind == "voice-effect":
         from ..render import VOICE_EFFECTS
         slug = _slug(p)
@@ -399,7 +420,7 @@ TAKES_RE = re.compile(r"\[(\d+) min\] take (\d+)/(\d+), (\d+) ms/take")
 TAKES_HEAD_RE = re.compile(r"generating takes .*?: (\d+) of \d+ lines")
 CHECK_HEAD_RE = re.compile(r"checking (\d+) takes with (?:Qwen3-ASR|Parakeet)")
 CHECK_RE = re.compile(r"\[(\d+) min\] checked (\d+)/(\d+), ([\d.]+) s/take")
-PRECHECK_RE = re.compile(r"checking the (\d+) new takes? with")
+PRECHECK_RE = re.compile(r"checking the (\d+) (?:new )?takes? with")
 PRECHECK_SECONDS_PER_TAKE = 0.5
 CASTING_RE = re.compile(r"^casting (\d+): (.*)$", re.M)
 CANDIDATE_RE = re.compile(r"^\s+\S+ seed \d+: match", re.M)
@@ -448,7 +469,7 @@ def render_progress(text: str, log_mtime: float | None, now: float, started: flo
         total = int(precheck.group(1))
         done, per = (int(marks[-1][1]), float(marks[-1][3])) if marks else (0, PRECHECK_SECONDS_PER_TAKE)
         return {**out, "phase": "checking", "fraction": 0.97, "eta": max(0, total - done) * per + JOIN_SECONDS,
-                "detail": f"checking the new takes before the join, {done:,} of {total:,}"}
+                "detail": f"checking the takes before the join, {done:,} of {total:,}"}
     if "voice effects" in seg:
         return {**out, "phase": "effects", "fraction": 0.99, "eta": 30, "detail": "applying voice effects"}
     if "decoding..." in seg:
@@ -632,6 +653,34 @@ def external_activity(snapshot: dict[int, procs.Proc], ours: set[int], now: floa
     return out
 
 
+def backlog_wait(job: dict, jobs) -> str | None:
+    """Why a queued backlog job cannot start now, or None.
+
+    job: the backlog job.
+    jobs: every job the manager holds.
+    A backlog job starts only when no other job is running and no job that is not backlog work is queued. A job
+    that waits between two stages on the cluster counts as running.
+    """
+    for other in jobs:
+        if other is job:
+            continue
+        if other["status"] == "running" or between_stages(other):
+            return f"backlog work, waiting for {other['title']} to finish"
+        if other["status"] == "queued" and not other.get("backlog"):
+            return "backlog work, waiting for the queue to empty"
+    return None
+
+
+def between_stages(job: dict) -> bool:
+    """Whether a queued job has run a stage on the cluster already and waits for its next one."""
+    return job["status"] == "queued" and bool(job.get("nomad"))
+
+
+def start_order(job: dict) -> tuple[bool, int]:
+    """The order in which queued jobs are offered a start: backlog work that has not started last, then by seq."""
+    return bool(job.get("backlog")) and not between_stages(job), job["seq"]
+
+
 # The manager
 
 class StateInUse(RuntimeError):
@@ -712,14 +761,19 @@ class JobManager:
 
     # Requests
 
-    def submit(self, requests: list[dict], stop_on_failure: bool = True) -> list[dict]:
+    def submit(self, requests: list[dict], stop_on_failure: bool = True,
+               covered: list[dict] | None = None) -> list[dict]:
         """Queues the jobs in order as one batch. Validates them all first.
 
-        requests: [{"kind", "params"}].
+        requests: [{"kind", "params"}]. A request whose params hold "backlog": true is queued as backlog work,
+            which starts only when backlog_wait lets it.
         stop_on_failure: when one job fails, skip the batch's queued jobs that can't go on. Here that is the rest
             of the batch, and on the cluster the jobs that wait for the failed one.
+        covered: when given, receives the waiting job that stands in for each request that was not queued.
         A character pass or a screenplay that follows the import of its chapter in `requests` names that chapter in
-        its meta before the chapter is on disk.
+        its meta before the chapter is on disk. A backlog render is not queued while a backlog render with the same
+        arguments waits outside a batch and no other kind of backlog job is queued after that one. The render that
+        waits stands in for it, and from then on counts as queued at the time of this request.
         Returns the new jobs. Raises ValueError and queues nothing if any request is bad.
         """
         built = []
@@ -737,11 +791,19 @@ class JobManager:
         with self.lock:
             seq = max((j.get("seq", 0) for j in self.jobs.values()), default=0)
             for kind, params, b in built:
+                backlog = isinstance(params, dict) and params.get("backlog") is True
+                waiting = self._stands_in(kind, b["args"]) if backlog else None
+                if waiting:
+                    waiting["asked"] = now_iso()
+                    if covered is not None:
+                        covered.append(waiting)
+                    continue
                 seq += 1
                 jid = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
                 job = {"id": jid, "kind": kind, "params": params, "args": b["args"], "heavy": b["heavy"],
                        "gpu": b["gpu"], "comfy": b["comfy"], "title": b["title"], "slug": b["slug"], "meta": b["meta"],
                        "batch": batch if len(built) > 1 and stop_on_failure else None, "seq": seq,
+                       "backlog": backlog,
                        "status": "queued", "created": now_iso(), "started": None, "finished": None,
                        "exit_code": None, "pid": None, "note": None}
                 self.jobs[jid] = job
@@ -752,6 +814,26 @@ class JobManager:
     def _build(self, kind, params, coming) -> dict:
         """The job fields for one request, as build returns them. Raises ValueError on a bad request."""
         return build(kind, params, self.comfy_url, coming)
+
+    def _stands_in(self, kind: str, args: list[str]) -> dict | None:
+        """Finds the waiting job that a new backlog render would only repeat.
+
+        kind: the new job's kind.
+        args: the new job's CLI arguments.
+        Returns the last queued backlog render with these arguments that is not part of a batch, or None when
+        there is none or another kind of backlog job is queued after it.
+        """
+        if kind != "render":
+            return None
+        same = [j for j in self.jobs.values() if j["kind"] == "render" and j.get("backlog") and j["args"] == args
+                and j["status"] == "queued" and not between_stages(j) and not j.get("batch")]
+        if not same:
+            return None
+        last = max(same, key=lambda j: j["seq"])
+        if any(j.get("backlog") and j["kind"] != "render" and j["status"] not in FINISHED and j["seq"] > last["seq"]
+               for j in self.jobs.values()):
+            return None
+        return last
 
     def cancel(self, jid: str) -> dict:
         """Cancels a queued job, or stops a running one and cancels its ComfyUI prompts. Returns the job."""
@@ -798,7 +880,9 @@ class JobManager:
             job = self.jobs.get(jid)
             if job is None:
                 raise KeyError(jid)
-            return self.submit([{"kind": job["kind"], "params": job["params"]}])[0]
+            covered: list[dict] = []
+            new = self.submit([{"kind": job["kind"], "params": job["params"]}], covered=covered)
+            return (new or covered)[0]
 
     def clear_finished(self) -> int:
         with self.lock:
@@ -879,7 +963,7 @@ class JobManager:
         with self.lock:
             rate = self.minutes_per_line()
             running = sorted((j for j in self.jobs.values() if j["status"] == "running"), key=lambda j: j["started"] or "")
-            queued = sorted((j for j in self.jobs.values() if j["status"] == "queued"), key=lambda j: j["seq"])
+            queued = sorted((j for j in self.jobs.values() if j["status"] == "queued"), key=start_order)
             finished = sorted((j for j in self.jobs.values() if j["status"] in FINISHED),
                               key=lambda j: j.get("finished") or j["created"], reverse=True)
             jobs = []
@@ -932,13 +1016,14 @@ class JobManager:
             if ext_heavy or comfy_busy:
                 self.last_busy = now
             self.wait_reasons = {}
-            queued = sorted((j for j in self.jobs.values() if j["status"] == "queued"), key=lambda j: j["seq"])
+            queued = sorted((j for j in self.jobs.values() if j["status"] == "queued"), key=start_order)
             changed = False
             ahead: dict[bool, dict] = {}
             for job in queued:
                 first = ahead.get(job["heavy"])
-                reason = (f"queued behind {first['title']}" if first else
-                          self._blocker(job, running, ext_heavy, comfy_busy, now))
+                held = backlog_wait(job, self.jobs.values()) if job.get("backlog") else None
+                reason = held or (f"queued behind {first['title']}" if first else
+                                  self._blocker(job, running, ext_heavy, comfy_busy, now))
                 if reason:
                     self.wait_reasons[job["id"]] = reason
                     ahead.setdefault(job["heavy"], job)
@@ -993,13 +1078,20 @@ class JobManager:
         """Why a queued render no longer needs to run, or None.
 
         A render is stale when its chapter was rendered after the job was queued, by a run the app did not start.
+        A backlog render is also stale when a render with the same arguments started after it was queued, no job
+        that changes what a render reads has run since that render started, the chapter's last render is Breeze,
+        and a render would make, take again, hear and join nothing. A job that stands in for a later request
+        counts as queued at that request.
         """
         if job["kind"] != "render" or job["meta"].get("decode_only"):
             return None
         n = job["meta"]["chapters"][0]
+        twin = self._repeats(job) if job.get("backlog") else None
+        if twin:
+            return f"{twin['title']} started at {twin['started']}, after this job was queued, and left it nothing to do"
         meta = lib.load_yaml(lib.chapter_dir(job["slug"], n) / "chapter.yaml", {}) or {}
         rendered = _ts((meta.get("render") or {}).get("at"))
-        queued = _ts(job["created"])
+        queued = _ts(job.get("asked") or job["created"])
         if not (rendered and queued and rendered > queued):
             return None
         for other in self.jobs.values():
@@ -1008,6 +1100,32 @@ class JobManager:
                     and (_ts(other.get("finished")) or 0) >= queued - 1):
                 return None
         return f"chapter {n} was rendered outside the app at {meta['render']['at']}, after this job was queued"
+
+    def _repeats(self, job: dict) -> dict | None:
+        """The finished render that left a queued backlog render nothing to do, or None."""
+        queued = _ts(job.get("asked") or job["created"])
+        twins = [j for j in self.jobs.values()
+                 if j is not job and j["kind"] == "render" and j["status"] == "done" and j["args"] == job["args"]
+                 and queued and (_ts(j.get("started")) or 0) >= queued]
+        if not twins:
+            return None
+        twin = max(twins, key=lambda j: _ts(j["started"]))
+        began = _ts(twin["started"])
+        for other in self.jobs.values():
+            if other["kind"] in RENDER_NEUTRAL or not other.get("started"):
+                continue
+            ended = _ts(other.get("finished"))
+            if other["status"] not in FINISHED or not ended or ended >= began:
+                return None
+        try:
+            from ..breeze import render_changes
+            args = job["args"]
+            seed = int(args[args.index("--seed") + 1]) if "--seed" in args else None
+            changes = render_changes(job["slug"], job["meta"]["chapters"][0], seed, job["meta"].get("runner"))
+            idle = changes["engine"] == "breeze" and not any(changes[k] for k in ("make", "retake", "unheard", "join"))
+        except Exception:
+            return None
+        return twin if idle else None
 
     def latest_log(self, kind: str, slug: str, n: int) -> tuple[Path, float] | None:
         """The newest log and its mtime of the app's jobs of `kind` for chapter n, or None."""

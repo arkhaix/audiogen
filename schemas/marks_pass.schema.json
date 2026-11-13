@@ -1,0 +1,37 @@
+{
+  "type": "object",
+  "properties": {
+    "marks": {
+      "type": "array",
+      "description": "One entry for each script line that has at least one mark. Most lines have none and are left out.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "line": {"type": "integer", "description": "The number of the line in the script."},
+          "emphasis": {"type": "array", "items": {"type": "string"}, "description": "Each word or short phrase of the line's text that the author set in italics for emphasis, spelled as the script spells it, in order. Otherwise empty array."},
+          "focus": {"type": "string", "description": "The one word of the line's text that takes the main stress because the line contrasts or corrects something, otherwise empty string."},
+          "heteronyms": {
+            "type": "array",
+            "description": "One entry for each word of the line's text whose pronunciation the context decides (read, lead, wind, tear, live), otherwise empty array.",
+            "items": {
+              "type": "object",
+              "properties": {
+                "word": {"type": "string", "description": "The word as the script spells it."},
+                "sounds_like": {"type": "string", "description": "A common respelling of how it sounds in this line, such as \"red\" or \"reed\"."}
+              },
+              "required": ["word", "sounds_like"],
+              "additionalProperties": false
+            }
+          },
+          "emotion": {"type": "string", "description": "One or two words for the feeling the line's direction names, otherwise empty string."},
+          "energy": {"type": "string", "enum": ["", "whisper", "soft", "normal", "raised", "shout"], "description": "How loud the line's direction says the line is, otherwise empty string."},
+          "pace": {"type": "string", "enum": ["", "slow", "fast", "halting"], "description": "The pace the line's direction gives, otherwise empty string."}
+        },
+        "required": ["line", "emphasis", "focus", "heteronyms", "emotion", "energy", "pace"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["marks"],
+  "additionalProperties": false
+}

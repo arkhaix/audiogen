@@ -7,7 +7,8 @@ own machine. A worker fetches its job's bundle from the app, streams its log bac
 which the app writes into the library unless they changed there meanwhile.
 
 Jobs on different chapters, serials or nodes run at the same time. Jobs on the same chapter, and any job beside a
-job that rewrites a serial's bible or voices, wait for each other. A node runs one GPU job at a time.
+job that rewrites a serial's bible or voices, wait for each other. A node runs one GPU job at a time, and LLM_SLOTS
+Claude jobs run at once.
 
 The app's media mirror holds a copy of every take and cast candidate a worker sent it, so a join, a take check and
 a render that reuses takes run on any breeze node, and picking a voice runs on the app's machine. A chapter whose
@@ -34,7 +35,7 @@ from .. import library as lib
 from .. import machine
 from ..breeze import reusable_takes
 from . import exchange
-from .jobs import ROOT, JobManager, _slug, now_iso, read_tail
+from .jobs import ROOT, JobManager, _slug, backlog_wait, between_stages, now_iso, read_tail, start_order
 
 NAMESPACE = "serial-audio"
 PREFIX = "serial-audio"
@@ -43,14 +44,17 @@ GPU_CLASSES = {"breeze", "comfyui"}
 LLM_KINDS = {"character-pass", "screenplay", "bios"}
 # a job with no CLI step: its worker sends the app every take and candidate its node holds for the serial
 SYNC_KIND = "sync-media"
-SERIAL_WIDE = {"character-pass", "cast", "bios", "reset-bible", "pick-voice", "fetch", "say-as", "voice-effect"}
+SERIAL_WIDE = {"character-pass", "cast", "bios", "reset-bible", "pick-voice", "fetch", "say-as", "voice-effect",
+               "say-options"}
 # serial-wide jobs that write only voices/, the bible and serial.yaml, which a chapter job took in its bundle
-CONFIG_WRITERS = {"cast", "bios", "pick-voice", "say-as", "voice-effect"}
+CONFIG_WRITERS = {"cast", "bios", "pick-voice", "say-as", "voice-effect", "say-options"}
 # jobs that write only their chapters' files
 CHAPTER_KINDS = {"render", "screenplay", "check-takes"}
 # pairs of serial-wide jobs that share no file: a fetch writes chapter files, the index and serial.yaml, and bios
 # writes bible/characters.yaml
 NO_SHARED_FILE = {frozenset({"bios", "fetch"})}
+# serial-wide jobs that change nothing a chapter job reads: the options of a term are not its say-as
+NO_CHAPTER_INPUT = {"say-options"}
 # seconds per Breeze take by GPU type, until a node's own render records give its rate
 RATE_DEFAULT = {"nvidia": 3.0, "metal": 18.0, "none": 60.0}
 RATE_MIN_TAKES = 20
@@ -63,9 +67,10 @@ CHECK_PER_TAKE = 0.5
 MOVE_PER_TAKE = 0.05
 # a cast candidate is about nine seconds of audio, two takes' worth
 CAST_TAKES = 2
+OPTION_TAKES = 7
 DEFAULT_LINES = 200
 WAIT_MARGIN = 120.0
-LLM_SLOTS = 1
+LLM_SLOTS = 3
 NODE_POLL = 15.0
 JOB_POLL = 5.0
 END_GRACE = 30.0
@@ -244,6 +249,8 @@ def conflicts(job: dict, other: dict) -> bool:
         return False
     if job["kind"] in CONFIG_WRITERS and other["kind"] in CHAPTER_KINDS:
         return False
+    if job["kind"] in CHAPTER_KINDS and other["kind"] in NO_CHAPTER_INPUT:
+        return False
     if frozenset({job["kind"], other["kind"]}) in NO_SHARED_FILE:
         return False
     if (_is_import(job) and other["kind"] in CONFIG_WRITERS) or (job["kind"] in CONFIG_WRITERS and _is_import(other)):
@@ -290,8 +297,10 @@ def job_stages(job: dict) -> list[dict] | None:
     """The Nomad dispatches a job runs as, in order, or None when it runs on the app's machine.
 
     A cast writes its casting briefs on a Claude node first and then designs the voices on a GPU node, which finds
-    the briefs cached and calls no LLM. Only a Qwen cast needs a ComfyUI node. A take check runs on any breeze
-    node, and picking a voice runs on the app's machine, from the media mirror.
+    the briefs cached and calls no LLM. Only a Qwen cast needs a ComfyUI node. The options of a term are proposed on
+    a Claude node and then said on a breeze node, and a job that only says options, again or with one spelling
+    added, is the breeze stage alone. A take check runs on any breeze node, and picking a voice runs on the app's
+    machine, from the media mirror.
     """
     kind, args = job["kind"], list(job["args"])
     if kind in LLM_KINDS:
@@ -306,6 +315,12 @@ def job_stages(job: dict) -> list[dict] | None:
         voices = [a for a in args if a != "--redo-brief"] + flag
         return [{"class": "llm", "args": args + flag + ["--dry-run"], "label": "casting briefs"},
                 {"class": "comfyui" if engine == "qwen" else "breeze", "args": voices, "label": "voices"}]
+    if kind == "say-options":
+        cut = args.index("--") if "--" in args else len(args)
+        if any(a == "--render-only" or a.startswith("--add=") for a in args[:cut]):
+            return [{"class": "breeze", "args": args}]
+        return [{"class": "llm", "args": args[:cut] + ["--dry-run"] + args[cut:], "label": "respellings"},
+                {"class": "breeze", "args": args[:cut] + ["--render-only"] + args[cut:], "label": "takes"}]
     if kind == "render":
         return [{"class": "comfyui" if job.get("comfy") else "breeze", "args": args}]
     return None
@@ -691,7 +706,7 @@ class NomadJobManager(JobManager):
 
     def _schedule(self, now: float, dispatch: list[str]) -> bool:
         running = [j for j in self.jobs.values() if j["status"] == "running"]
-        queued = sorted((j for j in self.jobs.values() if j["status"] == "queued"), key=lambda j: j["seq"])
+        queued = sorted((j for j in self.jobs.values() if j["status"] == "queued"), key=start_order)
         self.wait_reasons = {}
         self._plan = {}
         blocked: dict[str, dict] = {}
@@ -699,7 +714,11 @@ class NomadJobManager(JobManager):
         for job in queued:
             lane = self.lane(job)
             first = blocked.get(lane)
-            if first and lane not in GPU_CLASSES and (not _starts_beside(job) or conflicts(job, first)):
+            held = (backlog_wait(job, self.jobs.values()) if job.get("backlog") and not between_stages(job)
+                    else None)
+            if held:
+                reason = held
+            elif first and lane not in CLASSES and (not _starts_beside(job) or conflicts(job, first)):
                 reason = f"queued behind {first['title']}"
             else:
                 reason = self._blocker_for(job, lane, running)
@@ -727,8 +746,10 @@ class NomadJobManager(JobManager):
         """Why the queued job cannot start now, or None."""
         if self.paused and (lane in CLASSES or job["heavy"]):
             return "the queue is on hold"
+        # a job that is not backlog work never waits for backlog work that has not started, which waits for it
         earlier = next((j for j in self.jobs.values() if j["status"] == "queued" and j["seq"] < job["seq"]
-                        and conflicts(job, j)), None)
+                        and conflicts(job, j)
+                        and (job.get("backlog") or not j.get("backlog") or between_stages(j))), None)
         if earlier:
             return f"waiting for {earlier['title']}, queued ahead of it on the same serial"
         for other in running:
@@ -767,7 +788,7 @@ class NomadJobManager(JobManager):
             return f"no {lane} node is ready: " + ", ".join(_why_not(n) for n in offering)
         mine = [j for j in running if j.get("nomad") and self.lane(j) == lane]
         if len(mine) >= LLM_SLOTS:
-            return f"waiting for {mine[0]['title']}"
+            return f"waiting for a running Claude job to finish, {LLM_SLOTS} run at once"
         return None
 
     def _pick_node(self, job: dict, lane: str, running: list[dict]) -> tuple[str | None, str | None, str | None]:
@@ -885,6 +906,8 @@ class NomadJobManager(JobManager):
             return 60 + count * CAST_TAKES * rate
         if kind == "pick-voice":
             return 15.0
+        if kind == "say-options":
+            return 60 + OPTION_TAKES * rate
         return 120.0
 
     def _takes_needed(self, job: dict, lines: int) -> int:
@@ -903,8 +926,7 @@ class NomadJobManager(JobManager):
             return cached[1]
         try:
             seed = _int_flag(list(job.get("args") or []), "--seed")
-            reused, spoken = reusable_takes(job["slug"], int(meta["chapters"][0]), 1 if seed is None else seed,
-                                            meta.get("runner"))
+            reused, spoken = reusable_takes(job["slug"], int(meta["chapters"][0]), seed, meta.get("runner"))
             needed = spoken - reused
         except Exception:
             needed = lines
@@ -1099,6 +1121,7 @@ class NomadJobManager(JobManager):
             slug = job["slug"]
 
         # Build outside the lock, then check again
+        fetched = now_iso()
         data = exchange.build_bundle(slug, info)
         with self.lock:
             job = self._worker_job(jid, key, str(info["stage"]))
@@ -1110,7 +1133,7 @@ class NomadJobManager(JobManager):
             if node:
                 n["node"] = node
             if not job.get("started") or n["stage"] == 0:
-                job["started"] = now_iso()
+                job["started"] = fetched
             self._append_log(job, f"[web] {n.get('node') or 'a node'} fetched the bundle ({len(data) / 1e6:.1f} MB)\n")
             self._save()
         return data

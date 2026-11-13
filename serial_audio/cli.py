@@ -315,10 +315,44 @@ def cmd_screenplay(args) -> int:
             continue
         try:
             screenplay_pass(args.slug, n, backend=args.backend, model=args.model, effort=args.effort,
-                            on_limit=args.on_limit)
+                            on_limit=args.on_limit, marks=args.marks)
         except LLMError as e:
             print(f"chapter {n}: {e}", file=sys.stderr)
             return 1
+    return 0
+
+
+def cmd_marks(args) -> int:
+    from .screenplay import marks_pass
+    for n in _chapter_range(args.chapters, lib.list_chapters(args.slug)):
+        if not (lib.chapter_dir(args.slug, n) / "script.json").exists():
+            print(f"chapter {n}: no script, skipping")
+            continue
+        try:
+            marks_pass(args.slug, n, backend=args.backend, model=args.model, effort=args.effort, on_limit=args.on_limit)
+        except LLMError as e:
+            print(f"chapter {n}: {e}", file=sys.stderr)
+            return 1
+    return 0
+
+
+def cmd_audit_scripts(args) -> int:
+    from .screenplay import MAX_ADDED_RUN, MAX_DROPPED_RUN, long_runs
+    numbers = _chapter_range(args.chapters, lib.list_chapters(args.slug))
+    rows, scripts = [], 0
+    for n in numbers:
+        path = lib.chapter_dir(args.slug, n) / "script.json"
+        if not path.exists():
+            continue
+        scripts += 1
+        _, text = lib.load_chapter(args.slug, n)
+        rows += [{"chapter": n, **run} for run in long_runs(text, lib.load_json(path)["lines"])]
+    print(f"{args.slug}: {len({r['chapter'] for r in rows})} of {scripts} scripts have a run of more than "
+          f"{MAX_DROPPED_RUN} dropped or {MAX_ADDED_RUN} added words")
+    if rows:
+        print(f"{'chapter':>8}  {'kind':<8}{'words':>6}{'line':>6}  quote")
+    for r in rows:
+        print(f"{r['chapter']:>8}  {r['kind']:<8}{r['words']:>6}{r['line']:>6}  \"{r['quote']}\"")
     return 0
 
 
@@ -346,6 +380,49 @@ def cmd_check_takes(args) -> int:
         except ComfyError as e:
             print(f"chapter {n}: {e}", file=sys.stderr)
             return 1
+    return 0
+
+
+def cmd_measure_takes(args) -> int:
+    import json
+    from .comfy import ComfyError
+    from .take_report import measure_takes, table
+    numbers = _chapter_range(args.chapters, lib.list_chapters(args.slug))
+    quiet = (lambda *a, **k: print(*a, file=sys.stderr, **k)) if args.json else print
+    try:
+        report = measure_takes(args.slug, numbers, log=quiet, stored=args.stored)
+    except ComfyError as e:
+        print(f"measure-takes: {e}", file=sys.stderr)
+        return 1
+    print(json.dumps(report, ensure_ascii=False) if args.json else table(report))
+    return 0
+
+
+def cmd_backlog(args) -> int:
+    import json
+    from .breeze import render_changes
+    numbers = _chapter_range(args.chapters, lib.list_chapters(args.slug))
+    rows, skipped = [], {}
+    for n in numbers:
+        try:
+            rows.append({"chapter": n, **render_changes(args.slug, n)})
+        except Exception as e:
+            skipped[n] = f"{type(e).__name__}: {e}"
+    found = [r for r in rows if r["make"] or r["retake"] or r["join"]]
+    if args.json:
+        print(json.dumps({"slug": args.slug, "chapters": rows if args.all else found, "skipped": skipped}))
+        return 0
+    print(f"{args.slug}: a render would change {len(found)} of {len(rows)} chapters")
+    print(f"{'chapter':>8}{'spoken':>8}{'make':>6}{'retake':>8}{'join':>6}{'unheard':>9}  last render")
+    for r in rows if args.all else found:
+        print(f"{r['chapter']:>8}{r['spoken']:>8}{r['make']:>6}{r['retake']:>8}{'yes' if r['join'] else '':>6}"
+              f"{r['unheard']:>9}  {r['engine'] or 'none'}")
+    unheard = sum(1 for r in rows if r["unheard"])
+    if unheard:
+        print(f"{unheard} chapters have takes without evidence of the current versions. A check-takes of a chapter "
+              f"hears them and may flag some.")
+    if skipped:
+        print("skipped: " + ", ".join(f"chapter {n} ({why})" for n, why in skipped.items()))
     return 0
 
 
@@ -396,6 +473,30 @@ def cmd_say_as(args) -> int:
         print(f"{args.term}: override removed, read as written")
     else:
         print(f"{args.term}: read as {entry['say']!r}")
+    return 0
+
+
+def cmd_say_options(args) -> int:
+    from .comfy import ComfyError
+    from .pronounce import add_option, options_pass, render_options
+    try:
+        had = {}
+        if args.add is not None:
+            added = add_option(args.slug, args.term, args.add)
+            had = {c.get("say"): c.get("clip") for c in added["candidates"] if isinstance(c, dict)}
+        elif not args.render_only:
+            options_pass(args.slug, args.term, backend=args.backend, model=args.model, effort=args.effort,
+                         on_limit=args.on_limit)
+        if not args.dry_run:
+            options = render_options(args.slug, args.term, comfy_url=args.comfy_url, missing=args.add is not None)
+            said = [c for c in options["candidates"] if c.get("clip") and c["clip"] != had.get(c.get("say"))]
+            print(f"{args.term}: {len(said)} of {len(options['candidates'])} options said by {options.get('voice')}")
+    except (ValueError, FileNotFoundError) as e:
+        print(f"say-options: {e}", file=sys.stderr)
+        return 2
+    except (LLMError, ComfyError) as e:
+        print(f"say-options: {e}", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -506,12 +607,31 @@ def main(argv=None) -> int:
     p.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
     p.add_argument("--on-limit", choices=["api", "wait", "fail"], default="api")
     p.add_argument("--redo", action="store_true")
+    p.add_argument("--marks", action="store_true", help="run the marks pass on each script too")
     p.set_defaults(fn=cmd_screenplay)
+
+    p = sub.add_parser("marks", help="write the emphasis, focus, heteronyms, emotion, energy and pace of each line "
+                                     "into the scripts of chapters. The lines and their takes stay as they are")
+    p.add_argument("slug")
+    p.add_argument("chapters")
+    p.add_argument("--backend", choices=["auto", "subscription", "api"], default="auto")
+    p.add_argument("--model", choices=["opus", "sonnet", "haiku"], default="opus")
+    p.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
+    p.add_argument("--on-limit", choices=["api", "wait", "fail"], default="api")
+    p.set_defaults(fn=cmd_marks)
+
+    p = sub.add_parser("audit-scripts",
+                       help="list the scripts that leave out or add a run of words against their chapter's text. "
+                            "Read-only")
+    p.add_argument("slug")
+    p.add_argument("chapters", nargs="?", default="all")
+    p.set_defaults(fn=cmd_audit_scripts)
 
     p = sub.add_parser("render", help="render scripted chapters with Breeze TTS 2 or Drama 3")
     p.add_argument("slug")
     p.add_argument("chapters")
-    p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--seed", type=int,
+                   help="default: the seed of the chapter's last Breeze render, so its saved takes are reused, else 1")
     p.add_argument("--comfy-url", default="http://127.0.0.1:8188")
     p.add_argument("--engine", choices=["drama3", "breeze"], help="default: serial.yaml render_engine, else breeze")
     p.add_argument("--runner", choices=["cpp", "comfyui"],
@@ -531,6 +651,27 @@ def main(argv=None) -> int:
                    help="qwen3: Qwen3-ASR in ComfyUI. parakeet: Parakeet TDT 0.6B v2 on the CPU. Default: "
                         "SERIAL_AUDIO_ASR, else parakeet when its model is installed, else qwen3")
     p.set_defaults(fn=cmd_check_takes)
+
+    p = sub.add_parser("measure-takes",
+                       help="print each voice's distribution of the take measures over chapters and what the take "
+                            "check's rules flag. It hears with Parakeet the takes that don't have saved evidence, "
+                            "and it doesn't write anything")
+    p.add_argument("slug")
+    p.add_argument("chapters")
+    p.add_argument("--stored", action="store_true",
+                   help="report from the evidence take_check.json holds, from either recognizer, and don't hear a take")
+    p.add_argument("--json", action="store_true",
+                   help="print the report as JSON, with one row per take, in place of the table")
+    p.set_defaults(fn=cmd_measure_takes)
+
+    p = sub.add_parser("backlog",
+                       help="list the chapters a render would change: the takes it would make or take again, and "
+                            "whether it would join audio the chapter doesn't have. Read-only")
+    p.add_argument("slug")
+    p.add_argument("chapters", nargs="?", default="all")
+    p.add_argument("--all", action="store_true", help="list every chapter, also the ones a render would leave as they are")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_backlog)
 
     p = sub.add_parser("pick-voice", help="after listening, file a different candidate (or approve the current one)")
     p.add_argument("slug")
@@ -560,6 +701,22 @@ def main(argv=None) -> int:
     p.add_argument("--note", help="replace the entry's note, or remove it with an empty value")
     p.add_argument("--clear", action="store_true", help="remove the override")
     p.set_defaults(fn=cmd_say_as)
+
+    p = sub.add_parser("say-options", help="propose respellings of a term and have its line's voice say each one. "
+                                           "It doesn't file any of them")
+    p.add_argument("slug")
+    p.add_argument("term", help="the word or name as the text spells it")
+    p.add_argument("--backend", choices=["auto", "subscription", "api"], default="auto")
+    p.add_argument("--model", choices=["opus", "sonnet", "haiku"], default="opus")
+    p.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
+    p.add_argument("--on-limit", choices=["api", "wait", "fail"], default="api")
+    p.add_argument("--comfy-url", default="http://127.0.0.1:8188")
+    stage = p.add_mutually_exclusive_group()
+    stage.add_argument("--dry-run", action="store_true", help="propose and store the respellings, and say none")
+    stage.add_argument("--render-only", action="store_true", help="say the stored respellings again without a new pass")
+    stage.add_argument("--add", metavar="SPELLING", help="add this spelling to the options without a pass, and say "
+                                                         "the options that don't have a take yet")
+    p.set_defaults(fn=cmd_say_options)
 
     p = sub.add_parser("voice-effect", help="set or remove the effect that later renders apply to one voice")
     p.add_argument("slug")

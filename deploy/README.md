@@ -9,7 +9,10 @@ meta offers the job's class:
 * `llm`: the character pass, the screenplay, the casting briefs and the casting bios, which run `claude` under AJ's subscription. dev-arch.
 
 A cast runs as two dispatches: the briefs on an `llm` node, then the voices on a GPU node, which finds the briefs
-cached and doesn't call Claude. The voices stage is a `breeze` job, or a `comfyui` job for a Qwen cast.
+cached and doesn't call Claude. The voices stage is a `breeze` job, or a `comfyui` job for a Qwen cast. The options of
+a name (`say-options`) run the same way: the respellings on an `llm` node, then the takes on a `breeze` node. Hear it
+and Say them on the Names tab don't ask for respellings, so each is one `breeze` job. The takes go to the app's media
+mirror with the job's result, so the Names tab plays them whichever node made them.
 
 Every Breeze job runs while dev-arch and one of the two `breeze` nodes are up, because the app keeps a copy of the
 audio a later job needs from a node (The media mirror, below). A Drama 3 render and a Qwen cast need the laptop.
@@ -158,8 +161,10 @@ so does any job beside one that changes a whole serial (the character pass, a ca
 fetching from the site), with one exception: a cast, casting bios, a voice pick, a say-as or a voice effect starts beside a running
 render, screenplay or take check of its serial once that job has fetched its bundle, because it writes no chapter file
 and the bundle holds the chapter job's copy of the bible, voices, pronunciations and effects. It also passes a chapter job that waits ahead of it in
-its lane. A render queued after one of them still waits for it, and a cast's briefs stage still waits for a running
-screenplay, because the app runs one Claude job at a time. Casting bios and a fetch or an import don't wait for each
+its lane. A render queued after one of them still waits for it. Three Claude jobs run at once on the `llm` node
+(`LLM_SLOTS` in `serial_audio/web/nomad.py`), so the screenplays of three chapters are written together and a cast's
+briefs stage starts beside a running screenplay. A fourth Claude job waits for one of them to finish. A Claude job
+does not wait behind a blocked job in its lane. Casting bios and a fetch or an import don't wait for each
 other, because a fetch writes chapter files, the index and `serial.yaml` and the bios write only the bible. The import
 of a saved page counts as a job on its chapter, because it writes only that chapter's files. It runs beside the renders,
 screenplays and take checks of other chapters, and beside a cast, casting bios, a voice pick, a say-as or a voice
@@ -177,6 +182,18 @@ the stop is asked for. A job of the batch that already runs on another node keep
 An import with "process the chapters after import" ticked queues the same batch behind its imports. A character pass
 or a screenplay queued behind the import of its chapter counts as a job on that chapter before the chapter is on disk,
 so it waits for the import, and a failed import skips it and the jobs that wait for it.
+
+A job queued with `"backlog": true` in its params is backlog work, such as a render of an old chapter that a new
+check wants to fix. It starts only when no other job is running and no job that is not backlog work is queued, so one
+backlog job runs at a time, and a job that is not backlog work never waits for queued backlog work. A running backlog
+job is left to finish, so the next job waits for it by the usual rules. A backlog cast that waits between its briefs
+and its voices counts as running. The job list shows queued jobs in the order they start. Queue backlog work through
+`/api/jobs`:
+
+```
+curl -s -X POST https://audiogen.grayfam.us/api/jobs -H 'Content-Type: application/json' -H 'X-Serial-Audio: 1' \
+  -d '{"jobs": [{"kind": "render", "params": {"slug": "<slug>", "chapter": <n>, "backlog": true}}]}'
+```
 
 The app picks the node for a GPU job, one GPU job per node:
 

@@ -79,3 +79,37 @@ From "The app picks the node for every GPU job" (2026-11-07):
 From the known limits in `deploy/README.md`:
 
 > Saved Breeze takes stay on the node that made them. A rerun on another node renders every line again.
+
+---
+
+## 2026-11-12: one Claude job at a time
+
+### The case
+
+The five screenplays of the batch of chapters 49 to 53 of The Hundred Reigns ran one after the other on dev-arch from
+21:32:58 to 21:45:17, 2.2 to 2.7 minutes each, while the queue showed chapters 51 to 53 as "queued behind
+Screenplay · ch 50". The laptop started the chapter 49 render at 21:35:41. At 21:46 the app estimated the chapter 53
+render about 62 minutes out on aj-legion5, against about 67 on jsc-m1, and kept all five renders for the laptop.
+dev-arch has 12 cores and 24 GB, and its load was 0.08 while one pass ran.
+
+The cluster test after the deploy used a throwaway serial of four chapters of 498 words, deleted afterwards. Its four
+screenplay jobs were queued in one request at 22:07:
+
+* Chapters 1 to 3 started at 22:07:11 on dev-arch, and `ps` there showed three `claude` processes of about 246 MB each. Chapter 4 waited with "waiting for a running Claude job to finish, 3 run at once".
+* The three ended after 50, 51 and 58 seconds. Chapter 4 started at 22:08:03, 2 seconds after the first of them ended.
+* Chapters 1 and 2 wrote their `script.json` and `chapter.yaml` back while another pass ran. No pass reported a limit.
+* Chapters 3 and 4 failed, and the cause was the test's chapters. Their `text.md` had no `# ` heading line, so the check of the script's words counted the spoken heading as five added words, and those two passes kept the heading in both attempts.
+
+### Superseded text
+
+From "A cast, a pick, a say-as or a voice effect starts beside a chapter job of its serial" (2026-11-08):
+
+> A chapter job still waits for any of them, so "cast, then render" renders with the new voice, and a cast's briefs stage still waits for a running screenplay, because the app runs one Claude job at a time.
+
+From "Not decided yet" in `DECISIONS.md` (2026-11-11):
+
+> Whether to raise `LLM_SLOTS` in `serial_audio/web/nomad.py` above 1, so two screenplays run at once. The records don't give a reason for the limit. On 2026-11-11 dev-arch ran two scratch screenplay passes beside a live one, and all three finished. The two live passes that overlapped them took 148 and 146 seconds, against 133 and 158 for the two before. With `LLM_SLOTS = 2` in a scratch copy the scheduler started two screenplays at once. Within one serial's batch the character passes and the cast still ran one at a time. Outside a batch that did not hold: character passes of two serials ran together, casts of two serials ran together, and a cast's briefs stage started beside a running screenplay of its serial, which the 2026-11-08 entry on casts and `deploy/README.md` say it waits for. Only `test_a_batch_job_waits_only_for_the_jobs_it_needs` failed, because it expects one slot, and the tests don't cover a cast beside a screenplay. It would not shorten a batch that renders, because a screenplay took about 2.5 minutes in the batch of chapters 29 to 38 and a render on the laptop took 12 to 17 in the app's job list that day, so the renders set the pace. AJ was told on 2026-11-11.
+
+From How a job runs in `deploy/README.md`:
+
+> A render queued after one of them still waits for it, and a cast's briefs stage still waits for a running screenplay, because the app runs one Claude job at a time.

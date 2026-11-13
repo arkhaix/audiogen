@@ -247,11 +247,11 @@ class _ChapterParser(HTMLParser):
         if tag in ("em", "i"):
             target = self._block if self._block is not None else (None if self._cell is not None else "loose")
             if target == "loose":
-                self._loose = _close_italic(self._loose)
+                self._loose = close_italic(self._loose)
             elif target is not None:
-                target[-1] = _close_italic(target[-1])
+                target[-1] = close_italic(target[-1])
         elif tag in self.BLOCK and self._block is not None:
-            lines = [_fix_italics(_clean(x)) for x in self._block]
+            lines = [fix_italics(_clean(x)) for x in self._block]
             text = "\n".join(l for l in lines if l)
             if text:
                 self._emit(text)
@@ -296,13 +296,15 @@ def _clean(text: str) -> str:
     return re.sub(r"[ \t\r\f\v ]+", " ", text).strip()
 
 
-def _close_italic(text: str) -> str:
+def close_italic(text: str) -> str:
     """Put the closing marker before any trailing whitespace: '*very ' -> '*very* '."""
     stripped = text.rstrip()
     return stripped + "*" + text[len(stripped):]
 
 
-def _fix_italics(text: str) -> str:
+def fix_italics(text: str) -> str:
+    """Returns one line of text with its empty italic runs taken out, back-to-back runs joined, and the markers of a
+    run that holds only punctuation dropped."""
     text = re.sub(r"\*\*", "", text)              # empty or back-to-back runs
     text = re.sub(r"\*([^\w*]*)\*", r"\1", text)  # italics holding only punctuation
     return _clean(text)

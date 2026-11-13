@@ -143,7 +143,9 @@ async function upload(slug, file) {
 
 async function queue(jobs, stopOnFailure = true) {
   const res = await post("/api/jobs", { jobs, stop_on_failure: stopOnFailure });
-  toast(res.jobs.length === 1 ? `Queued: ${res.jobs[0].title}` : `Queued ${res.jobs.length} jobs`);
+  const made = res.jobs.length === 1 ? `Queued: ${res.jobs[0].title}` : `Queued ${res.jobs.length} jobs`;
+  const had = res.already ? `${res.already === 1 ? "1 render was" : `${res.already} renders were`} in the queue already` : "";
+  toast(!had ? made : res.jobs.length ? `${made}. ${had}` : `Nothing new to queue: ${had}`);
   await poll();
   return res.jobs;
 }
@@ -227,6 +229,8 @@ const S = {
   spk: null,
   bibleQ: "",
   bibleImp: "all",
+  namesAll: false,
+  namePicks: {},
   pronEdit: null,
   pronDraft: {},
   sig: "",
@@ -241,7 +245,7 @@ function parseRoute() {
   if (parts[0] === "jobs") return { view: "jobs" };
   if (parts[0] === "s" && parts[1]) {
     if (parts[2] === "c" && parts[3]) return { view: "chapter", slug: parts[1], n: Number(parts[3]) };
-    return { view: "serial", slug: parts[1], tab: ["cast", "bible"].includes(parts[2]) ? parts[2] : "chapters" };
+    return { view: "serial", slug: parts[1], tab: ["cast", "bible", "names"].includes(parts[2]) ? parts[2] : "chapters" };
   }
   return { view: "library" };
 }
@@ -257,7 +261,8 @@ async function fetchFor(r) {
   if (r.view === "jobs") return {};
   if (r.view === "chapter") return get(`/api/serials/${r.slug}/chapters/${r.n}`);
   const base = `/api/serials/${r.slug}`;
-  const extra = r.tab === "cast" ? get(`${base}/voices`) : r.tab === "bible" ? get(`${base}/bible`) : null;
+  const extra = r.tab === "cast" ? get(`${base}/voices`) : r.tab === "bible" ? get(`${base}/bible`)
+    : r.tab === "names" ? get(`${base}/names`) : null;
   const [serial, more] = await Promise.all([get(base), extra]);
   return { serial, extra: more };
 }
@@ -665,6 +670,7 @@ VIEWS.serial = (d, r) => {
   let body;
   if (r.tab === "cast") body = castTab(sd, d.extra, r.slug);
   else if (r.tab === "bible") body = bibleTab(d.extra);
+  else if (r.tab === "names") body = namesTab(d.extra, sd, r.slug);
   else body = chaptersTab(sd, r.slug);
   return serialHead(sd, r.tab) + body;
 };
@@ -690,6 +696,7 @@ function serialHead(sd, tab) {
       ${tabLink("chapters", "Chapters")}
       ${tabLink("cast", "Cast", sd.voices_pending ? ` <span class="count" title="voices to review">${sd.voices_pending}</span>` : "")}
       ${tabLink("bible", "Bible", ` <span class="muted small">${sd.characters}</span>`)}
+      ${tabLink("names", "Names")}
     </nav>`;
 }
 
@@ -857,7 +864,7 @@ async function openProcess(slug) {
       `<label class="inline"><input type="checkbox" name="redo_script"> redo chapters that have one</label>`)}
     ${stage("render", "Render", needRender.length, `${plural(needRender.length, "chapter")} have no audio yet. Runs ${engineLabel(sd.render_engine, sd.render_runner)}.`,
       `<label class="inline"><input type="checkbox" name="rerender"> re-render chapters that have audio</label>
-       <label class="inline">seed <input type="number" name="render_seed" value="1" min="0"></label>`)}
+       <label class="inline" title="Leave empty to keep each chapter's seed, so a render reuses its saved takes. A chapter without a Breeze render uses 1.">seed <input type="number" name="render_seed" value="" min="0" placeholder="same"></label>`)}
     <div id="proc-warn" class="stack"></div>
     ${llmFields()}`;
   openDialog({
@@ -903,7 +910,8 @@ function buildProcess(form, rows, slug) {
     characters: checked(form, "do_characters"), redoCharacters: checked(form, "redo_characters"),
     cast: checked(form, "do_cast"), candidates: num(form, "candidates"), castSeed: num(form, "cast_seed"),
     script: checked(form, "do_script"), redoScript: checked(form, "redo_script"),
-    render: checked(form, "do_render"), rerender: checked(form, "rerender"), renderSeed: num(form, "render_seed"),
+    render: checked(form, "do_render"), rerender: checked(form, "rerender"),
+    renderSeed: field(form, "render_seed").value === "" ? null : num(form, "render_seed"),
     llm: llmParams(form),
   });
 }
@@ -932,7 +940,7 @@ function processJobs(slug, rows, o) {
   if (o.render) {
     for (const c of rows) {
       if ((c.status !== "rendered" || o.rerender) && !chapterBusy(slug, c.number, "render")) {
-        jobs.push({ kind: "render", params: { slug, chapter: c.number, seed: o.renderSeed } });
+        jobs.push({ kind: "render", params: { slug, chapter: c.number, ...(o.renderSeed == null ? {} : { seed: o.renderSeed }) } });
       }
     }
   }
@@ -952,7 +960,7 @@ function importRows(sd, items, force) {
 async function importProcessJobs(slug, rows) {
   return processJobs(slug, rows, {
     characters: true, cast: true, script: true, render: true,
-    candidates: 3, castSeed: await nextCastSeed(slug), renderSeed: 1, llm: storedLLM(),
+    candidates: 3, castSeed: await nextCastSeed(slug), renderSeed: null, llm: storedLLM(),
   });
 }
 
@@ -1222,6 +1230,7 @@ function voiceCard(x, slug) {
         <div class="grow"><h3>${esc(x.name)}</h3><div class="mono small muted">${esc(x.id)}</div></div>
         <span class="pill ${esc(x.status)}">${esc(x.status)}</span></div>
       <div class="small muted">${facts}</div>
+      ${(x.findings || []).length ? `<div class="notice warn small">The take check flags many of this voice's takes for one reason, so the cause may be the voice, and those takes are not taken again: ${x.findings.map((f) => `chapter ${esc(f.chapter)} (${esc(f.reason)}, ${esc(f.takes)} of ${esc(f.of)} takes)`).join(", ")}.</div>` : ""}
       ${x.bio ? `<div class="bio open">${esc(bio)}</div>` : bio ? `<div class="bio" data-act="expand" title="Click to expand">${esc(bio)}</div>` : ""}
       <div class="instruct" data-act="expand" title="Click to expand">${esc(x.instruct)}</div>
       <div class="sample">“${esc(x.sample_text)}”</div>
@@ -1359,6 +1368,90 @@ function bibleTab(b) {
       <tbody>${pron || `<tr><td colspan="6" class="empty">None yet.</td></tr>`}</tbody></table></div>`;
 }
 
+// Names
+
+const NAMES_UNSTABLE = 3;
+
+function notePick(term) {
+  const nm = S.data[routeKey(S.route)]?.extra;
+  const t = nm?.terms.find((x) => x.term === term);
+  (S.namePicks[S.route.slug] ||= {})[term] = t ? t.chapters : [];
+  paint();
+}
+
+function listeningAt(sd) {
+  const started = sd.chapters.filter((c) => c.audio && store.get(`pos:${c.audio.url}`, 0) > 5).map((c) => c.number);
+  return started.length ? Math.max(...started) : 0;
+}
+
+function nameOptions(t, slug, busy) {
+  const o = t.options;
+  const silent = o && o.candidates.every((c) => !c.media);
+  const get = busy ? `<span class="small muted nowrap">working…</span>`
+    : (silent ? `<button class="sm" data-act="name-options" data-term="${esc(t.term)}" data-again="1">Say them</button>` : "")
+      + `<button class="sm" data-act="name-options" data-term="${esc(t.term)}">${o ? "New options" : "Get options"}</button>`;
+  if (!o) return `<div class="row tight"><span class="small muted grow">No options yet. A Claude pass proposes respellings, and the voice says each one in a line of the script.</span>${get}</div>`;
+  const current = t.say || t.term;
+  const rows = o.candidates.map((c) => {
+    const isCurrent = c.say === current;
+    const use = isCurrent ? `<span class="small muted nowrap">in use</span>`
+      : `<button class="sm" data-act="name-use" data-term="${esc(t.term)}" data-say="${esc(c.say)}">Use this</button>`;
+    return `<div class="cand${isCurrent ? " chosen" : ""}">
+      ${c.media ? playBtn(c.media.url, `${t.term} as ${c.say}`) : `<span class="small muted">no clip</span>`}
+      <div><div>${esc(c.say)}${c.say === t.term ? " · as written" : ""}</div>
+        ${c.why && c.say !== t.term ? `<div class="tr">${esc(c.why)}</div>` : ""}
+        ${c.heard ? `<div class="tr">heard as: ${esc(c.heard)}</div>` : ""}</div>
+      <div class="btns">${use}</div></div>`;
+  }).join("");
+  return `<div class="small muted">${o.voice ? `Said by ${esc(o.voice)} in ` : "In "}chapter ${esc(o.line?.chapter)}: ${esc(o.line?.text)}</div>
+    ${rows}<div class="row tight" style="margin-top:6px"><span class="grow"></span>${get}</div>`;
+}
+
+function namesTab(nm, sd, slug) {
+  if (!nm) return `<div class="empty">Loading…</div>`;
+  const jobs = (S.state?.jobs || []).filter((j) => j.slug === slug && (j.status === "queued" || j.status === "running"));
+  const working = new Set(jobs.filter((j) => j.kind === "say-options").map((j) => j.meta?.term));
+  const saving = new Set(jobs.filter((j) => j.kind === "say-as").map((j) => j.meta?.term));
+  const shown = S.namesAll ? nm.terms : nm.terms.filter((t) => t.spellings >= NAMES_UNSTABLE || t.options || t.say);
+  const cards = shown.map((t) => {
+    const i = nm.terms.indexOf(t);
+    const top = t.top.map(([s, n]) => `${esc(s)} <span class="muted">${n}</span>`).join(" · ");
+    const said = saving.has(t.term) ? `<span class="small muted nowrap">saving…</span>`
+      : (working.has(t.term) ? "" : `<button class="sm" data-act="name-hear" data-term="${esc(t.term)}" title="Add this spelling to the options and have the voice say it">Hear it</button>`)
+        + `<button class="sm" data-act="name-say" data-term="${esc(t.term)}" title="Use this spelling from the next render on">Save</button>`
+        + (t.say ? `<button class="sm danger" data-act="name-use" data-term="${esc(t.term)}" data-say="${esc(t.term)}">Read as written</button>` : "");
+    return `<details class="char" data-key="name:${esc(t.term)}" data-name-row data-term="${esc(t.term)}">
+      <summary><span class="name">${esc(t.term)}</span>
+        ${t.spellings ? `<span class="tag">${plural(t.spellings, "spelling")}</span>` : ""}
+        <span class="small muted hide-sm">${t.heard ? `heard ${t.heard} times, ${t.as_written} as sent` : "not heard yet"}</span>
+        <span class="grow"></span>
+        ${t.say ? `<span class="pill approved">${esc(t.say)}</span>` : t.options ? `<span class="pill auto">options</span>` : ""}
+      </summary>
+      <div class="body">
+        ${t.heard ? `<div class="small"><b>Heard as.</b> ${top}${t.spellings > t.top.length ? ` · and ${t.spellings - t.top.length} more` : ""}</div>` : ""}
+        ${t.respelling ? `<div class="small"><b>Bible.</b> <span class="mono">${esc(t.respelling)}</span></div>` : ""}
+        ${nameOptions(t, slug, working.has(t.term))}
+        <div class="row tight" style="margin-top:8px"><input id="name-say-${i}" data-name-say placeholder="or type a spelling to hear or save" value="${esc(t.say)}" maxlength="120" class="grow" style="min-width:160px">${said}</div>
+      </div></details>`;
+  }).join("");
+  const picked = Object.keys(S.namePicks[slug] || {});
+  const chapters = [...new Set(picked.flatMap((term) => S.namePicks[slug][term]))];
+  const heard = listeningAt(sd);
+  const typed = store.get(`names-at:${slug}`, null) || {};
+  const at = typed.heard === heard ? Number(typed.at) || heard : Math.max(Number(typed.at) || 0, heard);
+  const order = chapters.sort((a, b) => a - b);
+  const pass = picked.length ? `<div class="panel pad" style="margin-bottom:12px">
+      <div>You changed ${esc(picked.join(", "))}. ${order.length ? `${plural(order.length, "chapter")} ${order.length === 1 ? "has" : "have"} takes that say ${picked.length === 1 ? "it" : "them"}. The chapters from the one you are on go first.` : "No rendered chapter says them yet."}</div>
+      <div class="row tight" style="margin-top:8px">${order.length ? `<label class="small">I am on chapter <input id="names-at" type="number" min="1" value="${at || ""}" style="width:5em"></label>
+        <button class="sm primary" data-act="names-render" data-heard="${heard}" data-chapters="${esc(JSON.stringify(order))}">Render them when the queue is empty</button>` : ""}
+      <button class="sm ghost" data-act="names-forget">Not now</button></div></div>` : "";
+  const missing = nm.chapters.without.length;
+  return `${pass}<p class="small muted">How the take check heard each name, over ${plural(nm.chapters.with.length, "chapter")}. Many spellings can mean the voice says the name many ways, or only that the recognizer writes it many ways, so listen before you change one.${missing ? ` ${plural(missing, "chapter")} ${missing === 1 ? "has" : "have"} takes that an older check heard without names: ${esc(rangeText(nm.chapters.without))}.` : ""}</p>
+    <div class="row" style="margin-bottom:12px"><span class="muted small grow">${shown.length} of ${plural(nm.terms.length, "name")}</span>
+      <div class="filters"><button class="${S.namesAll ? "" : "on"}" data-act="names-all" data-all="0">${NAMES_UNSTABLE} spellings or more</button><button class="${S.namesAll ? "on" : ""}" data-act="names-all" data-all="1">all</button></div></div>
+    <div class="panel">${cards || `<div class="empty">No name has been heard yet. A render or a take check records them.</div>`}</div>`;
+}
+
 function pronEditRow(p) {
   const draft = S.pronDraft[p.term] || {};
   const val = (k, fallback) => esc(draft[k] ?? fallback ?? "");
@@ -1469,7 +1562,7 @@ function jobRow(j) {
       + `<button class="sm" data-act="job-cancel" data-id="${id}">Cancel</button>`;
   } else btns = (j.started ? log : "") + `<button class="sm" data-act="job-retry" data-id="${id}">Run again</button>`;
   return `<div class="job">
-      <div><div class="row tight"><span class="pill ${esc(j.status)}">${esc(j.status)}</span><span class="title">${esc(j.title)}</span></div>
+      <div><div class="row tight"><span class="pill ${esc(j.status)}">${esc(j.status)}</span><span class="title">${esc(j.title)}</span>${j.backlog ? `<span class="tag" title="Backlog work starts only when no other job runs or waits.">backlog</span>` : ""}</div>
         <div class="meta">${meta.join(" · ")}</div></div>
       <div class="btns">${btns}</div>
       ${j.status === "running" && j.progress ? progressRow(j.progress) : ""}
@@ -1555,6 +1648,44 @@ const ACT = {
     openCast(S.route.slug, el.dataset.mode === "sel" ? [...uselFor(S.route.slug)] : [], v);
   },
   "bible-imp": (el) => { S.bibleImp = el.dataset.imp; paint(); },
+  "names-all": (el) => { S.namesAll = el.dataset.all === "1"; paint(); },
+  "name-options": async (el) => {
+    const params = { slug: S.route.slug, term: el.dataset.term, ...storedLLM(), ...(el.dataset.again ? { render_only: true } : {}) };
+    await queue([{ kind: "say-options", params }]);
+    paint();
+  },
+  "name-use": async (el) => {
+    const { term, say } = el.dataset;
+    const params = say === term ? { slug: S.route.slug, term, clear: true } : { slug: S.route.slug, term, say };
+    await queue([{ kind: "say-as", params }]);
+    notePick(term);
+  },
+  "name-hear": async (el) => {
+    const term = el.dataset.term;
+    const say = el.closest("[data-name-row]").querySelector("[data-name-say]").value.trim();
+    if (!say) throw new Error("Type the spelling the voice should try");
+    await queue([{ kind: "say-options", params: { slug: S.route.slug, term, say } }]);
+    paint();
+  },
+  "name-say": async (el) => {
+    const term = el.dataset.term;
+    const say = el.closest("[data-name-row]").querySelector("[data-name-say]").value.trim();
+    if (!say) throw new Error("Type the spelling the voice should read");
+    if (say === term) throw new Error("That is the name as written. Use Read as written to remove an override");
+    await queue([{ kind: "say-as", params: { slug: S.route.slug, term, say } }]);
+    notePick(term);
+  },
+  "names-render": async (el) => {
+    const at = Number($("#names-at")?.value) || 0;
+    if (at) store.set(`names-at:${S.route.slug}`, { at, heard: Number(el.dataset.heard) || 0 });
+    const all = JSON.parse(el.dataset.chapters);
+    const order = [...all.filter((n) => n >= at), ...all.filter((n) => n < at)];
+    const jobs = order.map((n) => ({ kind: "render", params: { slug: S.route.slug, chapter: n, backlog: true } }));
+    await queue(jobs, false);
+    delete S.namePicks[S.route.slug];
+    paint();
+  },
+  "names-forget": () => { delete S.namePicks[S.route.slug]; paint(); },
   "pron-edit": (el) => {
     S.pronEdit = el.dataset.term;
     paint();
@@ -1648,7 +1779,8 @@ const ACT = {
   "job-move": async (el) => { await post(`/api/jobs/${el.dataset.id}/move`, { direction: el.dataset.dir }); await poll(); },
   "job-retry": async (el) => {
     const res = await post(`/api/jobs/${el.dataset.id}/retry`);
-    toast(`Queued: ${res.job.title}`);
+    const had = (S.state?.jobs || []).some((j) => j.id === res.job.id);
+    toast(`${had ? "In the queue already" : "Queued"}: ${res.job.title}`);
     await poll();
   },
   "jobs-clear": async () => { await post("/api/jobs/clear"); await poll(); },

@@ -12,14 +12,23 @@ import re
 import subprocess
 import tempfile
 import threading
+import unicodedata
 from pathlib import Path
 from typing import Iterator
 
 from . import machine
 from .comfy import ComfyClient, ComfyError, transcribe_graph
-from .parakeet_asr import MODEL_FILES
+from .parakeet_asr import ASR2_FILES, MODEL_FILES, PHONE_FILES, SPEAKER_FILES, VAD_FILES
 
 ENGINES = ("qwen3", "parakeet")
+# the evidence blocks Parakeet's child gathers beside its own, with the model folder and the files each needs
+EXTRA_MODELS = {"vad": ("VAD_MODEL", VAD_FILES, "SERIAL_AUDIO_VAD_MODEL"),
+                "speaker": ("SPEAKER_MODEL", SPEAKER_FILES, "SERIAL_AUDIO_SPEAKER_MODEL"),
+                "asr2": ("ASR2_MODEL", ASR2_FILES, "SERIAL_AUDIO_ASR2_MODEL")}
+# models whose folders model_problems checks, though no block reads them
+LATER_MODELS = {"phone": ("PHONE_MODEL", PHONE_FILES, "SERIAL_AUDIO_PHONE_MODEL")}
+# what loading the optional models gave in this process, by the folders it loaded them from
+_LOADS: dict[tuple, tuple[set[str], dict[str, str]]] = {}
 QWEN3_MODEL = "qwen3_asr_1.7b_bf16.safetensors"
 PARAKEET_SCRIPT = Path(__file__).with_name("parakeet_asr.py")
 PARAKEET_THREADS = 4
@@ -46,13 +55,86 @@ def model_name(engine: str) -> str:
     return QWEN3_MODEL if engine == "qwen3" else f"parakeet:{machine.PARAKEET_MODEL.name}"
 
 
+def extra_blocks() -> set[str]:
+    """The blocks of EXTRA_MODELS this machine can gather: those whose model folder holds all its files and whose
+    model loads under the audio Python. The load is tried once per process for each set of folders. Never raises.
+    """
+    folders = _present()
+    if not folders:
+        return set()
+    key = tuple(folders.items())
+    if key not in _LOADS:
+        _LOADS[key] = _load(folders)
+    return set(folders) & _LOADS[key][0]
+
+
+def _present() -> dict[str, str]:
+    """{block: folder} for the blocks of EXTRA_MODELS whose folder exists and holds all its files."""
+    problems = _file_problems()
+    return {block: str(getattr(machine, EXTRA_MODELS[block][0])) for block in EXTRA_MODELS
+            if block not in problems and _folder_exists(block)}
+
+
+def _load(folders: dict[str, str]) -> tuple[set[str], dict[str, str]]:
+    """(the blocks whose models loaded, {block: error} for the others), from the child's check of the folders."""
+    job = {"check": True, "blocks": sorted(folders), "model": str(machine.PARAKEET_MODEL), **folders}
+    kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW} if machine.WINDOWS else {}
+    try:
+        done = subprocess.run([str(machine.AUDIO_PYTHON), "-I", str(PARAKEET_SCRIPT)], input=json.dumps(job),
+                              capture_output=True, text=True, timeout=LOAD_TIMEOUT, **kwargs)
+        got = json.loads((done.stdout or "").strip().splitlines()[-1])
+        listed, failed = got.get("loaded"), got.get("errors")
+        loaded = {b for b in (listed if isinstance(listed, list) else []) if isinstance(b, str) and b in folders}
+        errors = {b: str(e) for b, e in (failed.items() if isinstance(failed, dict) else ()) if b in folders}
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError, AttributeError, TypeError,
+            RecursionError) as e:
+        return set(), {b: f"the audio Python could not load it: {type(e).__name__}: {e}" for b in folders}
+    return loaded, {**{b: "it did not load" for b in folders if b not in loaded and b not in errors}, **errors}
+
+
+def _folder_exists(block: str) -> bool:
+    try:
+        return getattr(machine, EXTRA_MODELS[block][0]).is_dir()
+    except OSError:
+        return False
+
+
+def model_problems() -> dict[str, str]:
+    """The take check's optional model folders that exist and lack a file, or whose model didn't load.
+
+    Returns {block: problem}, for the blocks of EXTRA_MODELS and LATER_MODELS, with a problem that names the
+    missing files or the load error, and the variable that moves the folder. A folder that doesn't exist is not a
+    problem, and a load is reported only after extra_blocks tried it in this process. Never raises.
+    """
+    out = _file_problems()
+    _, errors = _LOADS.get(tuple(_present().items()), (set(), {}))
+    for block, error in errors.items():
+        out.setdefault(block, f"the take check's {block} model doesn't load ({error}); see {EXTRA_MODELS[block][2]}")
+    return out
+
+
+def _file_problems() -> dict[str, str]:
+    out = {}
+    for block, (attr, names, variable) in {**EXTRA_MODELS, **LATER_MODELS}.items():
+        try:
+            folder = getattr(machine, attr)
+            if folder.is_dir():
+                missing = [str(folder / name) for name in names if not (folder / name).is_file()]
+                if missing:
+                    out[block] = f"the take check's {block} model needs {', '.join(missing)}; see {variable}"
+        except OSError:
+            pass
+    return out
+
+
 def check_ready(engine: str, comfy_url: str) -> None:
     """Raises ComfyError when the recognizer cannot run on this machine.
 
     engine: "qwen3" or "parakeet".
     comfy_url: the ComfyUI that runs Qwen3-ASR.
     For qwen3, ComfyUI must answer. For parakeet, the model files must exist and the audio Python must import
-    sherpa-onnx, soundfile and scipy.
+    sherpa-onnx, soundfile, numpy and scipy. A folder of EXTRA_MODELS that doesn't exist or lacks a file only leaves
+    its block out, and model_problems lists the second kind.
     """
     if engine == "qwen3":
         try:
@@ -66,22 +148,30 @@ def check_ready(engine: str, comfy_url: str) -> None:
         raise ComfyError(f"Parakeet needs {', '.join(missing)}; see SERIAL_AUDIO_PARAKEET_MODEL")
     kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW} if machine.WINDOWS else {}
     try:
-        done = subprocess.run([str(machine.AUDIO_PYTHON), "-I", "-c", "import sherpa_onnx, soundfile, scipy.signal"],
+        done = subprocess.run([str(machine.AUDIO_PYTHON), "-I", "-c",
+                               "import sherpa_onnx, soundfile, numpy, scipy.signal"],
                               capture_output=True, text=True, timeout=IMPORT_TIMEOUT, **kwargs)
     except (OSError, subprocess.SubprocessError) as e:
         raise ComfyError(f"Parakeet could not run {machine.AUDIO_PYTHON}: {e}") from None
     if done.returncode != 0:
-        raise ComfyError(f"Parakeet needs sherpa-onnx, soundfile and scipy in {machine.AUDIO_PYTHON}: "
+        raise ComfyError(f"Parakeet needs sherpa-onnx, soundfile, numpy and scipy in {machine.AUDIO_PYTHON}: "
                          f"{(done.stderr or done.stdout).strip()[-500:]}")
 
 
-def transcripts(files: list[Path], *, engine: str, comfy_url: str) -> Iterator[tuple[int, str]]:
-    """Transcribes the files in order.
+def records(files: list[Path], *, engine: str, comfy_url: str,
+            blocks: tuple[str, ...] = ("asr", "signal")) -> Iterator[tuple[int, dict]]:
+    """Hears the files in order.
 
     files: the audio files.
     engine: "qwen3" or "parakeet".
     comfy_url: the ComfyUI that runs Qwen3-ASR.
-    Yields (index, transcript) for each file, in order, as each finishes. Raises ComfyError when a file lies outside
+    blocks: for parakeet, the evidence to gather, from parakeet_asr.BLOCKS. A block of EXTRA_MODELS that this
+        machine can't gather, by extra_blocks, is left out, and so is one whose model doesn't load. Qwen3-ASR gives
+        the transcript only.
+    Yields (index, record) for each file, in order, as each finishes. A record holds the transcript as "text" when
+    the transcript was asked for. Parakeet adds its raw "tokens" with their "starts", "durations" and "logprobs",
+    one of each per token, and a block under its own name for each other block it gathered, as parakeet_asr
+    describes them. Raises ComfyError when a file lies outside
     ComfyUI's output folder for qwen3, when a file cannot be transcribed, or when the recognizer fails or stalls.
     """
     if not files:
@@ -89,10 +179,10 @@ def transcripts(files: list[Path], *, engine: str, comfy_url: str) -> Iterator[t
     if engine == "qwen3":
         yield from _qwen3(files, comfy_url)
     else:
-        yield from _parakeet(files)
+        yield from _parakeet(files, blocks)
 
 
-def _qwen3(files: list[Path], comfy_url: str) -> Iterator[tuple[int, str]]:
+def _qwen3(files: list[Path], comfy_url: str) -> Iterator[tuple[int, dict]]:
     output = machine.COMFY_OUTPUT
     refs = []
     for file in files:
@@ -105,7 +195,7 @@ def _qwen3(files: list[Path], comfy_url: str) -> Iterator[tuple[int, str]]:
     try:
         for i, rel in enumerate(refs):
             entry = client.run(transcribe_graph(clip_ref=f"{rel} [output]", asr_model=QWEN3_MODEL), timeout=FILE_TIMEOUT)
-            yield i, " ".join(entry.get("outputs", {}).get("transcript", {}).get("text") or [])
+            yield i, {"text": " ".join(entry.get("outputs", {}).get("transcript", {}).get("text") or [])}
     finally:
         try:
             client.free()
@@ -113,8 +203,11 @@ def _qwen3(files: list[Path], comfy_url: str) -> Iterator[tuple[int, str]]:
             pass
 
 
-def _parakeet(files: list[Path]) -> Iterator[tuple[int, str]]:
-    job = {"model": str(machine.PARAKEET_MODEL), "files": [str(f) for f in files], "threads": PARAKEET_THREADS}
+def _parakeet(files: list[Path], blocks: tuple[str, ...]) -> Iterator[tuple[int, dict]]:
+    extras = extra_blocks() if set(blocks) & set(EXTRA_MODELS) else set()
+    job = {"model": str(machine.PARAKEET_MODEL), "files": [str(f) for f in files], "threads": PARAKEET_THREADS,
+           "blocks": [b for b in blocks if b not in EXTRA_MODELS or b in extras],
+           **{b: str(getattr(machine, EXTRA_MODELS[b][0])) for b in sorted(extras)}}
     kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW} if machine.WINDOWS else {}
     with tempfile.TemporaryFile() as err:
         try:
@@ -157,7 +250,8 @@ def _parakeet(files: list[Path]) -> Iterator[tuple[int, str]]:
                     continue
                 if "error" in record:
                     raise ComfyError(f"Parakeet could not transcribe {files[expected]}: {record['error']}")
-                yield expected, str(record.get("text") or "")
+                yield expected, {**{k: v for k, v in record.items() if k != "index"},
+                                 **({"text": str(record.get("text") or "")} if "asr" in job["blocks"] else {})}
                 expected, wait = expected + 1, FILE_TIMEOUT
             try:
                 proc.wait(timeout=EXIT_TIMEOUT)
@@ -195,11 +289,18 @@ ORDINALS.update({w[:-1] + "ieth": v for w, v in TENS.items()})
 ORDINALS.update({w + "th": v for w, v in SCALES.items()})
 NUMBER_WORDS = set(ONES) | set(TENS) | set(SCALES) | set(ORDINALS)
 TOKEN_RE = re.compile(r"[a-z0-9']+|[,.;:!?]")
+TITLES = {"mr": "mister", "mrs": "missus", "dr": "doctor"}
+TITLE_RE = re.compile(r"\b(mr|mrs|dr)\b\.?")
+STUTTER_RE = re.compile(r"\b([a-z]|[cstw]h)-(?=\1)")
+PUNCTUATION = frozenset(",.;:!?")
 DIGIT_ORDINAL_RE = re.compile(r"^(\d+)(?:st|nd|rd|th)$")
 
 
 def _symbols(text: str) -> str:
     text = text.lower().replace("’", "'").replace("‘", "'").replace("′", "'").replace("″", '"')
+    text = "".join(c for c in unicodedata.normalize("NFD", text) if not unicodedata.combining(c))
+    text = TITLE_RE.sub(lambda m: TITLES[m.group(1)], text)
+    text = STUTTER_RE.sub("", text)
     text = re.sub(r"(?<=\d),(?=\d{3}\b)", "", text)
     text = re.sub(r"(?<=\d)\.(?=\d)", " point ", text)
     text = re.sub(r"(?<=\d):(?=\d\d\b)", " ", text)
@@ -210,19 +311,20 @@ def _symbols(text: str) -> str:
     return re.sub(r"(minutes\s+\d+)\s*\"", r"\1 seconds ", text)
 
 
-def _number_groups(tokens: list[str]) -> list[str]:
-    """Each run of number words as its digits and an ordinal as <n>th. A two digit group right after a group of
-    one or two digits joins it, so "eighteen sixty six" matches "1866" and "ten thirty" matches "10:30"."""
-    out: list[str] = []
+def _number_groups(tokens: list[str]) -> list[tuple[str, int]]:
+    """Each run of number words as its digits and an ordinal as <n>th, with the index of the last token each word
+    was made from. A two digit group right after a group of one or two digits joins it, so "eighteen sixty six"
+    matches "1866" and "ten thirty" matches "10:30"."""
+    out: list[tuple[str, int]] = []
     joinable = False
 
-    def push(digits: str) -> None:
+    def push(digits: str, last: int) -> None:
         nonlocal joinable
-        if joinable and len(out[-1]) <= 2 and len(digits) == 2:
-            out[-1] += digits
+        if joinable and len(out[-1][0]) <= 2 and len(digits) == 2:
+            out[-1] = (out[-1][0] + digits, last)
             joinable = False
         else:
-            out.append(digits)
+            out.append((digits, last))
             joinable = True
 
     i = 0
@@ -233,14 +335,14 @@ def _number_groups(tokens: list[str]) -> list[str]:
         if not start:
             m = DIGIT_ORDINAL_RE.match(tok)
             if m:
-                out.append(f"{int(m.group(1))}th")
+                out.append((f"{int(m.group(1))}th", i))
                 joinable = False
             elif tok.isdigit():
-                push(tok)
-            elif tok in ",.;:!?":
+                push(tok, i)
+            elif tok in PUNCTUATION:
                 joinable = False
             else:
-                out.append(tok)
+                out.append((tok, i))
                 joinable = False
             i += 1
             continue
@@ -284,18 +386,39 @@ def _number_groups(tokens: list[str]) -> list[str]:
             i += 1
         value = str(total + current)
         if ordinal:
-            out.append(value + "th")
+            out.append((value + "th", i - 1))
             joinable = False
         else:
-            push(value)
+            push(value, i - 1)
+    return out
+
+
+def word_map(text: str) -> list[tuple[str, str]]:
+    """The comparable words of a line or transcript, each with what stands between it and the next word.
+
+    text: a line or a transcript.
+    Returns [(word, after), ...]. The words are the ones words() gives. after holds every character between the
+    word and the next one, or the end of the text, that is not a space, so "" means only spaces lie between.
+    """
+    spoken = _symbols(text)
+    found = [(m.group().strip("'"), m.start(), m.end()) for m in TOKEN_RE.finditer(spoken)]
+    found = [(w[:-2] if w.endswith("s's") else w, a, b) for w, a, b in found if w]
+    out = []
+    for word, last in _number_groups([f[0] for f in found]):
+        nxt = last + 1
+        while nxt < len(found) and found[nxt][0] in PUNCTUATION:
+            nxt += 1
+        gap = spoken[found[last][2]: found[nxt][1] if nxt < len(found) else len(spoken)]
+        out.append((word, "".join(gap.split())))
     return out
 
 
 def words(text: str) -> list[str]:
     """The comparable words of a line or transcript.
 
-    Lower case, straight apostrophes, no punctuation. Numbers become digits whether they are spelled out or written
-    as digits, ordinals become <n>th, and %, °, $ and £ become words, so "a hundred and fifty" and "150" compare equal.
+    Lower case, straight apostrophes, no accents, no punctuation. Numbers become digits whether they are spelled out
+    or written as digits, ordinals become <n>th, and %, °, $ and £ become words, so "a hundred and fifty" and "150"
+    compare equal. Mr, Mrs and Dr become mister, missus and doctor, and a possessive of a word that ends in s loses
+    its 's, so "Thalas's" and "Thalas'" compare equal. The fragment of a stutter is left out, so "Y-yes" is "yes".
     """
-    tokens = [t.strip("'") for t in TOKEN_RE.findall(_symbols(text))]
-    return _number_groups([t for t in tokens if t])
+    return [word for word, _ in word_map(text)]

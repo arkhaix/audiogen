@@ -1,0 +1,20 @@
+{
+  "type": "object",
+  "properties": {
+    "options": {
+      "type": "array",
+      "description": "Four to six respellings of the term, each read differently from the others.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "say": {"type": "string", "description": "The respelling, as it would stand in for the term in a sentence."},
+          "why": {"type": "string", "description": "One short sentence on how it is meant to sound."}
+        },
+        "required": ["say", "why"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["options"],
+  "additionalProperties": false
+}

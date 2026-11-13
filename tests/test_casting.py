@@ -2,13 +2,15 @@
 casting bios, with a fake LLM."""
 from __future__ import annotations
 
+import json
 import re
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from serial_audio import asr, breeze, casting, machine
+from serial_audio import asr, breeze, casting, machine, pronounce
 from serial_audio import library as lib
 from serial_audio.comfy import ComfyError
 from serial_audio.llm import LLMError, PassResult
@@ -38,6 +40,9 @@ class FakeLLM:
         else:
             data = {"voices": [{"id": i, "instruct": f"The voice of {i}.", "sample_text": SAMPLE} for i in ids]}
         return PassResult(data=data, backend="fake", model="fake", cost_estimate_usd=0.0)
+
+
+REAL_LEVEL = casting.level_clips
 
 
 class FakeServer:
@@ -75,10 +80,11 @@ class FakeServer:
 
 def heard_for(good_seed: int):
     """A fake recognizer that hears the sample line in the take of good_seed and a loop in every other take."""
-    def transcripts(files, *, engine, comfy_url):
+    def records(files, *, engine, comfy_url):
         for i, f in enumerate(files):
-            yield i, ("I have waited 150 years for this." if f"_s{good_seed}" in Path(f).name else "This this this.")
-    return transcripts
+            yield i, {"text": "I have waited 150 years for this." if f"_s{good_seed}" in Path(f).name
+                      else "This this this."}
+    return records
 
 
 class BreezeCastTest(unittest.TestCase):
@@ -90,7 +96,9 @@ class BreezeCastTest(unittest.TestCase):
                    mock.patch.object(breeze, "CppServer", FakeServer),
                    mock.patch.object(breeze, "wait_comfy_idle", lambda *a, **k: None),
                    mock.patch.object(breeze, "free_comfy", lambda *a, **k: None),
-                   mock.patch.object(asr, "check_ready", lambda *a, **k: None)]
+                   mock.patch.object(asr, "check_ready", lambda *a, **k: None),
+                   mock.patch.object(casting, "level_clips", self.level)]
+        self.leveled: list[tuple[str, bool]] = []
         for p in patches:
             p.start()
             self.addCleanup(p.stop)
@@ -107,8 +115,16 @@ class BreezeCastTest(unittest.TestCase):
         lib.save_yaml(lib.serial_dir(SLUG) / "voices" / "_briefs.yaml",
                       {"meredith": BRIEF, "ann": {"id": "ann", "instruct": "A low alto.", "sample_text": "Ann speaks."}})
 
+    def level(self, candidates, log=print):
+        """Stands in for the leveler: notes each clip and whether it was scored yet, and marks the clip's file."""
+        for c in candidates:
+            self.leveled.append((Path(c["clip"]).name, "score" in c))
+            with open(c["clip"], "ab") as f:
+                f.write(b"leveled")
+            c["lufs"] = -18.0
+
     def cast(self, good_seed: int, seed0: int = 1000, **kwargs):
-        with mock.patch.object(asr, "transcripts", heard_for(good_seed)):
+        with mock.patch.object(asr, "records", heard_for(good_seed)):
             return casting.cast(SLUG, only=["meredith"], candidates=3, seed0=seed0, engine="breeze", asr="parakeet",
                                 log=lambda *_: None, **kwargs)
 
@@ -150,6 +166,12 @@ class BreezeCastTest(unittest.TestCase):
         self.assertEqual(lib.load_yaml(voices / "meredith.yaml")["engine"], "breeze")
         self.assertEqual(lib.load_bible(SLUG)["characters"]["meredith"]["voice_id"], "meredith")
 
+        # Level: every candidate's clip is leveled after it was scored, and the filed clip is the leveled one.
+        self.assertEqual(self.leveled, [("meredith_s1000.wav", True), ("meredith_s1001.wav", True),
+                                        ("meredith_s1002.wav", True)])
+        self.assertTrue((voices / "meredith.wav").read_bytes().endswith(b"leveled"))
+        self.assertEqual([c["lufs"] for c in record["candidates"]], [-18.0, -18.0, -18.0])
+
     def test_recast_and_pick_keep_the_engine(self):
         # A recast moves the first batch to history with its engine and recognizer.
         self.cast(good_seed=1001)
@@ -172,6 +194,33 @@ class BreezeCastTest(unittest.TestCase):
         self.assertTrue(Path(first_clip).is_file())
         self.assertEqual([h["seed"] for h in again["history"]], [2002, 1001])
 
+    def test_the_leveler_runs_the_join_script_and_never_stops_a_cast(self):
+        clips = [{"clip": "a.wav"}, {"clip": "b.wav"}]
+        logs: list[str] = []
+        answer = json.dumps([{"file": "a.wav", "before": -27.3, "after": -18.0, "peak": -4.0},
+                             {"file": "b.wav", "before": None, "after": None, "peak": None}])
+
+        # The audio Python gets the join script and the clips, and each clip with a level gets it recorded.
+        with mock.patch.object(casting.subprocess, "run",
+                               return_value=subprocess.CompletedProcess([], 0, "noise\n" + answer, "")) as run:
+            REAL_LEVEL(clips, logs.append)
+        args = run.call_args[0][0]
+        self.assertEqual(args[1:], ["-I", str(casting.LEVEL_SCRIPT), "--level", "a.wav", "b.wav"])
+        self.assertEqual(clips, [{"clip": "a.wav", "lufs": -18.0}, {"clip": "b.wav"}])
+        self.assertIn("-27.3 to -18.0", logs[-1])
+
+        # A failure of the audio Python, a missing one and an answer that isn't the list leave the clips alone.
+        for outcome in (subprocess.CompletedProcess([], 1, "", "Traceback: no soundfile"),
+                        subprocess.CompletedProcess([], 0, "{}", ""), subprocess.CompletedProcess([], 0, "", ""),
+                        OSError("no such file")):
+            clips = [{"clip": "a.wav"}]
+            patch = (mock.patch.object(casting.subprocess, "run", side_effect=outcome) if isinstance(outcome, OSError)
+                     else mock.patch.object(casting.subprocess, "run", return_value=outcome))
+            with patch:
+                REAL_LEVEL(clips, logs.append)
+            self.assertEqual(clips, [{"clip": "a.wav"}], outcome)
+            self.assertIn("were not leveled", logs[-1])
+
     def test_a_clipped_candidate_is_chosen_last(self):
         # The best match is clipped, so the next candidate is filed and the clipped one is marked.
         FakeServer.clipped_seeds = frozenset({1001})
@@ -193,7 +242,7 @@ class BreezeCastTest(unittest.TestCase):
     def test_a_failed_design_files_the_voices_before_it(self):
         # Design: ann's design fails after meredith's three succeed, and the server still stops.
         FakeServer.fail_text = "Ann speaks."
-        with mock.patch.object(asr, "transcripts", heard_for(1001)), self.assertRaises(ComfyError) as e:
+        with mock.patch.object(asr, "records", heard_for(1001)), self.assertRaises(ComfyError) as e:
             casting.cast(SLUG, only=["meredith", "ann"], candidates=3, engine="breeze", asr="parakeet",
                          log=lambda *_: None)
         self.assertIn("designing ann seed 1000 failed", str(e.exception))
@@ -236,7 +285,7 @@ class BreezeCastTest(unittest.TestCase):
             # the bio stays as it was.
             llm.drop = {"meredith"}
             lines = []
-            with mock.patch.object(asr, "transcripts", heard_for(4001)):
+            with mock.patch.object(asr, "records", heard_for(4001)):
                 [record] = casting.cast(SLUG, only=["meredith"], candidates=3, seed0=4000, engine="breeze",
                                         asr="parakeet", recast=True, redo_brief=True, log=lines.append)
             self.assertEqual(record["seed"], 4001)
@@ -372,6 +421,262 @@ class BreezeCastTest(unittest.TestCase):
             staged.unlink()
             self.assertEqual(render.stage_drama3_voices(SLUG, {"meredith"}), ["meredith"])
             self.assertTrue(staged.is_file())
+
+
+OPTIONS_SCRIPT = [{"speaker": "narrator", "text": "Chapter One.", "direction": ""},
+                  {"speaker": "narrator", "text": "Eole!", "direction": ""},
+                  {"speaker": "narrator", "text": "The guard told Louis that Eole had not come back.", "direction": "flatly"},
+                  {"speaker": "narrator", "text": "Nobody had seen the Eolean hills.", "direction": ""}]
+
+
+class SayOptionsTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        (root / "ref.wav").write_bytes(b"ref")
+        self.answers: list[dict] = []
+        self.inputs: list[str] = []
+
+        def run_pass(system_prompt, user_text, schema, **kwargs):
+            self.inputs.append(user_text)
+            return PassResult(data=self.answers.pop(0), backend="fake", model="fake", cost_estimate_usd=0.0)
+
+        def stage(slug, voices, runner):
+            return {v: {"ref": str(root / "ref.wav"), "transcript": "t", "sha1": "s" * 40} for v in voices}
+
+        def hears(files, *, engine, comfy_url):
+            for i, f in enumerate(files):
+                yield i, {"text": f"heard {Path(f).name[-5]}"}
+
+        class Server(FakeServer):
+            """A take of four seconds, a length the options' line may have, so each candidate is one request."""
+
+            def take(self, fields, wav, label, log):
+                return super().take(fields, wav, label, log) * 4
+
+        for p in (mock.patch.object(lib, "LIBRARY", root / "library"),
+                  mock.patch.object(pronounce, "SAY_OUTPUT", root / "output" / "breeze" / "say"),
+                  mock.patch.object(pronounce, "run_pass", run_pass),
+                  mock.patch.object(breeze, "CppServer", Server),
+                  mock.patch.object(breeze, "wait_comfy_idle", lambda *a, **k: None),
+                  mock.patch.object(breeze, "free_comfy", lambda *a, **k: None),
+                  mock.patch.object(breeze, "stage_references", stage),
+                  mock.patch.object(asr, "choose", lambda *a, **k: "parakeet"),
+                  mock.patch.object(asr, "records", hears)):
+            p.start()
+            self.addCleanup(p.stop)
+        FakeServer.instances.clear()
+        FakeServer.fail_text = None
+        FakeServer.clipped_seeds = frozenset()
+        lib.save_serial(SLUG, {"title": "Design Test", "author": "A. Writer", "narrator_voice_id": "narrator",
+                               "narration": {"point_of_view": "third_person"}})
+        lib.save_bible(SLUG, {"characters": {"eole": {"name": "Eole", "description": "A winged singer."}},
+                              "pronunciations": {"Eole": {"respelling": "ay-OHL", "note": "French."},
+                                                 "Louis": {"say": "Lewis"}}})
+        lib.save_yaml(lib.serial_dir(SLUG) / "voices" / "narrator.yaml", {"clip": "narrator.wav", "sample_text": "t"})
+        folder = lib.chapter_dir(SLUG, 1)
+        folder.mkdir(parents=True)
+        (folder / "text.md").write_text("x", encoding="utf-8")
+        lib.save_chapter_meta(SLUG, 1, {"number": 1, "render": {"engine": "breeze", "seed": 5}})
+        lib.save_json(folder / "script.json", {"lines": OPTIONS_SCRIPT})
+
+    def entry(self) -> dict:
+        return lib.load_yaml(lib.serial_dir(SLUG) / "bible" / "pronunciations.yaml")["Eole"]
+
+    def test_the_pass_stores_the_respellings_beside_the_term_as_written(self):
+        # The answer repeats the term, repeats a respelling in another case, has one without a letter and has more
+        # than the limit.
+        self.answers.append({"options": [{"say": "Ay-ole", "why": "Two beats."}, {"say": "Eole", "why": "x"},
+                                         {"say": "ay-ole", "why": "x"}, {"say": "123", "why": "x"}]
+                                        + [{"say": f"Option {c}", "why": "x"} for c in "abcdefg"]})
+        options = pronounce.options_pass(SLUG, "Eole", log=lambda *_: None)
+
+        # The term as written is first, then six respellings, each once. The line is the first of a sayable length,
+        # found as a say-as would find it, so "Eolean" is not the term.
+        self.assertEqual([c["say"] for c in options["candidates"]],
+                         ["Eole", "Ay-ole", "Option a", "Option b", "Option c", "Option d", "Option e"])
+        self.assertEqual(options["candidates"][0]["why"], "as written")
+        self.assertEqual(options["line"], {"chapter": 1, "index": 2, "speaker": "narrator",
+                                           "text": OPTIONS_SCRIPT[2]["text"]})
+        self.assertEqual([i for _, i, _ in pronounce.lines_naming(SLUG, "Eole")], [1, 2])
+
+        # The pass read the term, what the bible says about its sound, who it is and the lines that have it.
+        for part in ("## Term\n\nEole", "respelling: ay-OHL", "note: French.", "Eole: A winged singer.",
+                     "- chapter 1, narrator: Eole!"):
+            self.assertIn(part, self.inputs[0])
+
+        # The entry keeps its respelling, gets the options, and doesn't get a say-as. Another entry is as it was.
+        saved = lib.load_yaml(lib.serial_dir(SLUG) / "bible" / "pronunciations.yaml")
+        self.assertEqual((saved["Eole"]["respelling"], saved["Eole"]["options"], "say" in saved["Eole"]),
+                         ("ay-OHL", options, False))
+        self.assertEqual(saved["Louis"], {"say": "Lewis"})
+
+        # The pass also gets the respelling of a longer term that has the word, and a line of a chapter with a
+        # Breeze render is chosen before an earlier line of a chapter without one.
+        bible = lib.load_bible(SLUG)
+        bible["pronunciations"]["Eole Ashmodai"] = {"respelling": "ay-OHL ash-moh-DYE"}
+        self.assertIn("in Eole Ashmodai: ay-OHL ash-moh-DYE",
+                      pronounce._options_input({"title": "t"}, bible, "Eole", pronounce.lines_naming(SLUG, "Eole")))
+        early = lib.chapter_dir(SLUG, 0)
+        early.mkdir(parents=True)
+        (early / "text.md").write_text("x", encoding="utf-8")
+        lib.save_chapter_meta(SLUG, 0, {"number": 0, "render": {"codes_file": "x"}})
+        lib.save_json(early / "script.json", {"lines": [{"speaker": "narrator", "direction": "",
+                                                         "text": "Nobody in the harbour had ever heard of Eole."}]})
+        self.answers.append({"options": [{"say": "Ay-ole", "why": "x"}]})
+        self.assertEqual(pronounce.options_pass(SLUG, "Eole", log=lambda *_: None)["line"]["chapter"], 1)
+        lib.save_yaml(lib.serial_dir(SLUG) / "bible" / "pronunciations.yaml",
+                      {**lib.load_yaml(lib.serial_dir(SLUG) / "bible" / "pronunciations.yaml"), "Eole": saved["Eole"]})
+
+        # Removing a say-as leaves an entry that has options, and removes one that has neither a respelling nor
+        # options.
+        pronounce.set_say_as(SLUG, "Eole", "Ay-ole")
+        pronounce.set_say_as(SLUG, "Eole", None, clear=True)
+        self.assertEqual(self.entry()["options"], options)
+        pronounce.set_say_as(SLUG, "Guard", "Gard")
+        self.assertIsNone(pronounce.set_say_as(SLUG, "Guard", None, clear=True))
+
+        # A term no line has, and an answer without a usable respelling, change nothing.
+        with self.assertRaises(ValueError):
+            pronounce.options_pass(SLUG, "Vouivre", log=lambda *_: None)
+        self.answers.append({"options": [{"say": "Eole", "why": "x"}]})
+        with self.assertRaises(LLMError):
+            pronounce.options_pass(SLUG, "Eole", log=lambda *_: None)
+        self.assertEqual(self.entry()["options"], options)
+
+    def test_each_option_is_said_in_its_line_by_the_lines_voice(self):
+        # A term without options has nothing to say.
+        with self.assertRaises(ValueError):
+            pronounce.render_options(SLUG, "Eole", log=lambda *_: None)
+        self.answers.append({"options": [{"say": "Ay-ole", "why": "x"}, {"say": "Yole", "why": "x"}]})
+        pronounce.options_pass(SLUG, "Eole", log=lambda *_: None)
+        options = pronounce.render_options(SLUG, "Eole", log=lambda *_: None)
+
+        # One server session says the line three times, with the term as each candidate spells it, and with the
+        # other say-as of the line, the line's direction, one seed and the voice's reference clip every time.
+        [server] = FakeServer.instances
+        self.assertFalse(server.running)
+        self.assertEqual([f["text"] for f, _ in server.requests],
+                         ["The guard told Lewis that Eole had not come back.",
+                          "The guard told Lewis that Ay-ole had not come back.",
+                          "The guard told Lewis that Yole had not come back."])
+        self.assertEqual(len({f["seed"] for f, _ in server.requests}), 1)
+        self.assertEqual({c["seed"] for c in options["candidates"]}, {f["seed"] for f, _ in server.requests})
+        self.assertTrue(all("flatly" in f["instruction"] and wav == b"ref" for f, wav in server.requests))
+
+        # Each candidate has its clip, its length, its text and what the recognizer heard, and the options name
+        # the voice. The term still has no say-as.
+        clips = [Path(c["clip"]) for c in options["candidates"]]
+        self.assertTrue(all(c.is_file() and c.parent == pronounce.SAY_OUTPUT / SLUG for c in clips))
+        self.assertEqual(len(set(clips)), 3)
+        self.assertEqual([(c["seconds"], c["heard"]) for c in options["candidates"]],
+                         [(4.0, "heard 0"), (4.0, "heard 1"), (4.0, "heard 2")])
+        self.assertEqual((options["voice"], self.entry()["options"]), ("narrator", options))
+        self.assertNotIn("say", self.entry())
+
+        # A script whose line changed since the options were made is refused.
+        lib.save_json(lib.chapter_dir(SLUG, 1) / "script.json", {"lines": OPTIONS_SCRIPT[:2]})
+        with self.assertRaises(ValueError):
+            pronounce.render_options(SLUG, "Eole", log=lambda *_: None)
+
+
+class HearSpellingTest(SayOptionsTest):
+    """The options of a term that gets one spelling at a time, without a Claude pass."""
+
+    test_the_pass_stores_the_respellings_beside_the_term_as_written = None
+    test_each_option_is_said_in_its_line_by_the_lines_voice = None
+
+    def test_a_typed_spelling_joins_the_options_and_only_new_options_are_said(self):
+        # A term without options gets them: the term as written and the typed spelling, in the line a pass would
+        # choose. No pass is asked.
+        options = pronounce.add_option(SLUG, "Eole", " Ay-ohl ")
+        self.assertEqual([c["say"] for c in options["candidates"]], ["Eole", "Ay-ohl"])
+        self.assertEqual((options["line"]["index"], self.inputs, self.entry()["options"]), (2, [], options))
+
+        # Both are said, because neither has a take yet.
+        said = pronounce.render_options(SLUG, "Eole", log=lambda *_: None, missing=True)
+        [server] = FakeServer.instances
+        self.assertEqual([f["text"] for f, _ in server.requests],
+                         ["The guard told Lewis that Eole had not come back.",
+                          "The guard told Lewis that Ay-ohl had not come back."])
+        self.assertEqual([c["heard"] for c in said["candidates"]], ["heard 0", "heard 1"])
+
+        # A second spelling is said by itself, and the first two keep their clips. A spelling the options have
+        # is not added again, and then nothing is said and no server starts.
+        first = [c["clip"] for c in said["candidates"]]
+        pronounce.add_option(SLUG, "Eole", "Yole")
+        pronounce.add_option(SLUG, "Eole", " Yole ")
+        said = pronounce.render_options(SLUG, "Eole", log=lambda *_: None, missing=True)
+        self.assertEqual([c["say"] for c in said["candidates"]], ["Eole", "Ay-ohl", "Yole"])
+        self.assertEqual([f["text"] for f, _ in FakeServer.instances[1].requests],
+                         ["The guard told Lewis that Yole had not come back."])
+        self.assertEqual(([c["clip"] for c in said["candidates"]][:2], Path(said["candidates"][2]["clip"]).is_file()),
+                         (first, True))
+        pronounce.render_options(SLUG, "Eole", log=lambda *_: None, missing=True)
+        self.assertEqual(len(FakeServer.instances), 2)
+
+        # Saying every option again takes all three, and the term still has no say-as.
+        pronounce.render_options(SLUG, "Eole", log=lambda *_: None)
+        self.assertEqual(len(FakeServer.instances[2].requests), 3)
+        self.assertNotIn("say", self.entry())
+
+        # A spelling without a letter and a term no line has are refused, and change nothing.
+        for term, say in (("Eole", "123"), ("Eole", ""), ("Vouivre", "Voo-eevr")):
+            with self.assertRaises(ValueError):
+                pronounce.add_option(SLUG, term, say)
+        self.assertEqual([c["say"] for c in self.entry()["options"]["candidates"]], ["Eole", "Ay-ohl", "Yole"])
+
+    def test_a_spelling_in_another_case_is_an_option_of_its_own(self):
+        # The bible writes stress in capitals, so the voice may read "ay-OHL" and "Ay-ohl" differently.
+        pronounce.add_option(SLUG, "Eole", "Ay-ohl")
+        options = pronounce.add_option(SLUG, "Eole", "ay-OHL")
+        self.assertEqual([c["say"] for c in options["candidates"]], ["Eole", "Ay-ohl", "ay-OHL"])
+
+    def test_every_option_is_said_again_when_its_clip_is_not_from_the_line_as_it_is_now(self):
+        def hear(spelling):
+            pronounce.add_option(SLUG, "Eole", spelling)
+            said = pronounce.render_options(SLUG, "Eole", log=lambda *_: None, missing=True)
+            return said, [f["text"] for f, _ in FakeServer.instances[-1].requests]
+
+        said, texts = hear("Ay-ohl")
+        self.assertEqual((len(texts), said["voice"]), (2, "narrator"))
+        seed = said["candidates"][0]["seed"]
+
+        # Another seed for the chapter's render: the two old clips don't stay beside the new spelling's.
+        lib.save_chapter_meta(SLUG, 1, {"number": 1, "render": {"engine": "breeze", "seed": 6}})
+        said, texts = hear("Yole")
+        self.assertEqual(len(texts), 3)
+        self.assertEqual(len({c["seed"] for c in said["candidates"]} - {seed}), 1)
+
+        # Another say-as in the line: the same.
+        pronounce.set_say_as(SLUG, "Louis", "Loo-ee")
+        said, texts = hear("Ee-ole")
+        self.assertEqual(texts, [f"The guard told Loo-ee that {c['say']} had not come back." for c in said["candidates"]])
+
+        # Another voice for the line: the same, and the options name the voice that said them.
+        lib.save_yaml(lib.serial_dir(SLUG) / "voices" / "other.yaml", {"clip": "other.wav", "sample_text": "t"})
+        lib.save_serial(SLUG, {**lib.load_serial(SLUG), "narrator_voice_id": "other"})
+        said, texts = hear("Ay-ole")
+        self.assertEqual((len(texts), said["voice"]), (5, "other"))
+
+        # With nothing changed, one more spelling is said by itself.
+        said, texts = hear("Yoll")
+        self.assertEqual(texts, ["The guard told Loo-ee that Yoll had not come back."])
+
+        # The script's line is rewritten. The options can't be said in a line that is gone, so the next spelling
+        # moves them to the line as it is now. They keep every spelling, and each is said in that line.
+        script = [dict(line) for line in OPTIONS_SCRIPT]
+        script[2]["text"] = "The guard said that Eole was still away."
+        lib.save_json(lib.chapter_dir(SLUG, 1) / "script.json", {"lines": script})
+        with self.assertRaises(ValueError):
+            pronounce.render_options(SLUG, "Eole", log=lambda *_: None, missing=True)
+        said, texts = hear("Ay-oll")
+        self.assertEqual([c["say"] for c in said["candidates"]],
+                         ["Eole", "Ay-ohl", "Yole", "Ee-ole", "Ay-ole", "Yoll", "Ay-oll"])
+        self.assertEqual(said["line"]["text"], script[2]["text"])
+        self.assertEqual(texts, [f"The guard said that {c['say']} was still away." for c in said["candidates"]])
+        self.assertEqual([c["why"] for c in said["candidates"]][:2], ["as written", "typed on the Names tab"])
 
 
 class BioTest(unittest.TestCase):

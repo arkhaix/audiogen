@@ -11,7 +11,7 @@ The listener must hear the whole chapter exactly as written. Do not summarize, s
 - Split a paragraph that mixes dialogue and narration into alternating lines, in order. `“Did you call, sir?” said he, entering.` becomes a character line `Did you call, sir?` followed by a narrator line `said he, entering.` Keep the dialogue tags: an audiobook narrator reads them.
 - Quoted material the narrator reads aloud (a letter, a newspaper report, a sign, a document) is narration unless a character is reading it to someone in the scene.
 - Thoughts in quotation marks (`“Besides,” thought I,`) belong to the character thinking them.
-- Italics may be marked `*like this*`. The asterisks are never spoken: drop them. An italic sentence that is not in quotation marks and reads as the point-of-view character's own thought (`*Well, that's that.*`, `*Something's wrong.*`) is a line for that character with the direction `thought, quietly`; italics used for emphasis, titles, or set-off text stay with whoever speaks the surrounding words.
+- Italics may be marked `*like this*`. The asterisks never appear in `text`. An italic sentence that is not in quotation marks and reads as the point-of-view character's own thought (`*Well, that's that.*`, `*Something's wrong.*`) is a line for that character with the direction `thought, quietly`. Italics used for emphasis, titles, or set-off text stay with whoever speaks the surrounding words.
 - Paragraphs that begin with `> ` are set-off text: a system notification or status screen in a game-like story, a letter, a song, an inscription. Drop the `> ` marker. A system notification or status screen is a `narrator` line with the direction `system notification, flat and formal`, one line per notification paragraph; a letter or song follows the rule above.
 - A line of `* * *` is a scene break: it produces no line at all.
 
@@ -24,10 +24,11 @@ One narrator line per paragraph. Split a paragraph longer than about eighty word
 Apply these and nothing else:
 
 - The chapter heading becomes the first narrator line, spoken as a reader would say it: `Chapter One. A Shifting Reef.` A part number in parentheses after a title, `The Fourth Overlord (1)`, is read `The Fourth Overlord, part one.`
-- Drop the quotation marks around dialogue, and drop em dashes or ellipses that only mark an interruption; keep the words.
+- Drop the quotation marks around dialogue, and drop em dashes or ellipses that only mark an interruption. Keep the words.
+- Drop the asterisks that mark italics, and keep the words between them.
 - Expand abbreviations and symbols into words: `M.` before a name to `Monsieur`, `Mr.`/`Mrs.`/`Dr.` to `Mister`/`Missus`/`Doctor`, `lat.`/`long.` to `latitude`/`longitude`, compass letters after coordinates to `north`/`south`/`east`/`west`, `ft.` to `feet`, `°` to `degrees`, `′` to `minutes`, `&` to `and`, `etc.` to `et cetera`, `i.e.` to `that is`, a `+` or `-` sign before a stat change (`+5 Agility`) to `plus`/`minus`. Leave digits as digits.
 - Spell out a Roman numeral that is read as a number (`Napoleon III` to `Napoleon the Third`).
-- Keep italics, capitalization, and foreign phrases as they are; the pronunciation list is for the voice, not for you to rewrite.
+- Keep capitalization and foreign phrases as they are. The pronunciation list is for the voice, not for you to rewrite.
 
 ## Directions
 

@@ -15,7 +15,8 @@ home Nomad cluster.
 * `docs/casting.md`: how to write a voice brief that works, the cast so far and the voices still to cast.
 * `docs/take-quality/`: the plan for better checks on each take, in three phases, with the contract they share and where each phase stands.
 * `deploy/macos/ggml-metal-left-pad.patch`: the ggml fix the Mac's Metal breeze-server needs.
-* `tests/`: unit tests for the cluster, casting, the speech recognizers and the retakes of flagged takes, the backup and the audiobook folders, the parsers and the Claude passes, and the Breeze join's click repair, and a fake Nomad end-to-end test.
+* `D:\fish.wt\scratch\` on the laptop, outside the repo: the scratch copy of The Hundred Reigns with every take and its evidence, the ten labelled takes and the two clips of the join, for the take quality plan (`docs/take-quality/README.md`, Scratch data). Delete it when phase 3 is deployed.
+* `tests/`: unit tests for the cluster, casting, the speech recognizers, the take check and the retakes of flagged takes, the backup and the audiobook folders, the parsers and the Claude passes, the Breeze join's click repair and the take measures, and a fake Nomad end-to-end test.
 
 ## Where things run
 
@@ -45,21 +46,25 @@ is deployed to containers.
 ## Code
 
 * The web app in `serial_audio/web/` uses the standard library only. The containers image adds only pyyaml, and the laptop's user Python has no numpy.
-* Audio processing runs under a separate audio Python with numpy, scipy, librosa and soundfile. That is ComfyUI's embedded Python on the laptop and the venv on the Mac. `fx.py` and `breeze_join.py` run there and import only each other. `machine.py` uses the standard library only for the same reason.
+* Audio processing runs under a separate audio Python with numpy, scipy, librosa and soundfile. That is ComfyUI's embedded Python on the laptop and the venv on the Mac. `fx.py`, `breeze_join.py` and `take_measure.py` run there and import only each other. `parakeet_asr.py` runs there too and imports only `take_measure.py`, inside `main`, because `asr.py` and `takecheck.py` import its constants under the plain Python. `machine.py` uses the standard library only for the same reason.
+* A take's evidence is in `take_check.json`, in versioned blocks: `asr` from the recognizer, `signal` from `take_measure.py`, and on a machine that has their models `vad`, `speaker` and `asr2` from Silero VAD, TitaNet small and Moonshine. `takecheck.judge()` derives every verdict from the blocks and uses the standard library only, so the app can call it. Bump `ASR_V` or `SIGNAL_V` when a block's content changes, and every saved take is then heard again on its chapter's next render or check. Bump `VAD_V`, `SPEAKER_V` or `ASR2_V` in `parakeet_asr.py` for the other three, and a saved take is then heard for that block alone. Bump `JUDGE_V` when a rule or a threshold changes, and a render then judges the saved evidence again without hearing anything. `takecheck.SIGNAL_V` has to equal `take_measure.SIGNAL_V`, and a test checks that.
+* `breeze.JOIN_VERSION` is the version of the join's output, and a render records it as `render.join`. Bump it when a change to `breeze_join.py`, `fx.py` or the join job changes how a chapter sounds, and the `backlog` list then names every chapter for a join. A change to the cuts the take check gives is a change to its rules, so it bumps `JUDGE_V` and not `JOIN_VERSION`. A render records a hash of the cuts its join made as `render.cuts`, and the list names a chapter whose cuts would change.
+* `breeze.voice_text()` builds the text a voice is sent and the line's token map. A change to that text changes take keys, and a render makes every line with a new key again. `VoiceTextTest` in `tests/test_asr.py` pins the keys of a fixed script.
 * `serial_audio/machine.py` reads each machine's paths from the environment. Its defaults are the laptop's `D:\comfy` layout, so the laptop sets nothing. A node's `serial_audio_config` JSON sets them for its jobs:
   * `SERIAL_AUDIO_COMFY_OUTPUT`: ComfyUI's output folder. On a node without ComfyUI, the folder for takes and joined audio.
   * `SERIAL_AUDIO_AUDIO_PYTHON`: the audio Python.
   * `SERIAL_AUDIO_BREEZE_HOME`: the Breeze-TTS-2.cpp folder with `bin/`, `models/`, `refs/` and `voices/`.
   * `SERIAL_AUDIO_PARAKEET_MODEL`: the Parakeet TDT 0.6B v2 int8 folder for sherpa-onnx.
   * `SERIAL_AUDIO_ASR`: `qwen3` or `parakeet` for the take check and the casting check. Unset means Parakeet when its folder exists, else Qwen3-ASR.
+  * `SERIAL_AUDIO_VAD_MODEL`, `SERIAL_AUDIO_SPEAKER_MODEL`, `SERIAL_AUDIO_ASR2_MODEL` and `SERIAL_AUDIO_PHONE_MODEL`: the folders of the take check's Silero VAD, TitaNet small, Moonshine and ZIPA models. Each defaults to its folder beside the Parakeet folder, so a node that has them there sets nothing. A machine without a folder, or whose folder lacks a file or doesn't load, doesn't gather that block, so the rule that reads it doesn't fire. The tail rule doesn't need any of them. The tests in `tests/test_asr.py` pin the folders off.
 * The web app reads library files directly and writes only through `python -m serial_audio.cli` jobs, so every change is logged and a job survives a server restart.
 * A take's `file` in `breeze_takes.json` and a candidate's `clip` and `voice_file` in a voice record are absolute paths on the node that last worked on them. On any other machine the file is the app's copy at `state/media/<exchange.mirror_rel(path)>`. The app sets `SERIAL_AUDIO_MEDIA_MIRROR` to that folder for the jobs it runs itself, and a worker fetches a chapter's takes from it before its steps (`deploy/README.md`, The media mirror). A new kind of file that a later job needs from a node has to go to the mirror too, in `worker.media_files`.
-* A hook rejects an en dash or an em dash anywhere. It also rejects a semicolon on any line that starts like a comment (`#`, `//`, `/*`, `--`, `* `), which includes Markdown bullets and headings. A CSS custom property on a line of its own starts with `--`, so put custom properties on one-line rules that start with the selector.
+* A hook rejects an en dash or an em dash anywhere. It also rejects a semicolon on any line that starts like a comment (`#`, `//`, `/*`, `--`, `* `), which includes Markdown bullets and headings. A CSS custom property on a line of its own starts with `--`, so put custom properties on one-line rules that start with the selector. Test data that needs a dash has to hold it as a Python escape, and a `\u` escape typed into an Edit or a Bash command arrives as the character itself. Write the escape from a script that builds it with `chr(92) + "u2014"`.
 
 ## Testing
 
 * Run `python -m unittest tests.test_cluster tests.test_casting tests.test_asr tests.test_mirror tests.test_text` and `python tests/e2e_fake_nomad.py` after any change. The end-to-end test covers the cluster exchange and scheduling.
-* After a change to `fx.py` or `breeze_join.py`, also run `tests/test_fx.py` under the audio Python, with `D:\comfy\python_embeded\python.exe -I tests/test_fx.py` on the laptop. The plain Python skips it.
+* After a change to `fx.py`, `breeze_join.py` or `take_measure.py`, also run `tests/test_fx.py` under the audio Python, with `D:\comfy\python_embeded\python.exe -I tests/test_fx.py` on the laptop. The plain Python skips it.
 * Check a pipeline change in a scratch copy with the layout a worker gets: the code, and one serial's folder without its audio, copied from containers. Point the output folder at the scratch copy too, so its takes can't land beside the node's real ones. On the Mac, from the clone:
 
 ```
@@ -74,7 +79,9 @@ export SERIAL_AUDIO_COMFY_OUTPUT="$S/output"
 "$PY" -m serial_audio.cli chapters twenty-thousand-leagues
 ```
 
-  Then run the step you changed against that copy.
+  Then run the step you changed against that copy. On the laptop the plain `python` needs no node settings, so only export `SERIAL_AUDIO_COMFY_OUTPUT`.
+
+* A scratch render or check of a rendered chapter needs its own copies of the takes, because a retake replaces a take's file in place. Every take is in the app's mirror, `/opt/serial-audio/state/media` on containers, under its path on the node that made it. Copy the chapter's takes into the scratch copy and point each `file` in its `breeze_takes.json` at the copy before the first run.
 
 * Take phone-width screenshots of the web app over the Chrome DevTools Protocol. Start headless Chrome or Edge with `--remote-debugging-port`, then send `Emulation.setDeviceMetricsOverride` at 390 by 844. A headless window doesn't go narrower than about 477 px on its own. Node 24 has a global WebSocket for the protocol. `Page.navigate` to the page that is already open doesn't load it again, so send `Page.reload` with `ignoreCache` after a change to a static file.
 
@@ -89,7 +96,10 @@ export SERIAL_AUDIO_COMFY_OUTPUT="$S/output"
 * ComfyUI loads node pack changes only on a restart. The auto-mode classifier blocks Claude from stopping AJ's own ComfyUI, so ask him. An instance that a Claude session started itself can be restarted.
 * Connecting to ComfyUI's `/ws` with another client's clientId steals that client's socket. Read progress from the logs instead.
 * While ComfyUI renders, the laptop's RAM is nearly full, and Claude Code's low-memory reaper kills background Bash commands. Launch long work detached with PowerShell `Start-Process`, and watch its log with a Monitor tail through `grep -a --line-buffered`, not `tr`.
+* On the laptop a cluster worker waits while a `python -m serial_audio.cli` render, cast, check-takes or Claude pass that it did not start is running, because it counts each as GPU work. A scratch `check-takes` therefore holds every GPU job on the laptop until it ends, though Parakeet doesn't use the card. For a long scratch check, call `takecheck.check_takes` from a script of your own, or use `measure-takes`, which hears with Parakeet only and which the worker doesn't wait for.
 * Windows PowerShell 5.1's `*>>` appends UTF-16 to a UTF-8 log. Use pwsh.
+* On the laptop, `tests/e2e_fake_nomad.py` runs its fake node's worker on this machine, and that worker waits for GPU work while a real breeze-server runs. So while a chapter renders there, the test can fail at its backlog phase or at cleanup, with a PermissionError on the job's log, and it leaves a `python -u local/bootstrap.py` worker running. Run it when nothing renders on the laptop, and stop a leftover worker of your own run.
+* On the laptop, a doubled backslash in a heredoc of a Bash tool command arrives as one, also when the heredoc's word is quoted. A Python string with a Windows path in such a heredoc then reads the path's `\f` as a form feed and its `\t` as a tab, and two docs carried those characters for an hour on 2026-11-12. Write a script that has backslashes to a file and run the file.
 * The `Scripts\*.exe` launchers in ComfyUI's embedded Python, such as `hf.exe`, are broken. Download models with the `huggingface_hub` API from a script. Dry-run a pip change to the embedded Python first.
 * Git on the laptop has `core.autocrlf` true in its system config, so 19 of the deployed files had CRLF in the working tree on 2026-11-11, and a plain `tar` of the tree sends them to containers that way. A `git archive` does too unless `core.autocrlf` is off for that command. Deploy with the command in `deploy/README.md`, which sends LF. To check what is deployed, strip `\r` before comparing hashes.
 * A tar made on the Mac adds `._*` AppleDouble files unless `COPYFILE_DISABLE=1` is set. `/opt/serial-audio/src` held 56 of them on 2026-11-11. `exchange.code_files` leaves `._*` files out of a worker bundle. The `git archive` deploy doesn't add any.

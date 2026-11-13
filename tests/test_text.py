@@ -1,8 +1,11 @@
 """Tests for the text side of the pipeline: the Royal Road and EPUB parsers, the character pass merge and its rules,
-the screenplay rules, and what the LLM backends do at the subscription limit."""
+the screenplay rules, the script against its chapter, the screenplay pass and its fields, the script audit, and what
+the LLM backends do at the subscription limit."""
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
+import io
 import json
 import subprocess
 import tempfile
@@ -11,7 +14,7 @@ import zipfile
 from pathlib import Path
 from unittest import mock
 
-from serial_audio import epub, llm, passes, royalroad, screenplay
+from serial_audio import breeze, cli, epub, llm, passes, royalroad, screenplay
 
 PAGE = """<html><head><style>.cjZhYjNm { display: none; speak: never; }</style></head><body>
 <h1 class="font-white">Chapter 3: The One Act Play (1)</h1>
@@ -115,6 +118,33 @@ class EpubTest(unittest.TestCase):
         self.assertEqual(chapters[0].paragraphs, ["The year 1866 was signalised by a remarkable incident.", "Second paragraph."])
         self.assertEqual(chapters[2].text, "# Epilogue\n\nThe end.\n")
 
+    def test_italics_inside_a_paragraph_are_kept_as_markers(self):
+        book = """<html><body><div class="chapter"><h2>CHAPTER I.<br/><i>A</i> SHIFTING REEF</h2>
+<p>He was <em>very </em>tired, and thought: <i>not again</i>.</p>
+<p>It was<em> loud</em>, an empty <em></em>run, and a <i>,</i> comma.</p>
+<p><i>Well, that's that.</i></p>
+<p>* * *</p>
+<p>He said f*** and left**.</p>
+<div class="fig"><p class="caption">The <i>Nautilus</i> at rest.</p></div></div></body></html>"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "book.epub"
+            with zipfile.ZipFile(path, "w") as z:
+                z.writestr("META-INF/container.xml", CONTAINER)
+                z.writestr("OEBPS/content.opf", OPF)
+                z.writestr("OEBPS/c1.xhtml", book)
+            _, chapters = epub.extract(path)
+
+        # A marker closes before trailing space, opens after leading space, and an empty or punctuation run loses it.
+        self.assertEqual(chapters[0].paragraphs[:3], ["He was *very* tired, and thought: *not again*.",
+                                                      "It was *loud*, an empty run, and a , comma.",
+                                                      "*Well, that's that.*"])
+
+        # A paragraph without italics keeps the asterisks the book has itself, like a scene break.
+        self.assertEqual(chapters[0].paragraphs[3:], ["* * *", "He said f*** and left**."])
+
+        # A heading stays plain.
+        self.assertEqual((chapters[0].label, chapters[0].title), ("Chapter I", "A Shifting Reef"))
+
     def test_roman_numerals_and_title_case(self):
         self.assertEqual([epub._roman(s) for s in ("I", "IV", "XLII", "12")], [1, 4, 42, 12])
         self.assertEqual(epub.title_case("NED LAND’S TEMPER"), "Ned Land’s Temper")
@@ -215,6 +245,155 @@ class ScreenplayRulesTest(unittest.TestCase):
         padded, _ = self.check([{"speaker": "narrator", "text": "The harbour was quiet. Nobody answered, said Mira. " * 2}])
         self.assertTrue(any("dropped or added" in p for p in padded), padded)
 
+    def test_asterisks_in_a_lines_text_are_sent_back(self):
+        problems, _ = self.check([{"speaker": "narrator", "text": "The harbour was *quiet*."},
+                                  {"speaker": "mira", "text": "Nobody answered,"},
+                                  {"speaker": "narrator", "text": "said Mira."}])
+        self.assertEqual(problems, ["line 0: `text` has asterisks around words. Drop them and keep the words between "
+                                    "them."])
+
+        # An asterisk that doesn't mark italics, as in a censored word or a scene break, is not a problem.
+        for text in ("The harbour was f*cking quiet.", "The harbour was q***t and f**ing quiet.", "The harbour * was quiet.",
+                     "The harbour was quiet. * * *"):
+            problems, _ = self.check([{"speaker": "narrator", "text": text},
+                                      {"speaker": "mira", "text": "Nobody answered,"},
+                                      {"speaker": "narrator", "text": "said Mira."}])
+            self.assertFalse([p for p in problems if "asterisks" in p], text)
+
+
+MARKED = [{"speaker": "narrator", "text": "The harbour was quiet.", "direction": ""},
+          {"speaker": "mira", "text": "Nobody answered,", "direction": "shouting, panicked"},
+          {"speaker": "narrator", "text": "said Mira’s.", "direction": ""}]
+
+
+class MarksTest(unittest.TestCase):
+    def entry(self, line, **marks) -> dict:
+        return {"line": line, "emphasis": [], "focus": "", "heteronyms": [], "emotion": "", "energy": "", "pace": "",
+                **marks}
+
+    def test_a_mark_is_kept_when_its_line_has_a_place_for_it(self):
+        # A word is found whole, in any case and with either apostrophe, and a directed line keeps what restates
+        # its direction.
+        placed, dropped = screenplay.placed_marks([
+            self.entry(0, emphasis=["harbour was"], focus="QUIET"),
+            self.entry(1, emotion="panicked", energy="shout"),
+            self.entry(2, emphasis=["Mira's"], heteronyms=[{"word": "said", "sounds_like": "sed"}])], MARKED)
+        self.assertEqual(dropped, 0)
+        self.assertEqual(placed[0], {"emphasis": ["harbour was"], "focus": "QUIET", "heteronyms": [], "emotion": "",
+                                     "energy": "", "pace": ""})
+        self.assertEqual((placed[1]["emotion"], placed[1]["energy"], placed[1]["pace"]), ("panicked", "shout", ""))
+        self.assertEqual((placed[2]["emphasis"], placed[2]["heteronyms"]),
+                         (["Mira's"], [{"word": "said", "sounds_like": "sed"}]))
+
+    def test_a_mark_without_a_place_is_left_out_and_counted(self):
+        # A word the line doesn't have, a part of a word, a line the script doesn't have, and an emotion on a line
+        # without a direction.
+        placed, dropped = screenplay.placed_marks([
+            self.entry(0, emphasis=["harb", "quiet", ""], focus="Somebody", emotion="calm"),
+            self.entry(1, heteronyms=[{"word": "read", "sounds_like": "red"}]),
+            self.entry(3, emphasis=["said"]), self.entry(-1), self.entry(True)], MARKED)
+        self.assertEqual(dropped, 8)
+
+        # An energy or a pace outside the schema's values is left out, and an emotion loses its outer spaces.
+        odd, left = screenplay.placed_marks([self.entry(1, energy="deafening", pace="brisk", emotion=" angry ")], MARKED)
+        self.assertEqual((odd[1]["energy"], odd[1]["pace"], odd[1]["emotion"], left), ("", "", "angry", 2))
+        self.assertEqual(placed, {0: {"emphasis": ["quiet"], "focus": "", "heteronyms": [], "emotion": "", "energy": "",
+                                      "pace": ""},
+                                  1: {"emphasis": [], "focus": "", "heteronyms": [], "emotion": "", "energy": "",
+                                      "pace": ""}})
+
+        # An answer of the wrong types gives no marks and doesn't raise.
+        for found in (None, "marks", [None, "x", 3], [{"line": "0"}],
+                      [{"line": 0, "emphasis": "quiet", "focus": 5, "heteronyms": ["read"], "energy": None}],
+                      [{"line": 0, "emphasis": 5, "heteronyms": {"word": "quiet"}, "focus": ["quiet"], "pace": 3,
+                        "emotion": {"a": 1}}]):
+            placed, _ = screenplay.placed_marks(found, MARKED)
+            self.assertFalse(any(any(m.values()) for m in placed.values()), found)
+
+    def test_a_line_gets_all_six_fields_and_the_pass_reads_numbered_rows(self):
+        bare = {"speaker": "mira", "text": "Nobody answered,", "direction": ""}
+        self.assertEqual(screenplay.with_marks(bare), {**bare, "emphasis": [], "focus": "", "heteronyms": [],
+                                                       "emotion": "", "energy": "", "pace": ""})
+        again = screenplay.with_marks({**bare, "focus": "old", "emphasis": ["old"]}, {"focus": "Nobody"})
+        self.assertEqual((again["focus"], again["emphasis"]), ("Nobody", []))
+        rows = screenplay.marks_input("# One\n\nBody *text*.", MARKED).split("## Script\n\n")[1].splitlines()
+        self.assertEqual(rows, ["line | speaker | direction | text", "0 | narrator | - | The harbour was quiet.",
+                                "1 | mira | shouting, panicked | Nobody answered,", "2 | narrator | - | said Mira’s."])
+
+
+GATE = ("# Chapter 2: The Gate (3)\n\nMr. Adrissant was late again, and the gate was shut.\n\n> +5 Agility\n\n"
+        "“Open it,” he said. “Open it *now*.”\n\nThe guard did not move. She had orders from the captain, and the "
+        "captain was asleep.\n\n* * *\n\nBy noon the whole town knew.\n")
+GATE_SCRIPT = [{"speaker": "narrator", "text": "Chapter 2. The Gate, part three."},
+               {"speaker": "narrator", "text": "Mister Adrissant was late again, and the gate was shut."},
+               {"speaker": "narrator", "text": "plus 5 Agility"},
+               {"speaker": "mira", "text": "Open it,"},
+               {"speaker": "narrator", "text": "he said."},
+               {"speaker": "mira", "text": "Open it now."},
+               {"speaker": "narrator", "text": "The guard did not move. She had orders from the captain, and the "
+                                               "captain was asleep."},
+               {"speaker": "narrator", "text": "By noon the whole town knew."}]
+GUARD = "The guard did not ... the captain was asleep"
+
+
+class ScriptAgainstChapterTest(unittest.TestCase):
+    def test_a_faithful_script_differs_only_by_its_normalizations(self):
+        # The heading lines, the set-off marker, the asterisks and the scene break are left out.
+        self.assertEqual(screenplay.text_runs(GATE, GATE_SCRIPT), [
+            {"kind": "dropped", "words": 1, "line": 1, "quote": "Mr"},
+            {"kind": "added", "words": 1, "line": 1, "quote": "Mister"},
+            {"kind": "added", "words": 1, "line": 2, "quote": "plus"}])
+        self.assertEqual(screenplay.long_runs(GATE, GATE_SCRIPT), [])
+        self.assertEqual(screenplay.validate_script({"lines": GATE_SCRIPT}, BIBLE, GATE)[0], [])
+
+        # A first line that has the chapter's opening words is chapter text, so its words count.
+        self.assertEqual(screenplay.text_runs(GATE, GATE_SCRIPT[1:]), [
+            {"kind": "dropped", "words": 1, "line": 0, "quote": "Mr"},
+            {"kind": "added", "words": 1, "line": 0, "quote": "Mister"},
+            {"kind": "added", "words": 1, "line": 1, "quote": "plus"}])
+
+        # Any other first line is the heading as a reader says it, whatever words it uses, and it is left out.
+        other = [{"speaker": "narrator", "text": "Prologue. The Gate."}] + GATE_SCRIPT[1:]
+        self.assertEqual(screenplay.text_runs(GATE, other), screenplay.text_runs(GATE, GATE_SCRIPT))
+        road = "# Ch. 5: The Long Road Home\n\nThe road ran north along the river for a day and a night.\n"
+        spoken = [{"speaker": "narrator", "text": "Chapter Five. The Long Road Home."},
+                  {"speaker": "narrator", "text": "The road ran north along the river for a day and a night."}]
+        self.assertEqual(screenplay.text_runs(road, spoken), [])
+
+        # A chapter without a heading doesn't have a heading line in its script.
+        self.assertEqual(screenplay.text_runs(road.split("\n", 2)[2], spoken),
+                         [{"kind": "added", "words": 6, "line": 0, "quote": "Chapter Five The Long Road Home"}])
+
+    def test_a_dropped_paragraph_is_found_and_quoted(self):
+        script = GATE_SCRIPT[:6] + GATE_SCRIPT[7:]
+        self.assertEqual(screenplay.long_runs(GATE, script),
+                         [{"kind": "dropped", "words": 16, "line": 6, "quote": GUARD}])
+        problems, _ = screenplay.validate_script({"lines": script}, BIBLE, GATE)
+        self.assertIn(f"the script leaves out 16 words of the chapter before line 6: \"{GUARD}\". Put them back where "
+                      f"the chapter has them.", problems)
+
+        # A run at the end of the chapter falls after the last line.
+        problems, _ = screenplay.validate_script({"lines": GATE_SCRIPT[:7]}, BIBLE, GATE + "\nThen the bells rang out over the water.\n")
+        self.assertIn("the script leaves out 14 words of the chapter after the last line: \"By noon the whole ... out over "
+                      "the water\". Put them back where the chapter has them.", problems)
+
+    def test_a_repeated_line_is_found_and_quoted(self):
+        script = GATE_SCRIPT[:7] + GATE_SCRIPT[6:]
+        self.assertEqual(screenplay.long_runs(GATE, script), [{"kind": "added", "words": 16, "line": 7, "quote": GUARD}])
+        problems, _ = screenplay.validate_script({"lines": script}, BIBLE, GATE)
+        self.assertIn(f"line 7: 16 words are not in the chapter at this place: \"{GUARD}\". Take out the repeated or "
+                      f"added words.", problems)
+
+    def test_the_limits_are_the_longest_runs_that_pass(self):
+        script = [dict(line) for line in GATE_SCRIPT]
+        for size, flagged in ((screenplay.MAX_DROPPED_RUN, False), (screenplay.MAX_DROPPED_RUN + 1, True)):
+            script[7]["text"] = " ".join("By noon the whole town knew.".split()[size:])
+            self.assertEqual(bool(screenplay.long_runs(GATE, script)), flagged, size)
+        script[7]["text"] = "By noon the whole town knew."
+        for size, flagged in ((screenplay.MAX_ADDED_RUN, False), (screenplay.MAX_ADDED_RUN + 1, True)):
+            script[4]["text"] = "he said " + " ".join(["loudly"] * size) + "."
+            self.assertEqual(bool(screenplay.long_runs(GATE, script)), flagged, size)
+
 
 SCHEMA = {"type": "object", "properties": {"lines": {"type": "array"}}}
 
@@ -265,16 +444,20 @@ class ClaudeCodeBackendTest(unittest.TestCase):
 
 
 class FakeBackend:
-    """A backend that raises the limit error for its first `limits` calls and then answers."""
+    """A backend that raises the limit error for its first `limits` calls and then answers, with each of `answers` in
+    turn while it has them. It keeps the instruction of every call."""
 
-    def __init__(self, name: str, limits: int = 0):
+    def __init__(self, name: str, limits: int = 0, answers: list[dict] | None = None):
         self.name, self.limits, self.calls = name, limits, 0
+        self.answers, self.instructions = list(answers or []), []
 
     def run(self, *args) -> llm.PassResult:
         self.calls += 1
+        self.instructions.append(args[-1])
         if self.calls <= self.limits:
             raise llm.UsageLimitError("subscription session limit reached", "3:45pm")
-        return llm.PassResult(data={"from": self.name}, backend=self.name, model="m", cost_estimate_usd=None)
+        data = self.answers.pop(0) if self.answers else {"from": self.name}
+        return llm.PassResult(data=data, backend=self.name, model="m", cost_estimate_usd=None)
 
 
 class RunPassTest(unittest.TestCase):
@@ -321,6 +504,188 @@ class RunPassTest(unittest.TestCase):
         self.assertTrue(dt.timedelta(0) < at - now <= dt.timedelta(days=7))
         self.assertIsNone(llm._parse_reset("soon"))
         self.assertIsNone(llm._parse_reset(None))
+
+
+HARBOUR = ("# Chapter 7: Morning (1)\n\nMira woke before dawn and found the harbour *empty*.\n\n*Something’s wrong.*\n\n"
+           "> [Quest received: Find the missing fleet before the tide turns.]\n\n"
+           "“I said Tuesday, not Monday,” Mira told the harbourmaster. “Read the ledger again.”\n\n* * *\n\n"
+           "The old man had read it twice already, and the wind would not wait for a third reading.\n")
+NO_FIELDS = {"emphasis": [], "focus": "", "heteronyms": [], "emotion": "", "energy": "", "pace": ""}
+HARBOUR_SCRIPT = [
+    {"speaker": "narrator", "text": "Chapter 7. Morning, part one.", "direction": "", **NO_FIELDS},
+    {"speaker": "narrator", "text": "Mira woke before dawn and found the harbour empty.", "direction": "",
+     **NO_FIELDS, "emphasis": ["empty"]},
+    {"speaker": "mira", "text": "Something’s wrong.", "direction": "thought, quietly", **NO_FIELDS, "energy": "soft"},
+    {"speaker": "narrator", "text": "[Quest received: Find the missing fleet before the tide turns.]",
+     "direction": "system notification, flat and formal", **NO_FIELDS},
+    {"speaker": "mira", "text": "I said Tuesday, not Monday,", "direction": "", **NO_FIELDS, "focus": "Tuesday"},
+    {"speaker": "narrator", "text": "Mira told the harbourmaster.", "direction": "", **NO_FIELDS},
+    {"speaker": "mira", "text": "Read the ledger again.", "direction": "", **NO_FIELDS,
+     "heteronyms": [{"word": "Read", "sounds_like": "reed"}]},
+    {"speaker": "narrator", "text": "The old man had read it twice already, and the wind would not wait for a third "
+                                    "reading.", "direction": "", **NO_FIELDS,
+     "heteronyms": [{"word": "read", "sounds_like": "red"}]}]
+
+
+HARBOUR_BARE = [{name: line[name] for name in ("speaker", "text", "direction")} for line in HARBOUR_SCRIPT]
+HARBOUR_MARKS = {"marks": [{"line": i, **{name: line[name] for name in NO_FIELDS}}
+                           for i, line in enumerate(HARBOUR_SCRIPT) if any(line[name] for name in NO_FIELDS)]}
+
+
+class ScreenplayPassTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        patch = mock.patch.object(screenplay.lib, "LIBRARY", Path(tmp.name))
+        patch.start()
+        self.addCleanup(patch.stop)
+        lib = screenplay.lib
+        lib.save_serial("harbour", {"title": "Harbour", "author": "A. Writer",
+                                    "narration": {"point_of_view": "third_person"}})
+        lib.save_yaml(lib.serial_dir("harbour") / "bible" / "characters.yaml", {"mira": {"name": "Mira"}})
+        (lib.chapter_dir("harbour", 7)).mkdir(parents=True)
+        (lib.chapter_dir("harbour", 7) / "text.md").write_text(HARBOUR, encoding="utf-8")
+        lib.save_chapter_meta("harbour", 7, {"number": 7, "label": "Chapter 7", "title": "Morning (1)",
+                                             "word_count": 52, "status": "characters", "characters_present": ["mira"]})
+
+    def run_pass(self, *answers: dict, log=lambda *_: None, marks: bool = True) -> FakeBackend:
+        backend = FakeBackend("subscription", answers=list(answers))
+        with mock.patch.object(llm, "ClaudeCodeBackend", lambda: backend):
+            screenplay.screenplay_pass("harbour", 7, backend="subscription", log=log, marks=marks)
+        return backend
+
+    def saved(self) -> dict:
+        return screenplay.lib.load_json(screenplay.lib.chapter_dir("harbour", 7) / "script.json")
+
+    def test_a_dropped_paragraph_and_asterisks_are_sent_back_and_the_fields_are_saved(self):
+        broken = [dict(line) for line in HARBOUR_BARE[:7]]
+        broken[1] = {**broken[1], "text": "Mira woke before dawn and found the harbour *empty*."}
+        backend = self.run_pass({"lines": broken, "notes": ""}, {"lines": HARBOUR_BARE, "notes": ""}, HARBOUR_MARKS)
+
+        # The second request names the dropped run by its first and last words, and the asterisks.
+        self.assertEqual(backend.calls, 3)
+        retry = backend.instructions[1]
+        self.assertIn("the script leaves out 18 words of the chapter after the last line: \"The old man had ... for a "
+                      "third reading\"", retry)
+        self.assertIn("line 1: `text` has asterisks around words.", retry)
+
+        # The script is the second answer with the marks of the third, every line has the six fields, and no text
+        # has an asterisk.
+        saved = self.saved()
+        self.assertEqual(saved["lines"], HARBOUR_SCRIPT)
+        self.assertTrue(all(set(NO_FIELDS) <= set(line) for line in saved["lines"]))
+        self.assertFalse([line for line in saved["lines"] if "*" in line["text"]])
+        meta = screenplay.lib.load_chapter("harbour", 7)[0]
+        self.assertEqual((meta["status"], sorted(meta["passes"])), ("scripted", ["marks", "screenplay"]))
+
+    def test_the_marks_pass_reads_the_saved_script_and_leaves_out_what_it_cannot_place(self):
+        # The marks name three words their lines don't have: an emphasis, a focus and a heteronym.
+        wrong = {"marks": [dict(entry) for entry in HARBOUR_MARKS["marks"]]}
+        by_line = {entry["line"]: entry for entry in wrong["marks"]}
+        by_line[1]["emphasis"] = ["empty", "full"]
+        by_line[4]["focus"] = "Wednesday"
+        by_line[6]["heteronyms"] = [{"word": "lead", "sounds_like": "led"}]
+        logs: list[str] = []
+        backend = self.run_pass({"lines": HARBOUR_BARE, "notes": ""}, wrong, log=logs.append)
+
+        # The script is saved without them, with the words its lines do have, and the log counts what was left out.
+        self.assertEqual(backend.calls, 2)
+        self.assertIn("Return the marks of the script above", backend.instructions[1])
+        lines = self.saved()["lines"]
+        self.assertEqual((lines[1]["emphasis"], lines[4]["focus"], lines[6]["heteronyms"]), (["empty"], "", []))
+        self.assertEqual(lines[7]["heteronyms"], [{"word": "read", "sounds_like": "red"}])
+        self.assertTrue(any("marks on 3 of 8 lines, 3 left out" in line for line in logs), logs)
+
+        # A later marks pass replaces the marks and leaves each line's speaker, text and direction as they were.
+        backend = FakeBackend("subscription", answers=[HARBOUR_MARKS])
+        with mock.patch.object(llm, "ClaudeCodeBackend", lambda: backend):
+            screenplay.marks_pass("harbour", 7, backend="subscription", log=lambda *_: None)
+        self.assertEqual(self.saved()["lines"], HARBOUR_SCRIPT)
+
+    def test_a_marks_pass_that_fails_leaves_the_script_with_empty_fields(self):
+        logs: list[str] = []
+        backend = FakeBackend("subscription", answers=[{"lines": HARBOUR_BARE, "notes": ""}])
+        real = backend.run
+
+        def run(*args):
+            if backend.calls >= 1:
+                backend.calls += 1
+                raise llm.LLMError("the answer was not JSON")
+            return real(*args)
+
+        backend.run = run
+        with mock.patch.object(llm, "ClaudeCodeBackend", lambda: backend):
+            screenplay.screenplay_pass("harbour", 7, backend="subscription", log=logs.append, marks=True)
+
+        # The chapter is scripted all the same, with the lines as the screenplay pass wrote them.
+        self.assertEqual(backend.calls, 2)
+        self.assertEqual(self.saved()["lines"], HARBOUR_BARE)
+        self.assertNotIn("marks", self.saved())
+        self.assertEqual(screenplay.lib.load_chapter("harbour", 7)[0]["status"], "scripted")
+        self.assertTrue(any("the marks pass failed" in line for line in logs), logs)
+
+        # Without the marks asked for, the screenplay pass is one request and the script has its three fields.
+        backend = self.run_pass({"lines": HARBOUR_BARE, "notes": ""}, HARBOUR_MARKS, marks=False)
+        self.assertEqual((backend.calls, self.saved()["lines"]), (1, HARBOUR_BARE))
+
+        # A chapter without a script has nothing to mark.
+        with self.assertRaises(FileNotFoundError):
+            screenplay.marks_pass("harbour", 8, backend="subscription", log=lambda *_: None)
+
+    def test_a_script_that_still_drops_text_is_not_saved(self):
+        short = {"lines": HARBOUR_BARE[:7], "notes": ""}
+        with self.assertRaises(llm.LLMError) as e:
+            self.run_pass(short, short)
+        self.assertIn("leaves out 18 words", str(e.exception))
+        self.assertFalse((screenplay.lib.chapter_dir("harbour", 7) / "script.json").exists())
+
+    def test_the_two_schemas_name_the_fields_of_a_line_and_of_its_marks(self):
+        # A line of the screenplay pass is its speaker, text and direction.
+        line = screenplay.lib.load_json(screenplay.SCHEMA)["properties"]["lines"]["items"]
+        self.assertEqual(line["required"], ["speaker", "text", "direction"])
+        self.assertEqual(set(line["properties"]), set(line["required"]))
+        self.assertFalse(line["additionalProperties"])
+
+        # An entry of the marks pass is a line number and all six fields.
+        marks = screenplay.lib.load_json(screenplay.MARKS_SCHEMA)["properties"]["marks"]["items"]
+        self.assertEqual(marks["required"], ["line", *NO_FIELDS])
+        self.assertEqual((list(marks["properties"]), list(NO_FIELDS)), (marks["required"], list(screenplay.MARKS)))
+        self.assertFalse(marks["additionalProperties"])
+        self.assertEqual((marks["properties"]["energy"]["enum"], marks["properties"]["pace"]["enum"]),
+                         (["", "whisper", "soft", "normal", "raised", "shout"], ["", "slow", "fast", "halting"]))
+
+    def test_the_fields_leave_every_take_key_as_it_was(self):
+        slots, voices, clips = {"narrator": 0, "mira": 1}, {0: "narrator", 1: "mira"}, {"narrator": "a" * 40, "mira": "b" * 40}
+        bare = [{k: line[k] for k in ("speaker", "text", "direction")} for line in HARBOUR_SCRIPT]
+        bible = {"characters": {"mira": {"name": "Mira"}}, "pronunciations": {}}
+        for runner in ("cpp", "comfyui"):
+            self.assertEqual(breeze.plan_takes(HARBOUR_SCRIPT, slots, voices, bible, 3, clips, runner),
+                             breeze.plan_takes(bare, slots, voices, bible, 3, clips, runner), runner)
+
+
+class AuditScriptsTest(unittest.TestCase):
+    def test_the_audit_lists_the_runs_over_the_limits_and_writes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(screenplay.lib, "LIBRARY", Path(tmp)):
+            lib = screenplay.lib
+            for n, lines in ((1, GATE_SCRIPT), (2, GATE_SCRIPT[:6] + GATE_SCRIPT[7:]), (3, None)):
+                lib.chapter_dir("gate", n).mkdir(parents=True)
+                (lib.chapter_dir("gate", n) / "text.md").write_text(GATE, encoding="utf-8")
+                lib.save_chapter_meta("gate", n, {"number": n})
+                if lines:
+                    lib.save_json(lib.chapter_dir("gate", n) / "script.json", {"lines": lines})
+            before = {p: p.read_bytes() for p in Path(tmp).rglob("*") if p.is_file()}
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(cli.main(["audit-scripts", "gate"]), 0)
+            after = {p: p.read_bytes() for p in Path(tmp).rglob("*") if p.is_file()}
+
+        # Chapter 2 leaves out a paragraph, chapter 1 is faithful, and chapter 3 has no script.
+        self.assertEqual(out.getvalue().splitlines(), [
+            f"gate: 1 of 2 scripts have a run of more than {screenplay.MAX_DROPPED_RUN} dropped or "
+            f"{screenplay.MAX_ADDED_RUN} added words",
+            " chapter  kind     words  line  quote",
+            f"       2  dropped     16     6  \"{GUARD}\""])
+        self.assertEqual(after, before)
 
 
 if __name__ == "__main__":

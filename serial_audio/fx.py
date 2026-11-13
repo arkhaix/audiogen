@@ -31,6 +31,7 @@ TAIL = 0.15
 
 N_FFT, HOP = 1024, 256
 OPUS_RATES = (8000, 12000, 16000, 24000, 48000)
+OPUS_KBPS_RANGE = (6.0, 256.0)
 EFFECTS = {"whisper"}
 
 CLICK_BAND = 5000
@@ -77,8 +78,14 @@ def line_spans(lines: list[dict], takes: list[int], sample_rate: int) -> list[tu
     return spans
 
 
-def write_audio(path, x: np.ndarray, sr: int) -> None:
-    """Writes mono x to path. A .opus path gets Ogg Opus, resampled to 48 kHz when sr is not a rate Opus takes."""
+def write_audio(path, x: np.ndarray, sr: int, kbps: float | None = None) -> None:
+    """Writes mono x to path.
+
+    path: where to write. A .opus path gets Ogg Opus, resampled to 48 kHz when sr is not a rate Opus uses.
+    x: mono samples.
+    sr: their sample rate.
+    kbps: the Opus bitrate to ask the encoder for. None leaves the encoder's own choice. Any other format ignores it.
+    """
     x = x.astype(np.float32)
     if Path(path).suffix.lower() != ".opus":
         sf.write(path, x, sr)
@@ -86,7 +93,12 @@ def write_audio(path, x: np.ndarray, sr: int) -> None:
     if sr not in OPUS_RATES:
         g = np.gcd(48000, sr)
         x, sr = resample_poly(x, 48000 // g, sr // g).astype(np.float32), 48000
-    sf.write(path, x, sr, format="OGG", subtype="OPUS")
+    if kbps is None:
+        sf.write(path, x, sr, format="OGG", subtype="OPUS")
+        return
+    # libsndfile sets an Opus bitrate of 6 to 256 kbps from a compression level of 1 to 0
+    level = 1 - (float(kbps) - OPUS_KBPS_RANGE[0]) / (OPUS_KBPS_RANGE[1] - OPUS_KBPS_RANGE[0])
+    sf.write(path, x, sr, format="OGG", subtype="OPUS", compression_level=min(1.0, max(0.0, level)))
 
 
 def highpass(x, hz, sr):

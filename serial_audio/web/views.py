@@ -1,6 +1,7 @@
 """Library records shaped for the web app's API. Never writes."""
 from __future__ import annotations
 
+import difflib
 import os
 import re
 import urllib.parse
@@ -15,7 +16,8 @@ from ..casting import NARRATOR_ID, needs_narrator
 from ..comfy import ComfyError
 from ..breeze import TAKES_FILE
 from ..render import COMFY_OUTPUT, plan_engine, plan_slots
-from ..takecheck import CHECK_FILE, VERDICTS
+from ..asr import words
+from ..takecheck import CHECK_FILE, JUDGE_V, VERDICTS, for_take, heard, rejudged
 from .jobs import INCOMING, read_tail
 
 AUDIO_SUFFIXES = {".opus", ".flac", ".wav", ".mp3", ".ogg", ".m4a"}
@@ -23,6 +25,8 @@ MEDIA_MIRROR: Path | None = None
 IMPORTANCE_ORDER = {"major": 0, "recurring": 1, "minor": 2, "one_off": 3}
 _Loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
 _cache: dict[str, tuple[float, int, object]] = {}
+_names_cache: dict[str, tuple[tuple, dict | None]] = {}
+NAMES_SHOWN = 12
 
 
 def _yaml(path: Path, default=None):
@@ -283,12 +287,13 @@ def serial_detail(slug: str, minutes_per_line: float) -> dict:
             "render_engine": engine, "render_runner": runner}
 
 
-def _take_check(folder: Path, script: dict | None, meta: dict, names: dict) -> list[dict] | None:
+def _take_check(folder: Path, script: dict | None, meta: dict, names: dict, bible: dict | None = None) -> list[dict] | None:
     """The takes to listen to, worst first, with the script line, the transcript and the take's media.
 
-    Takes the last check did not pass come from take_check.json. Takes the length guard kept out of range come from
-    breeze_takes.json with the verdict "out_of_range", whether or not a check ran. None when the chapter has no
-    Breeze takes.
+    Takes the last check did not pass come from take_check.json. With the bible, verdicts from older rules are
+    judged again from their evidence first, as a render judges them. Takes the length guard kept out of range come
+    from breeze_takes.json with the verdict "out_of_range", whether or not a check ran. None when the chapter has
+    no Breeze takes.
     """
     render = meta.get("render") if isinstance(meta.get("render"), dict) else {}
     if not script or not (folder / TAKES_FILE).is_file():
@@ -297,7 +302,13 @@ def _take_check(folder: Path, script: dict | None, meta: dict, names: dict) -> l
     check = render.get("check")
     results = {}
     if isinstance(check, dict) and not check.get("skipped") and (folder / CHECK_FILE).is_file():
-        results = lib.load_json(folder / CHECK_FILE).get("takes") or {}
+        checked = lib.load_json(folder / CHECK_FILE)
+        results = checked.get("takes") or {}
+        if bible is not None and checked.get("rules") != JUDGE_V:
+            try:
+                results = rejudged(results, takes, script["lines"], bible)
+            except Exception:
+                pass
     rank = {v: i for i, v in enumerate(VERDICTS)}
     rank["out_of_range"] = len(VERDICTS)
     out = []
@@ -310,7 +321,7 @@ def _take_check(folder: Path, script: dict | None, meta: dict, names: dict) -> l
         line = script["lines"][i]
         out.append({"line": i, "verdict": verdict, "speaker": line["speaker"], "name": names.get(line["speaker"]),
                     "voice": take.get("voice"), "direction": line.get("direction") or "", "said": line["text"],
-                    "heard": r.get("heard"), "ins": r.get("ins"), "del": r.get("del"), "sub": r.get("sub"),
+                    "heard": heard(r), "ins": r.get("ins"), "del": r.get("del"), "sub": r.get("sub"),
                     "wer": r.get("wer"), "seconds": _duration(Path(take["file"])) if take.get("file") else None,
                     "media": comfy_media(take.get("file"))})
     out.sort(key=lambda t: (-rank.get(t["verdict"], 0), t["line"]))
@@ -360,7 +371,7 @@ def chapter_detail(slug: str, n: int) -> dict:
             "script": script, "cast": cast, "plan_notes": plan_notes,
             "audio": lib_media(audio) if audio else None,
             "render_log": read_tail(log, 40_000) if log.is_file() else None,
-            "take_check": _take_check(folder, script, meta, {c["id"]: c["name"] for c in cast}),
+            "take_check": _take_check(folder, script, meta, {c["id"]: c["name"] for c in cast}, bible),
             "character_pass": pass_out,
             "prev": numbers[i - 1] if i > 0 else None, "next": numbers[i + 1] if i + 1 < len(numbers) else None}
 
@@ -369,12 +380,150 @@ def _with_media(candidates: list[dict]) -> list[dict]:
     return [{**c, "media": comfy_media(c.get("clip"))} for c in candidates or []]
 
 
+def voice_findings(slug: str) -> dict[str, list[dict]]:
+    """The voice findings in the render records of a serial's chapters, by voice.
+
+    slug: the serial.
+    Returns {voice: [{"chapter", "reason", "takes", "of"}, ...]} in chapter order, where takes counts the takes of
+    the voice that the reason flagged in the chapter and of counts the voice's checked takes there. A record that
+    is not a finding is left out.
+    """
+    out: dict[str, list[dict]] = {}
+    for n in lib.list_chapters(slug):
+        found = (_chapter_meta(slug, n).get("render") or {}).get("voice_findings")
+        for f in found if isinstance(found, list) else []:
+            if isinstance(f, dict) and isinstance(f.get("voice"), str) and isinstance(f.get("lines"), list):
+                out.setdefault(f["voice"], []).append({"chapter": n, "reason": str(f.get("reason") or ""),
+                                                       "takes": len(f["lines"]), "of": f.get("of")})
+    return out
+
+
+def _names_in(folder: Path) -> dict[str, Counter] | None:
+    """How a chapter's take check heard each name.
+
+    folder: the chapter folder.
+    Returns {term: Counter of spellings} over the check's entries for the takes' current audio, with a possessive
+    's left off a spelling. None when the chapter doesn't have both files, when one doesn't parse, or when no entry
+    holds names, which is a check from before the rules recorded them.
+    """
+    takes_path, check_path = folder / TAKES_FILE, folder / CHECK_FILE
+    try:
+        a, b = takes_path.stat(), check_path.stat()
+    except OSError:
+        return None
+    key, stamp = str(folder), (a.st_mtime_ns, a.st_size, b.st_mtime_ns, b.st_size)
+    hit = _names_cache.get(key)
+    if hit and hit[0] == stamp:
+        return hit[1]
+    found: dict[str, Counter] | None = None
+    try:
+        takes = lib.load_json(takes_path).get("takes") or {}
+        entries = lib.load_json(check_path).get("takes") or {}
+        for k, entry in entries.items():
+            if not for_take(entry, takes.get(k)) or not isinstance(entry.get("names"), dict):
+                continue
+            found = {} if found is None else found
+            for term, spellings in entry["names"].items():
+                for spelling in spellings if isinstance(spellings, list) else []:
+                    if isinstance(spelling, str):
+                        found.setdefault(str(term), Counter())[spelling.removesuffix("'s")] += 1
+    except (OSError, ValueError, AttributeError, TypeError):
+        found = None
+    _names_cache[key] = (stamp, found)
+    return found
+
+
+def _options_view(options) -> dict | None:
+    """A term's pronunciation options for the Names page, each candidate with its clip's media, or None."""
+    if not isinstance(options, dict) or not isinstance(options.get("candidates"), list):
+        return None
+    return {"line": options.get("line"), "voice": options.get("voice"),
+            "at": options.get("rendered_at") or options.get("at"),
+            "candidates": [{"say": c.get("say"), "why": c.get("why"),
+                            "heard": _heard_as(c.get("text"), c.get("say"), c.get("heard")),
+                            "seconds": c.get("seconds"),
+                            "media": comfy_media(c["clip"]) if isinstance(c.get("clip"), str) else None}
+                           for c in options["candidates"] if isinstance(c, dict)]}
+
+
+def _heard_as(text, say, heard) -> str:
+    """The words of a transcript that stand where a spelling stands in the text the voice was sent.
+
+    text: the text that was sent.
+    say: the spelling in it.
+    heard: the recognizer's transcript of the take.
+    Returns the transcript's words in the spelling's place, or "" when any of the three is missing or the spelling
+    isn't in the text.
+    """
+    if not all(isinstance(v, str) and v for v in (text, say, heard)):
+        return ""
+    sent, said, got = words(text), words(say), words(heard)
+    start = next((i for i in range(len(sent) - len(said) + 1) if sent[i: i + len(said)] == said), None) if said else None
+    if start is None:
+        return ""
+    end, out = start + len(said), []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, sent, got, autojunk=False).get_opcodes():
+        if tag == "equal":
+            out += got[j1 + max(0, start - i1): j2 - max(0, i2 - end)] if i1 < end and i2 > start else []
+        elif (i1 < end and i2 > start) or (i1 == i2 and start < i1 < end):
+            out += got[j1:j2]
+    return " ".join(out)
+
+
+def names_heard(slug: str) -> dict:
+    """How the recognizer spelled each name of a serial, over the takes its checks heard.
+
+    slug: the serial.
+    Returns {"terms": [...], "chapters": {"with": [...], "without": [...]}}. A term is {"term", "say",
+    "respelling", "heard", "spellings", "as_written", "top", "chapters", "options"}: the name as the bible has it,
+    its say-as and its respelling or "", how many times a take's check heard it, in how many spellings, how many of
+    those times in the spelling the voice is sent, the NAMES_SHOWN most frequent spellings as [spelling, count],
+    the chapters, and its pronunciation options or None. The options are {"line", "voice", "at", "candidates"},
+    and a candidate is {"say", "why", "heard", "seconds", "media"}, where heard is how the recognizer wrote the
+    spelling in the candidate's take. The terms with the most spellings come first,
+    and a term that has options but was never heard comes after them. chapters lists the chapters with Breeze
+    takes whose check holds names and those whose check doesn't yet.
+    """
+    pronunciations = _bible(slug).get("pronunciations") or {}
+    counts: dict[str, Counter] = {}
+    where: dict[str, list[int]] = {}
+    known, unknown = [], []
+    for n in lib.list_chapters(slug):
+        folder = lib.chapter_dir(slug, n)
+        if not (folder / TAKES_FILE).is_file():
+            continue
+        found = _names_in(folder)
+        if found is None:
+            unknown.append(n)
+            continue
+        known.append(n)
+        for term, spellings in found.items():
+            counts.setdefault(term, Counter()).update(spellings)
+            where.setdefault(term, []).append(n)
+    terms = []
+    for term, spellings in counts.items():
+        entry = pronunciations.get(term) if isinstance(pronunciations.get(term), dict) else {}
+        sent = " ".join(words(str(entry.get("say") or term)))
+        terms.append({"term": term, "say": str(entry.get("say") or ""), "respelling": str(entry.get("respelling") or ""),
+                      "heard": sum(spellings.values()), "spellings": len(spellings), "as_written": spellings.get(sent, 0),
+                      "top": [[s, c] for s, c in spellings.most_common(NAMES_SHOWN)], "chapters": where[term],
+                      "options": _options_view(entry.get("options"))})
+    for term, entry in pronunciations.items():
+        if term not in counts and isinstance(entry, dict) and _options_view(entry.get("options")):
+            terms.append({"term": term, "say": str(entry.get("say") or ""), "respelling": str(entry.get("respelling") or ""),
+                          "heard": 0, "spellings": 0, "as_written": 0, "top": [], "chapters": [],
+                          "options": _options_view(entry.get("options"))})
+    terms.sort(key=lambda t: (-t["spellings"], -t["heard"], t["term"]))
+    return {"terms": terms, "chapters": {"with": known, "without": unknown}}
+
+
 def voices(slug: str) -> dict:
     serial = lib.load_serial(slug)
     bible = _bible(slug)
     chars = bible["characters"]
     records = _voice_records(slug)
     briefs = _yaml(lib.serial_dir(slug) / "voices" / "_briefs.yaml", {}) or {}
+    findings = voice_findings(slug)
     seeds = []
     out = []
     for vid, rec in records.items():
@@ -393,7 +542,8 @@ def voices(slug: str) -> dict:
                     "in_bible": bool(c), "voice_brief": c.get("voice_brief"), "chapters": len(c.get("chapters_present") or []),
                     "media": lib_media(clip) if rec.get("clip") else None,
                     "candidates": _with_media(rec.get("candidates")), "history": history,
-                    "effect": (serial.get("voice_effects") or {}).get(vid), "rendered_in": used_in})
+                    "effect": (serial.get("voice_effects") or {}).get(vid), "rendered_in": used_in,
+                    "findings": findings.get(vid) or []})
     out.sort(key=lambda v: (v["id"] != NARRATOR_ID, IMPORTANCE_ORDER.get(v.get("importance"), 9), v["name"].lower()))
     policy = set((serial.get("casting_policy") or {}).get("dedicated_voice_for") or ["major", "recurring"])
     uncast = []

@@ -30,6 +30,7 @@ from pathlib import Path
 from . import library as lib
 from . import machine
 from .asr import choose as choose_asr
+from .asr import word_map, words
 from .comfy import ComfyClient, ComfyError
 from .render import AUDIO_SUFFIX, COMFY_OUTPUT, COMFY_PYTHON, apply_say_as, plan_slots, say_as_map, slot_effects
 
@@ -59,6 +60,41 @@ COMFY_IDLE_TIMEOUT = 4 * 3600
 RETAKES = 2
 RETAKE_SEED_STEP = 7919
 CHECK_RETAKES = 2
+RETAKE_FLOOR = 8
+RETAKE_SHARE = 0.125
+LONG_LINE = 60
+PIECE_WORDS = 40
+PIECE_GAP = 0.25
+SENTENCE_ENDS = ".!?" + chr(0x2026)
+CLAUSE_ENDS = ",;:" + chr(0x2014)
+CLOSING_MARKS = "\"')" + chr(0x201D) + chr(0x2019)
+SENTENCE_END_RE = re.compile(rf"(?:(?<=[{SENTENCE_ENDS}])|(?<=[{SENTENCE_ENDS}][{CLOSING_MARKS}]))\s+")
+CLAUSE_END_RE = re.compile(rf"(?:(?<=[{CLAUSE_ENDS}])|(?<=[{CLAUSE_ENDS}][{CLOSING_MARKS}]))\s+"
+                           rf"|(?<={chr(0x2014)})(?=\w)")
+# the version of the join, which a render records as render.join
+JOIN_VERSION = 2
+GAP_CONTINUES = 0.15
+GAP_SAME = 0.35
+GAP_CHANGE = 0.5
+ASIDE_RE = re.compile(r"\([^()]*\)")
+QUOTE_MARKS = "\"'" + chr(0x201C) + chr(0x201D) + chr(0x2018) + chr(0x2019)
+
+DIRECTION_STEMS = {
+    "whisper": ("whisper", "breath", "inaudibl"),
+    "soft": ("soft", "quiet", "murmur", "mutter", "mumbl", "hush", "gentl", "low", "thought", "faint", "meek", "timid"),
+    "shout": ("shout", "yell", "scream", "roar", "bellow", "shriek", "howl", "holler"),
+    "raised": ("loud", "raised", "exclaim", "calling", "barking", "booming", "snapp", "furious", "outrage", "angr"),
+}
+# the level a take of each class sits at against its voice's ordinary level, in dB
+LEVEL_OFFSETS = {"whisper": -6.0, "soft": -3.0, "normal": 0.0, "raised": 2.0, "shout": 3.0}
+PACE_WORDS = frozenset(
+    "slow slowly hesitant hesitantly hesitating hesitation halting haltingly pause pauses pausing stammering "
+    "stuttering faltering trailing drawn measured deliberate deliberately weak weakly dying gasping struggling "
+    "sobbing crying choked choking panting breathless exhausted".split())
+NAME_WORD_RE = re.compile(r"[^\W\d_]+(?:['’][^\W\d_]+)*")
+NAME_SKIP = frozenset("the and von van der del las los des".split())
+NAME_MARK = "zqx{}qzx"
+NAME_MARK_RE = re.compile(r"zqx(\d+)qzx")
 
 
 def take_bounds(words: int) -> tuple[float, float]:
@@ -109,6 +145,154 @@ def speakable(text: str) -> str:
     out = re.sub(r"\s+,", ",", out)
     out = re.sub(r",\s*([,.!?;:])", r"\1", out)
     return re.sub(r"\s{2,}", " ", out).strip(" ,")
+
+
+def without_events(text: str) -> str:
+    """text without its vocal events in parentheses, which a voice performs and doesn't say."""
+    return re.sub(r"\(([^()]*)\)", lambda m: " " if m.group(1).strip().lower() in VOCAL_EVENTS else m.group(0), text)
+
+
+def name_terms(bible: dict) -> dict[str, tuple[str, str]]:
+    """The strings that mark a name in a script line, as {string: (term, spoken)}.
+
+    bible: the serial's bible.
+    A say-as term is spoken as its say. Each other word of a pronunciation term, and each capitalized word of a
+    character's name, is a term of its own that is spoken as written. Words of one or two letters and NAME_SKIP are
+    left out. voice_text matches a pronunciation term of one word with its first letter in either case, and any
+    other string as written.
+    """
+    out: dict[str, tuple[str, str]] = {}
+    for term in bible.get("pronunciations") or {}:
+        for word in NAME_WORD_RE.findall(str(term)):
+            if len(word) > 2 and word.lower() not in NAME_SKIP:
+                out[word] = (word, word)
+    for character in (bible.get("characters") or {}).values():
+        for word in NAME_WORD_RE.findall(str((character or {}).get("name") or "")):
+            if len(word) > 2 and word[0].isupper() and word.lower() not in NAME_SKIP:
+                out[word] = (word, word)
+    for term, say in say_as_map(bible).items():
+        out[term] = (term, say)
+    return out
+
+
+def placed_names(plain: list[dict], found: list[tuple[str, str]]) -> list[dict]:
+    """A token map with each name marked where its spoken words stand.
+
+    plain: a line's token map without names.
+    found: (term, spoken) for each name in the line, in the line's order.
+    Returns a copy of plain. Each name is looked for after the name before it, and its last word matches with or
+    without a possessive 's. A name whose words aren't there stays unmarked.
+    """
+    out = [dict(t) for t in plain]
+    at = 0
+    for term, spoken in found:
+        said = words(spoken)
+        for i in range(at, len(out) - len(said) + 1) if said else ():
+            got = [t["w"] for t in out[i: i + len(said)]]
+            if got[:-1] == said[:-1] and got[-1] in (said[-1], said[-1] + "'s"):
+                for t in out[i: i + len(said)]:
+                    t["name"] = term
+                at = i + len(said)
+                break
+    return out
+
+
+def voice_text(line: dict, bible: dict) -> tuple[str, list[dict]]:
+    """The text Breeze is sent for a script line, and the line's token map.
+
+    line: the script line.
+    bible: the serial's bible. Its say-as overrides replace their terms in the text.
+    Returns (text, tokens). tokens has one {"w", "name", "after"} per word of the text, in order: the word as
+    asr.words gives it, the term of name_terms it belongs to or "", and every character that is not a space
+    between it and the next word. A vocal event in parentheses is not a word. A name that cannot be placed is a
+    word without a name.
+    """
+    text = speakable(apply_say_as(line["text"], say_as_map(bible)))
+    plain = [{"w": w, "name": "", "after": after} for w, after in word_map(without_events(text))]
+    terms = name_terms(bible)
+    if not terms:
+        return text, plain
+
+    # Mark each name with a word that survives asr.words
+    found: list[tuple[str, str]] = []
+    exact = set(say_as_map(bible))
+    loose = {str(term) for term in bible.get("pronunciations") or {} if NAME_WORD_RE.fullmatch(str(term))} - exact
+    spelled = {(t[0].lower() + t[1:] if t in loose else t).replace("’", "'"): v for t, v in terms.items()}
+
+    def mark(m: re.Match) -> str:
+        hit = m.group(0)
+        straight = hit.replace("’", "'")
+        found.append(terms[hit] if hit in terms else spelled.get(straight) or spelled[straight[0].lower() + straight[1:]])
+        return NAME_MARK.format(len(found) - 1)
+
+    def loosely(term: str) -> str:
+        """A pattern for a name: either apostrophe, and either case of the first letter of a pronunciation term."""
+        body = re.sub("['’]", "['’]", re.escape(term[1:]))
+        first = f"[{re.escape(term[0].lower())}{re.escape(term[0].upper())}]" if term in loose else re.escape(term[0])
+        return first + body
+
+    # a say-as term matches where and as apply_say_as matches it
+    pattern = "|".join([re.escape(t) for t in sorted(exact, key=len, reverse=True)]
+                       + [loosely(t) for t in sorted(terms, key=len, reverse=True) if t not in exact])
+    marked = without_events(speakable(re.sub(rf"(?<!\w)(?:{pattern})(?!\w)", mark, line["text"])))
+
+    # Put the spoken words of each name back
+    tokens = []
+    for word, after in word_map(marked):
+        m = NAME_MARK_RE.search(word)
+        if not m:
+            tokens.append({"w": word, "name": "", "after": after})
+            continue
+        term, spoken = found[int(m.group(1))]
+        said = words(spoken) or [""]
+        said[0] = word[: m.start()] + said[0]
+        said[-1] += word[m.end():]
+        tokens += [{"w": w, "name": term, "after": after if n == len(said) - 1 else ""} for n, w in enumerate(said)]
+    return text, tokens if [t["w"] for t in tokens] == [t["w"] for t in plain] else placed_names(plain, found)
+
+
+def direction_class(direction: str | None) -> str:
+    """How loud a direction says its line is: "whisper", "soft", "normal", "raised" or "shout".
+
+    direction: the line's direction, or None.
+    Returns the loudest or the softest class a word of the direction names, the softest when it names both, and
+    "normal" when it names none.
+    """
+    said = re.findall(r"[a-z]+", (direction or "").lower())
+    for name in ("whisper", "soft", "shout", "raised"):
+        if any(word.startswith(stem) for word in said for stem in DIRECTION_STEMS[name]):
+            return name
+    return "normal"
+
+
+def gap_after(line: dict, following: dict | None) -> float:
+    """The silence the join leaves after a line's take, in seconds.
+
+    line: the script line.
+    following: the next line that has a take, or None after the last one.
+    GAP_CONTINUES when the sentence goes on into the next line: the line's words end without a full stop, a question
+    mark, an exclamation mark or an ellipsis, or the next line starts with a lowercase letter. Otherwise GAP_CHANGE
+    when the next line has another speaker, and GAP_SAME when it doesn't. Quote marks, brackets and an aside in
+    parentheses at either end don't count.
+    """
+    def bare(a_line: dict | None) -> str:
+        return ASIDE_RE.sub(" ", str((a_line or {}).get("text") or "")).strip(QUOTE_MARKS + "()[] \t\n")
+
+    said, comes = bare(line), bare(following)
+    if (said and said[-1] not in SENTENCE_ENDS) or comes[:1].islower():
+        return GAP_CONTINUES
+    return GAP_CHANGE if following is not None and following.get("speaker") != line.get("speaker") else GAP_SAME
+
+
+def keeps_its_pauses(line: dict) -> bool:
+    """Whether a script line's pauses belong to its delivery, so no check may shorten them.
+
+    line: the script line.
+    True for a line with a vocal event in parentheses, and for a line whose direction has a word of PACE_WORDS.
+    """
+    events = {m.strip().lower() for m in re.findall(r"\(([^()]*)\)", line.get("text") or "")}
+    said = set(re.findall(r"[a-z]+", (line.get("direction") or "").lower()))
+    return bool(events & VOCAL_EVENTS or said & PACE_WORDS)
 
 
 def instruction(direction: str) -> str:
@@ -432,6 +616,81 @@ def cpp_take(server, wav: bytes, transcript: str, text: str, direction: str, vse
     return {"pcm": pcm, "seed": seed, "tries": len(tries), "fits": low <= secs <= high}
 
 
+def clause_pieces(text: str, limit: int = PIECE_WORDS) -> list[str]:
+    """A long line as pieces that end at a sentence or a clause.
+
+    text: the line as the voice reads it.
+    limit: the words a piece may have.
+    Returns the pieces in order. Each is a stretch of the text with single spaces, and together they hold all of it
+    but the spaces between them. A sentence over the limit is split after a comma, a semicolon, a colon or a dash.
+    A piece is over the limit when it has no such place to split, or when it took in a neighbour of under a fifth
+    of the limit.
+    """
+    flat = " ".join(text.split())
+
+    def split(start: int, end: int, pattern: re.Pattern) -> list[tuple[int, int]]:
+        marks = [start] + [at for m in pattern.finditer(flat, start, end) for at in m.span()] + [end]
+        return [(marks[k], marks[k + 1]) for k in range(0, len(marks), 2) if marks[k + 1] > marks[k]]
+
+    def size(a: int, b: int) -> int:
+        return count_words(flat[a:b])
+
+    # Sentences, and the clauses of a sentence over the limit
+    parts = []
+    for a, b in split(0, len(flat), SENTENCE_END_RE):
+        parts += split(a, b, CLAUSE_END_RE) if size(a, b) > limit else [(a, b)]
+
+    # Fill each piece up to the limit
+    pieces: list[tuple[int, int]] = []
+    for a, b in parts:
+        if pieces and size(pieces[-1][0], b) <= limit:
+            pieces[-1] = (pieces[-1][0], b)
+        else:
+            pieces.append((a, b))
+
+    # Give a piece that is too short to the shorter of its neighbours
+    while len(pieces) > 1:
+        i = next((i for i, p in enumerate(pieces) if size(*p) < limit // 5), None)
+        if i is None:
+            break
+        before = i > 0 and (i == len(pieces) - 1 or size(*pieces[i - 1]) <= size(*pieces[i + 1]))
+        a = i - 1 if before else i
+        pieces[a: a + 2] = [(pieces[a][0], pieces[a + 1][1])]
+    return [flat[a:b] for a, b in pieces]
+
+
+def cpp_pieces(server, wav: bytes, transcript: str, pieces: list[str], direction: str, vseed: int, line: int, log,
+               first: int = 0) -> dict:
+    """Takes a line piece by piece with breeze-server and joins the pieces into one take.
+
+    server, wav, transcript, direction, vseed, line, log, first: as cpp_take takes them.
+    pieces: the line's text in pieces, from clause_pieces.
+    Returns what cpp_take returns, for the whole line: the audio of the pieces with PIECE_GAP of silence between
+    them, the seed of the first piece, the tries of all pieces, and fits when every piece fits its own length.
+    """
+    takes = [cpp_take(server, wav, transcript, piece, direction, vseed, line, log, first=first) for piece in pieces]
+    gap = b"\x00\x00" * int(PIECE_GAP * server.sample_rate)
+    return {"pcm": gap.join(t["pcm"] for t in takes), "seed": takes[0]["seed"], "tries": sum(t["tries"] for t in takes),
+            "fits": all(t["fits"] for t in takes)}
+
+
+def retake_line(server, wav: bytes, transcript: str, text: str, direction: str, vseed: int, line: int, log,
+                round_: int) -> tuple[dict, int]:
+    """Takes a flagged line again for one round of the check before the join.
+
+    server, wav, transcript, text, direction, vseed, line, log: as cpp_take takes them.
+    round_: the round, which picks seeds no earlier round used.
+    Returns (take, pieces). A line of more than LONG_LINE words is taken in the pieces of clause_pieces, and pieces
+    is their count. Any other line is one piece.
+    """
+    first = round_ * (RETAKES + 1)
+    pieces = clause_pieces(text) if count_words(text) > LONG_LINE else [text]
+    if len(pieces) > 1:
+        log(f"   line {line}: taking its {count_words(text)} words again in {len(pieces)} pieces")
+        return cpp_pieces(server, wav, transcript, pieces, direction, vseed, line, log, first=first), len(pieces)
+    return cpp_take(server, wav, transcript, text, direction, vseed, line, log, first=first), 1
+
+
 def take_fields(got: dict) -> dict:
     """What a saved take records about a cpp_take answer: its seed, a hash of its audio, takes_tried when it took
     more than one try, and out_of_range when its length does not fit."""
@@ -451,73 +710,128 @@ def write_wav(path: Path, pcm: bytes, sample_rate: int) -> None:
         w.writeframes(pcm)
 
 
-def retake_flagged(folder: Path, lines: list[dict], say: dict, saved: dict, made: list[str], again, *, save,
-                   comfy_url: str, log, rounds: int = CHECK_RETAKES) -> list[int]:
-    """Checks a render's takes against the script before the join and replaces the ones that do not say their line.
+def retake_ceiling(spoken: int) -> int:
+    """How many times one render may take a flagged line again, over all its rounds, for a chapter of `spoken` takes."""
+    return max(RETAKE_FLOOR, int(spoken * RETAKE_SHARE))
 
-    folder: the chapter folder. Its take_check.json gets the verdict of every take in made.
+
+def retake_flagged(folder: Path, lines: list[dict], bible: dict, saved: dict, made: list[str], again, *, save,
+                   comfy_url: str, log, rounds: int = CHECK_RETAKES) -> dict:
+    """Checks a render's takes before the join and replaces the ones the check flags.
+
+    folder: the chapter folder. Its take_check.json gets the entry of every take in made, and each voice's baseline.
     lines: the script lines.
-    say: the bible's say-as map.
-    saved: the chapter's takes by line. The entry of a replaced take is updated in place, and the entry of every
-        line taken again records its last round as retake_rounds.
-    made: the lines, as keys of saved, to check: the ones this render made, and the ones whose saved take an
-        earlier check flagged.
+    bible: the serial's bible.
+    saved: the chapter's takes by line. The entry of a replaced take is updated in place, the entry of every line
+        taken again records its last round as retake_rounds, and the entry of a take a voice finding covers
+        records its reasons as retake_held.
+    made: the lines, as keys of saved, to check: the ones this render made, the ones whose saved take an earlier
+        check flagged, and the ones whose saved take doesn't have evidence of the current versions.
     again: again(line, round) takes a line again and returns its entry, with the audio in a file of its own.
     save: save() writes saved to disk. It is called after each replaced take and at the end of each round.
     comfy_url: the ComfyUI address the recognizer functions take.
     log: receives the progress lines.
-    rounds: how many times a flagged line is taken again.
-    Returns the lines whose take was replaced. A new take replaces the old one only when its transcript is closer to
-    the line. Does nothing unless this machine's recognizer is Parakeet, which leaves the card to breeze-server.
+    rounds: how many rounds a flagged line gets, over every render of its take.
+    Returns {"replaced", "findings", "left"}: the lines whose take was replaced, the voice findings from
+    takecheck.voice_findings, and the flagged lines that the render's ceiling left for a later render. A new take
+    replaces the old one only when takecheck.better ranks it above. A line goes on from the round its retake_rounds
+    records, so a line that has been through every round is heard and not taken again. A take is not taken again
+    when a voice finding covers every reason it is flagged for. The render takes lines again at most retake_ceiling
+    times, the worst lines first. Does nothing unless this machine's recognizer is Parakeet, which leaves the card
+    to breeze-server.
     Never raises. A failure is logged, and the takes replaced before it stay replaced, in saved and in
     take_check.json.
     """
-    replaced: list[int] = []
+    out: dict = {"replaced": [], "findings": [], "left": []}
+    replaced: list[int] = out["replaced"]
     pending: dict[str, dict] = {}
     try:
         from . import takecheck
         engine = choose_asr()
         if engine != "parakeet" or not made:
-            return replaced
-        check = dict(engine=engine, comfy_url=comfy_url, log=log)
-        log(f"   checking the {len(made)} new take{'' if len(made) == 1 else 's'} with Parakeet before the join...")
-        results = takecheck.check_entries({k: saved[k] for k in made}, lines, say, **check)
-        takecheck.save_entries(folder, results, engine)
-        for round_ in range(1, rounds + 1):
-            bad = [k for k in made if results[k]["verdict"] == "flagged"]
+            return out
+        check = dict(engine=engine, comfy_url=comfy_url, log=log, folder=folder, saved=saved)
+        record = dict(takes=saved, lines=lines, bible=bible)
+        log(f"   checking the {len(made)} take{'' if len(made) == 1 else 's'} with Parakeet before the join...")
+        results = takecheck.check_entries({k: saved[k] for k in made}, lines, bible, **check)
+        takecheck.save_entries(folder, results, engine, **record)
+
+        # Voice findings
+        out["findings"] = takecheck.voice_findings(takecheck.saved_entries(folder, saved), saved)
+        tripped = {(f["voice"], f["reason"]) for f in out["findings"]}
+        held, changed = set(), False
+        for k in made:
+            reasons = sorted(results[k].get("reasons") or [])
+            covered = (results[k]["verdict"] == "flagged" and bool(reasons)
+                       and all((saved[k].get("voice"), r) in tripped for r in reasons))
+            if covered:
+                held.add(k)
+            if saved[k].get("retake_held") != (reasons if covered else None):
+                changed = True
+                saved[k].pop("retake_held", None)
+                if covered:
+                    saved[k]["retake_held"] = reasons
+        for f in out["findings"]:
+            log(f"   voice finding: {f['reason']} flags {len(f['lines'])} of the {f['of']} takes of {f['voice']}, so "
+                f"the cause is the voice and those takes are not taken again")
+        if changed:
+            save()
+
+        # Retakes
+        def spent(k: str) -> int:
+            done = saved[k].get("retake_rounds")
+            return done if isinstance(done, int) and not isinstance(done, bool) else 0
+
+        budget, left = retake_ceiling(len(saved)), set()
+        for _ in range(rounds):
+            bad = [k for k in made if results[k]["verdict"] == "flagged" and k not in held and spent(k) < rounds]
+            if len(bad) > budget:
+                worst = sorted(bad, key=lambda k: -(results[k]["sub"] + results[k]["del"] + results[k]["ins"]))
+                left.update(worst[budget:])
+                bad = [k for k in bad if k in worst[:budget]]
+            budget -= len(bad)
             if not bad:
                 break
-            log(f"   taking {len(bad)} of them again, because the transcript does not match the line: {', '.join(bad)}")
+            log(f"   taking {len(bad)} of them again, because the check flagged them: {', '.join(bad)}")
             for k in bad:
-                pending[k] = again(k, round_)
-            verdicts = takecheck.check_entries(pending, lines, say, **check)
+                pending[k] = again(k, spent(k) + 1)
+            verdicts = takecheck.check_entries(pending, lines, bible, **check)
             for k in bad:
                 new = pending.pop(k)
+                round_ = spent(k) + 1
                 saved[k]["takes_tried"] = saved[k].get("takes_tried", 1) + new.get("takes_tried", 1)
                 saved[k]["retake_rounds"] = round_
-                if takecheck.badness(verdicts[k]) >= takecheck.badness(results[k]):
+                if not takecheck.better(verdicts[k], results[k]):
                     Path(new["file"]).unlink(missing_ok=True)
                     continue
                 os.replace(new["file"], saved[k]["file"])
-                saved[k].pop("out_of_range", None)
-                saved[k].update({f: new[f] for f in ("seed", "audio", "out_of_range") if f in new}, retaken=round_)
+                for field in ("out_of_range", "pieces"):
+                    saved[k].pop(field, None)
+                saved[k].update({f: new[f] for f in ("seed", "audio", "out_of_range", "pieces") if f in new},
+                                retaken=round_)
                 results[k] = verdicts[k]
                 save()
                 if int(k) not in replaced:
                     replaced.append(int(k))
             save()
-            takecheck.save_entries(folder, results, engine)
-        still = [k for k in made if results[k]["verdict"] == "flagged"]
+            takecheck.save_entries(folder, results, engine, **record)
+        still = [k for k in made if results[k]["verdict"] == "flagged" and k not in held]
+        out["left"] = sorted(int(k) for k in left if k in still)
         if replaced:
             log(f"   kept a new take for: {', '.join(map(str, sorted(replaced)))}")
+        if out["left"]:
+            log(f"   the render reached its ceiling of {retake_ceiling(len(saved))} retakes, so a later render takes "
+                f"these lines again: {', '.join(map(str, out['left']))}")
+        still = [k for k in still if int(k) not in out["left"]]
         if still:
-            log(f"   still flagged after {rounds} more rounds: {', '.join(still)}")
+            log(f"   still flagged after {rounds} rounds of retakes: {', '.join(still)}")
     except Exception as e:
         for new in pending.values():
             Path(new["file"]).unlink(missing_ok=True)
         log(f"   could not check the new takes before the join, so the join uses them as they are: "
             f"{type(e).__name__}: {e}")
-    return sorted(replaced)
+    replaced.sort()
+    return out
 
 
 def retakes_flagged_here(comfy_url: str) -> bool:
@@ -537,18 +851,27 @@ def retakes_flagged_here(comfy_url: str) -> bool:
         return False
 
 
-def flagged_before(folder: Path, saved: dict) -> set[str]:
-    """The lines whose saved take the take check flagged and that have not been through every retake round.
+def flagged_before(folder: Path, saved: dict, lines: list[dict] | None = None, bible: dict | None = None) -> set[str]:
+    """The lines whose saved take the take check flagged and that a render would take again.
 
     folder: the chapter folder, which holds take_check.json.
     saved: the chapter's takes by line.
-    Returns the lines as keys of saved. A verdict counts only for the take and the audio it was heard in. A
-    take_check.json that cannot be read or parsed counts as no verdicts.
+    lines, bible: the script lines and the serial's bible. With them, a file whose verdicts come from older rules
+        than takecheck.JUDGE_V is judged again from its evidence first, without being written.
+    Returns the lines as keys of saved. A verdict counts only for the take and the audio it was heard in. A line
+    that has been through every retake round is left out, and so is a take whose reasons a voice finding covered
+    (retake_held). A take_check.json that cannot be read or parsed counts as no verdicts.
     """
-    from .takecheck import CHECK_FILE
-    path = folder / CHECK_FILE
+    from . import takecheck
+    path = folder / takecheck.CHECK_FILE
     try:
-        checked = (lib.load_json(path).get("takes") or {}) if path.is_file() else {}
+        data = lib.load_json(path) if path.is_file() else {}
+        checked = data.get("takes") or {}
+        if lines is not None and bible is not None and data.get("rules") != takecheck.JUDGE_V:
+            try:
+                checked = takecheck.rejudged(checked, saved, lines, bible)
+            except Exception:
+                pass
         verdicts = list(checked.items())
     except (OSError, ValueError, AttributeError, RecursionError):
         return set()
@@ -559,9 +882,28 @@ def flagged_before(folder: Path, saved: dict) -> set[str]:
             continue
         rounds = take.get("retake_rounds")
         spent = isinstance(rounds, int) and rounds >= CHECK_RETAKES
-        if verdict.get("key") == take.get("key") and verdict.get("audio") == take.get("audio") and not spent:
+        held, reasons = take.get("retake_held"), verdict.get("reasons")
+        covered = (isinstance(held, list) and isinstance(reasons, list) and bool(reasons)
+                   and all(isinstance(r, str) and r in held for r in reasons))
+        if (verdict.get("key") == take.get("key") and verdict.get("audio") == take.get("audio") and not spent
+                and not covered):
             lines.add(k)
     return lines
+
+
+def unheard_before(folder: Path, saved: dict) -> set[str]:
+    """The lines whose saved take doesn't have evidence from Parakeet, in the current versions, in take_check.json.
+
+    folder: the chapter folder.
+    saved: the chapter's takes by line.
+    Returns the lines as keys of saved. The evidence counts the blocks this machine has the models for. Never raises.
+    """
+    from . import takecheck
+    from .asr import extra_blocks
+    entries = takecheck.saved_entries(folder, saved)
+    extras = extra_blocks()
+    return {k for k, take in saved.items()
+            if isinstance(take, dict) and not takecheck.reusable(entries.get(k) or {}, take, "parakeet", extras)}
 
 
 def wait_comfy_idle(comfy_url: str, log, timeout: float = COMFY_IDLE_TIMEOUT) -> None:
@@ -617,14 +959,27 @@ def take_model(runner: str) -> str:
     return MODEL if runner == "comfyui" else f"cpp:{CPP_MODEL.name}"
 
 
-def plan_takes(lines: list[dict], speaker_slot: dict, slot_voice: dict, say: dict, seed: int,
+def render_seed(last: dict | None, seed: int | None = None) -> int:
+    """The base seed a Breeze render uses.
+
+    last: the chapter's render record, or None.
+    seed: the seed the request names, or None.
+    Returns seed when the request names one, else the seed of the last render when that was Breeze, else 1.
+    """
+    if seed is not None:
+        return seed
+    kept = last.get("seed") if isinstance(last, dict) and last.get("engine") == "breeze" else None
+    return kept if isinstance(kept, int) and not isinstance(kept, bool) else 1
+
+
+def plan_takes(lines: list[dict], speaker_slot: dict, slot_voice: dict, bible: dict, seed: int,
                ref_sha1: dict[str, str], runner: str) -> list[tuple]:
     """The take each script line needs, in script order, as (line, voice, text, direction, voice seed, key).
 
     lines: the script lines.
     speaker_slot: speaker -> slot, from plan_slots.
     slot_voice: slot -> voice id, from plan_slots.
-    say: the bible's say-as map.
+    bible: the serial's bible, whose say-as overrides voice_text applies.
     seed: the render's base seed.
     ref_sha1: voice id -> the sha1 of its cast clip.
     runner: "cpp" or "comfyui".
@@ -634,7 +989,7 @@ def plan_takes(lines: list[dict], speaker_slot: dict, slot_voice: dict, say: dic
     plan = []
     for i, line in enumerate(lines):
         voice = slot_voice[speaker_slot[line["speaker"]]]
-        text = speakable(apply_say_as(line["text"], say))
+        text = voice_text(line, bible)[0]
         direction = " ".join((line.get("direction") or "").split())
         vseed = voice_seed(seed, voice)
         parts = dict(text=text, voice=voice, ref=ref_sha1[voice], direction=direction, seed=vseed,
@@ -645,16 +1000,27 @@ def plan_takes(lines: list[dict], speaker_slot: dict, slot_voice: dict, say: dic
     return plan
 
 
-def reusable_takes(slug: str, number: int, seed: int, runner: str | None = None) -> tuple[int, int]:
-    """How many of a chapter's spoken lines a render could take from its saved takes, and how many it speaks.
+def render_changes(slug: str, number: int, seed: int | None = None, runner: str | None = None, *,
+                   stored: bool = False) -> dict:
+    """What a render of a chapter would change.
 
     slug: the serial.
     number: the chapter.
-    seed: the render's base seed.
+    seed: the render's base seed. None picks it the way a render does, with render_seed.
     runner: "cpp" or "comfyui". None picks it the way a render does.
-    Returns (reusable, spoken). Reads only the library, so a take counts when its key matches, even if its file is
-    gone from the node that made it. Under cpp a take that a render would take again, because the take check flagged
-    it, does not count. Raises when the chapter cannot be planned, for example when it has no script.
+    stored: count the flagged takes from the verdicts as take_check.json holds them. A render judges verdicts from
+        older rules again first, and so does this function when stored is False.
+    Returns {"spoken", "make", "retake", "unheard", "join", "engine"}. spoken counts the lines the chapter speaks.
+    make counts the lines whose saved take is missing or has another key. retake counts the saved takes a render
+    would take again because the take check flagged them, and unheard the saved takes it would hear for their
+    evidence, both under cpp only. join says whether a render would write audio the chapter doesn't have: it is
+    False only when the chapter's audio comes from a Breeze join of JOIN_VERSION that made the cuts a join would
+    make now. A render record from before renders recorded their cuts counts as having made every cut but the ones
+    that end a take. engine is the engine of the
+    chapter's last render, "breeze" or "drama3", or None for a chapter that was never rendered. Reads the library, and tries the take check's models once in a process on a machine that has them, so
+    unheard counts the blocks this machine gathers. A take counts as saved when its key matches, even if its
+    file is gone from the node that made it. Raises when the chapter cannot be planned, for example when it has no
+    script.
     """
     serial = lib.load_serial(slug)
     meta, _ = lib.load_chapter(slug, number)
@@ -662,26 +1028,60 @@ def reusable_takes(slug: str, number: int, seed: int, runner: str | None = None)
     lines = lib.load_json(folder / "script.json")["lines"]
     bible = lib.load_bible(slug)
     speaker_slot, slot_voice, _ = plan_slots(serial, bible, lines)
-    runner = choose_runner(serial, meta.get("render") if isinstance(meta.get("render"), dict) else {}, runner=runner)
+    last = meta.get("render") if isinstance(meta.get("render"), dict) else {}
+    runner = choose_runner(serial, last, runner=runner)
+    seed = render_seed(last, seed)
     vdir = lib.serial_dir(slug) / "voices"
     ref_sha1 = {v: hashlib.sha1((vdir / (lib.load_yaml(vdir / f"{v}.yaml") or {})["clip"]).read_bytes()).hexdigest()
                 for v in set(slot_voice.values())}
-    plan = plan_takes(lines, speaker_slot, slot_voice, say_as_map(bible), seed, ref_sha1, runner)
+    plan = plan_takes(lines, speaker_slot, slot_voice, bible, seed, ref_sha1, runner)
     takes_path = folder / TAKES_FILE
     saved = (lib.load_json(takes_path).get("takes") or {}) if takes_path.exists() else {}
     spoken = [p for p in plan if re.search(r"\w", p[2])]
-    redo = flagged_before(folder, saved) if runner == "cpp" else set()
-    reusable = sum(1 for p in spoken if (saved.get(str(p[0])) or {}).get("key") == p[5] and str(p[0]) not in redo)
-    return reusable, len(spoken)
+    kept = {str(p[0]) for p in spoken if (saved.get(str(p[0])) or {}).get("key") == p[5]}
+    flagged = flagged_before(folder, saved) if stored else flagged_before(folder, saved, lines, bible)
+    redo = flagged & kept if runner == "cpp" else set()
+    unheard = (unheard_before(folder, saved) & kept) - redo if runner == "cpp" else set()
+    rendered = last.get("engine") == "breeze" and bool(last.get("audio"))
+    joined = last.get("join") if isinstance(last.get("join"), int) else 1
+    cut = False
+    if rendered and joined >= JOIN_VERSION:
+        from . import takecheck
+        cuts = takecheck.join_cuts(folder, saved, lines, bible, stored=True)
+        if isinstance(last.get("cuts"), str):
+            cut = last["cuts"] != cuts_digest(cuts)
+        else:
+            entries = takecheck.saved_entries(folder, saved)
+            cut = any(takecheck.ends_a_take(c, entries.get(k) or {}) for k, found in cuts.items() for c in found)
+    return {"spoken": len(spoken), "make": len(spoken) - len(kept), "retake": len(redo), "unheard": len(unheard),
+            "join": not rendered or joined < JOIN_VERSION or cut,
+            "engine": last.get("engine") or ("drama3" if last.get("codes_file") else None)}
 
 
-def render_breeze(slug: str, number: int, *, seed: int = 1, comfy_url: str = "http://127.0.0.1:8188", log=print,
-                  join_only: bool = False, runner: str | None = None) -> dict:
+def cuts_digest(cuts: dict) -> str:
+    """A short hash of the cuts a join makes, {line: [[start, end], ...]}, which the render record keeps."""
+    return hashlib.sha1(json.dumps({k: cuts[k] for k in sorted(cuts, key=int)}).encode("utf-8")).hexdigest()[:12]
+
+
+def reusable_takes(slug: str, number: int, seed: int | None = None, runner: str | None = None) -> tuple[int, int]:
+    """How many of a chapter's spoken lines a render could take from its saved takes, and how many it speaks.
+
+    slug, number, seed, runner: as render_changes uses them.
+    Returns (reusable, spoken). A take that render_changes counts under make or retake does not count, with the
+    flagged takes read from the stored verdicts. Raises when the chapter cannot be planned.
+    """
+    changes = render_changes(slug, number, seed, runner, stored=True)
+    return changes["spoken"] - changes["make"] - changes["retake"], changes["spoken"]
+
+
+def render_breeze(slug: str, number: int, *, seed: int | None = None, comfy_url: str = "http://127.0.0.1:8188",
+                  log=print, join_only: bool = False, runner: str | None = None) -> dict:
     """Renders a chapter with Breeze TTS 2 to audio/chNNNN.opus and marks it rendered.
 
     slug: the serial.
     number: the chapter.
-    seed: the base for each voice's Breeze seed. A join-only run uses the seed the chapter was rendered with.
+    seed: the base for each voice's Breeze seed. None keeps the seed of the chapter's last Breeze render, else 1.
+        A join-only run uses the seed the chapter was rendered with.
     comfy_url: the ComfyUI that the comfyui runner queues on, and that the cpp runner asks to free the card.
     log: receives the progress lines.
     join_only: join the saved takes again without generating any.
@@ -704,12 +1104,12 @@ def render_breeze(slug: str, number: int, *, seed: int = 1, comfy_url: str = "ht
     lines = lib.load_json(script_path)["lines"]
     bible = lib.load_bible(slug)
     speaker_slot, slot_voice, notes = plan_slots(serial, bible, lines)
-    say = say_as_map(bible)
     effects = {slot_voice[s]: spec for s, spec in slot_effects(serial, slot_voice).items()}
     last = meta.get("render") if isinstance(meta.get("render"), dict) else {}
     last_breeze = last.get("engine") == "breeze"
     if join_only and last_breeze:
         seed = last.get("seed", seed)
+    seed = render_seed(last, seed)
     runner = choose_runner(serial, last, join_only=join_only, runner=runner)
     stem = f"ch{number:04d}"
     for n in notes:
@@ -723,7 +1123,7 @@ def render_breeze(slug: str, number: int, *, seed: int = 1, comfy_url: str = "ht
     model = take_model(runner)
 
     # Plan
-    plan = plan_takes(lines, speaker_slot, slot_voice, say, seed, {v: r["sha1"] for v, r in refs.items()}, runner)
+    plan = plan_takes(lines, speaker_slot, slot_voice, bible, seed, {v: r["sha1"] for v, r in refs.items()}, runner)
     spoken = [p for p in plan if re.search(r"\w", p[2])]
 
     def usable(p) -> bool:
@@ -734,19 +1134,28 @@ def render_breeze(slug: str, number: int, *, seed: int = 1, comfy_url: str = "ht
             return True
         secs = wav_seconds(Path(entry["file"]))
         low, high = take_bounds(count_words(p[2]))
+        pieces = entry.get("pieces") if isinstance(entry.get("pieces"), int) else 1
+        # each piece after the first has its own allowance in take_bounds, and a gap before it
+        high += (pieces - 1) * (take_bounds(0)[1] + PIECE_GAP)
         return secs is not None and low <= secs <= high
 
     stale = [p for p in spoken if not usable(p)]
     if join_only and stale:
         raise ComfyError(f"chapter {number} is missing {len(stale)} takes (first: line {stale[0][0]}); run a full render")
-    flagged = flagged_before(folder, saved) if runner == "cpp" and not join_only else set()
+    flagged = flagged_before(folder, saved, lines, bible) if runner == "cpp" and not join_only else set()
+    unheard = unheard_before(folder, saved) if runner == "cpp" and not join_only else set()
     made_now = {p[0] for p in stale}
-    retry = [p for p in spoken if str(p[0]) in flagged and p[0] not in made_now]
+    retry = [p for p in spoken if (str(p[0]) in flagged or str(p[0]) in unheard) and p[0] not in made_now]
     if retry and not retakes_flagged_here(comfy_url):
         retry = []
-    if retry:
-        log(f"   an earlier check flagged the saved takes of lines {', '.join(str(p[0]) for p in retry)}, so they are "
+    again_lines = [str(p[0]) for p in retry if str(p[0]) in flagged]
+    if again_lines:
+        log(f"   an earlier check flagged the saved takes of lines {', '.join(again_lines)}, so they are "
             f"checked with the new takes and taken again")
+    if len(retry) > len(again_lines):
+        log(f"   {len(retry) - len(again_lines)} saved takes don't have evidence from the current check, so they "
+            f"are heard before the join")
+    findings = last.get("voice_findings") if isinstance(last.get("voice_findings"), list) else []
 
     # Takes
     generated_seconds = 0.0
@@ -809,14 +1218,14 @@ def render_breeze(slug: str, number: int, *, seed: int = 1, comfy_url: str = "ht
 
                 def again(k: str, round_: int) -> dict:
                     i, voice, text, direction, vseed, key = by_line[k]
-                    got = cpp_take(server, wavs[voice], refs[voice]["transcript"], text, direction, vseed, i, log,
-                                   first=round_ * (RETAKES + 1))
+                    got, pieces = retake_line(server, wavs[voice], refs[voice]["transcript"], text, direction, vseed,
+                                              i, log, round_)
                     file = Path(saved[k]["file"]).with_name(f"l{i:04d}.retake.wav")
                     write_wav(file, got["pcm"], server.sample_rate)
-                    return {"key": key, "file": str(file), **take_fields(got)}
+                    return {"key": key, "file": str(file), **take_fields(got), **({"pieces": pieces} if pieces > 1 else {})}
 
-                retake_flagged(folder, lines, say, saved, list(by_line), again, comfy_url=comfy_url, log=log,
-                               save=lambda: save_takes(takes_path, saved, runner))
+                findings = retake_flagged(folder, lines, bible, saved, list(by_line), again, comfy_url=comfy_url,
+                                          log=log, save=lambda: save_takes(takes_path, saved, runner))["findings"]
         finally:
             if server is not None:
                 server.__exit__(None, None, None)
@@ -831,8 +1240,13 @@ def render_breeze(slug: str, number: int, *, seed: int = 1, comfy_url: str = "ht
     out_dir = COMFY_OUTPUT / slug
     out_dir.mkdir(parents=True, exist_ok=True)
     src = out_dir / f"{stem}_breeze{AUDIO_SUFFIX}"
+    from . import takecheck
+    cuts = takecheck.join_cuts(folder, saved, lines, bible)
+    after = {p[0]: lines[q[0]] for p, q in zip(spoken, spoken[1:])}
     job = {"output": str(src), "cap_seconds": MAX_TAKE_SECONDS,
-           "takes": [{"line": i, "file": saved[str(i)]["file"], "voice": voice, "effect": effects.get(voice)}
+           "takes": [{"line": i, "file": saved[str(i)]["file"], "voice": voice, "effect": effects.get(voice),
+                      "offset": LEVEL_OFFSETS[direction_class(lines[i].get("direction"))],
+                      "cuts": cuts.get(str(i), []), "gap": gap_after(lines[i], after.get(i))}
                      for i, voice, *_ in spoken]}
     job_path = folder / "breeze_join_job.json"
     lib.save_json(job_path, job)
@@ -845,7 +1259,10 @@ def render_breeze(slug: str, number: int, *, seed: int = 1, comfy_url: str = "ht
     dst = audio_dir / f"{stem}{src.suffix}"
     shutil.copy2(src, dst)
     log(f"   joined {summary['takes']} takes into {summary['seconds']} s at {summary['sample_rate']} Hz, "
-        f"{summary.get('clicks', 0)} clicks filled in")
+        f"{summary.get('clicks', 0)} clicks filled in, {summary.get('cuts', 0)} pauses and tails cut by "
+        f"{summary.get('cut_seconds', 0)} s")
+    log(f"   the chapter is at {summary.get('loudness')} LUFS with a true peak of {summary.get('true_peak')} dB, "
+        f"compressed by {summary.get('compressed', 0)} dB at most and limited by {summary.get('limited', 0)} dB")
     if summary.get("capped"):
         log(f"   warning: lines {summary['capped']} reached the {MAX_TAKE_SECONDS} s take limit and may be cut off")
     if summary.get("voice_gains"):
@@ -856,13 +1273,17 @@ def render_breeze(slug: str, number: int, *, seed: int = 1, comfy_url: str = "ht
                       "comfy_audio": str(src), "audio": f"audio/{dst.name}", "seed": seed,
                       "slots": {str(s): v for s, v in slot_voice.items()}, "notes": notes,
                       "generated_takes": len(stale), "generate_seconds": round(generated_seconds),
-                      "clicks_filled": summary.get("clicks", 0), "at": lib.now_iso()}
+                      "clicks_filled": summary.get("clicks", 0), "join": JOIN_VERSION, "cuts": cuts_digest(cuts),
+                      "pauses_cut": summary.get("cuts", 0), "loudness": summary.get("loudness"),
+                      "true_peak": summary.get("true_peak"), "at": lib.now_iso()}
     if summary.get("capped"):
         meta["render"]["capped_lines"] = summary["capped"]
     if effects:
         meta["render"]["effects"] = effects
         meta["render"]["fx"] = {"treated_lines": summary["treated_lines"], "raw_seconds": summary.get("raw_seconds"),
                                 "seconds": summary["seconds"]}
+    if findings:
+        meta["render"]["voice_findings"] = findings
     if not (stale or retry) and isinstance(last.get("check"), dict):
         meta["render"]["check"] = last["check"]
     meta["status"] = "rendered"

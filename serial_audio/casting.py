@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import array
 import difflib
+import json
 import shutil
+import subprocess
 import sys
 import time
 import wave
@@ -40,6 +42,8 @@ SOURCES = {"qwen": "qwen3-tts-12hz-1.7b-voicedesign", "breeze": "breeze-tts-2-vo
 DESIGN_CFG = 4.0
 MATCH_THRESHOLD = 0.85
 CLIP_RUN = 3
+LEVEL_SCRIPT = Path(__file__).with_name("breeze_join.py")
+LEVEL_TIMEOUT = 600
 NARRATOR_ID = "narrator"       # the voice of a third-person serial's narration; not a bible character
 TONE_SAMPLE_WORDS = 400
 BATCH_KEYS = ("instruct", "sample_text", "seed", "status", "created_at", "candidates", "engine", "asr")
@@ -352,14 +356,40 @@ def score_candidates(cid: str, brief: dict, candidates: list[dict], *, asr: str,
     Raises ComfyError when the recognizer fails.
     """
     files = [Path(c["clip"]) for c in candidates]
-    for i, heard in recognizer.transcripts(files, engine=asr, comfy_url=comfy_url):
-        c = candidates[i]
+    for i, record in recognizer.records(files, engine=asr, comfy_url=comfy_url):
+        c, heard = candidates[i], record["text"]
         score = transcript_match(brief["sample_text"], heard)
         c.update(transcript=heard, score=round(score, 3))
         run = full_scale_run(files[i])
         if run >= CLIP_RUN:
             c["clipped"] = run
         log(f"   {cid} seed {c['seed']}: match {score:.2f}{'  clipped' if run >= CLIP_RUN else ''}  {files[i].name}")
+
+
+def level_clips(candidates: list[dict], log=print) -> None:
+    """Brings each candidate's clip to the loudness of a cast clip, in place, under the audio Python.
+
+    candidates: the candidates of one voice, each with its clip.
+    log: receives one line.
+    Each candidate whose clip was measured gets the key lufs, the clip's loudness afterwards. A clip keeps its
+    format. When the audio Python can't run or fails, the clips stay as they are and the line says so. Never raises.
+    """
+    try:
+        done = subprocess.run([str(machine.AUDIO_PYTHON), "-I", str(LEVEL_SCRIPT), "--level",
+                               *[str(c["clip"]) for c in candidates]], capture_output=True, text=True,
+                              timeout=LEVEL_TIMEOUT)
+        rows = json.loads(done.stdout.strip().splitlines()[-1]) if done.returncode == 0 else None
+        if not isinstance(rows, list) or len(rows) != len(candidates):
+            raise ValueError((done.stderr or done.stdout or "no answer").strip()[-300:])
+        moved = []
+        for c, row in zip(candidates, rows):
+            before, after = (row.get(name) if isinstance(row, dict) else None for name in ("before", "after"))
+            if isinstance(before, (int, float)) and isinstance(after, (int, float)):
+                c["lufs"] = round(after, 1)
+                moved.append(f"{before:.1f} to {after:.1f}")
+        log(f"   leveled the clips, in LUFS: {', '.join(moved) or 'none had a level'}")
+    except Exception as e:
+        log(f"   the clips were not leveled: {e}")
 
 
 def held_file(raw: str) -> Path | None:
@@ -544,6 +574,7 @@ def cast(slug: str, *, only: list[str] | None = None, candidates: int = 3, seed0
         else:
             cands = generate_candidates(client, slug=slug, cid=cid, brief=brief, count=candidates, seed0=seed0, log=log)
         score_candidates(cid, brief, cands, asr=asr, comfy_url=comfy_url, log=log)
+        level_clips(cands, log=log)
         order = sorted(range(len(cands)), key=lambda i: (not cands[i].get("clipped"), cands[i]["score"]), reverse=True)
         chosen = order[0]
         if cands[chosen].get("clipped"):

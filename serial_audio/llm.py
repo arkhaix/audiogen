@@ -167,7 +167,7 @@ class AnthropicBackend:
             output_config["effort"] = effort
         kwargs = dict(
             model=model_id,
-            max_tokens=32000,
+            max_tokens=64000,
             system=[{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}],
             messages=[{"role": "user", "content": f"{user_text}\n\n{instruction}"}],
             output_config=output_config,

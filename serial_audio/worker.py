@@ -214,11 +214,13 @@ def media_files(folder: Path, changed: dict | None) -> list[str]:
 
     folder: the worker's copy of the serial.
     changed: the files the steps changed. The answer then covers the candidates of each changed voice record, with
-        their Drama 3 voice files, and every take of each chapter that has a changed file. None covers every voice
-        record and every chapter of the serial.
+        their Drama 3 voice files, every take of each chapter that has a changed file, and the pronunciation options
+        when the pronunciations changed. None covers every voice record, every chapter and every option of the
+        serial.
     Returns the paths that are files on this node, sorted. Never raises.
     """
     import yaml
+    said = folder / "bible" / "pronunciations.yaml"
     if changed is None:
         voices = sorted((folder / "voices").glob("*.yaml"))
         chapters = sorted(p.parent for p in (folder / "chapters").glob(f"*/{exchange.TAKES_FILE}"))
@@ -227,6 +229,17 @@ def media_files(folder: Path, changed: dict | None) -> list[str]:
         chapters = sorted({folder / "chapters" / rel.split("/")[1] for rel in changed
                            if rel.startswith("chapters/") and rel.count("/") >= 2})
     out = set()
+    if changed is None or "bible/pronunciations.yaml" in changed:
+        try:
+            entries = yaml.safe_load(said.read_text(encoding="utf-8"))
+        except (OSError, ValueError, yaml.YAMLError):
+            entries = None
+        for entry in entries.values() if isinstance(entries, dict) else []:
+            options = entry.get("options") if isinstance(entry, dict) else None
+            candidates = options.get("candidates") if isinstance(options, dict) else None
+            for c in candidates if isinstance(candidates, list) else []:
+                if isinstance(c, dict) and isinstance(c.get("clip"), str):
+                    out.add(c["clip"])
     for path in voices:
         if path.name == "_briefs.yaml":
             continue
