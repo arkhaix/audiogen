@@ -21,6 +21,13 @@ SAMPLE = "I have waited a hundred and fifty years for this."
 BRIEF = {"id": "meredith", "instruct": "A woman in her late twenties with a low alto voice.", "sample_text": SAMPLE}
 
 
+def setUpModule():
+    # The fake recognizers here give a transcript only, so no option is screened, whatever models this machine has.
+    patcher = mock.patch.object(asr, "extra_blocks", lambda: set())
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
+
+
 class FakeLLM:
     """run_pass that answers the casting pass and the bio pass for the ids in its input and records each call.
 
@@ -579,6 +586,267 @@ class SayOptionsTest(unittest.TestCase):
         lib.save_json(lib.chapter_dir(SLUG, 1) / "script.json", {"lines": OPTIONS_SCRIPT[:2]})
         with self.assertRaises(ValueError):
             pronounce.render_options(SLUG, "Eole", log=lambda *_: None)
+
+
+SCREEN_SCRIPT = OPTIONS_SCRIPT + [
+    {"speaker": "narrator", "text": f"{before} Eole {after}", "direction": ""}
+    for before, after in (("Nobody had told", "about the open gate."), ("The captain asked", "to sing it again."),
+                          ("In the morning", "was gone from the hall."), ("They found", "asleep beside the fire."),
+                          ("Then", "laughed at all of them."), ("Only", "knew the way down there."),
+                          ("At the gate", "turned and waved once."), ("Nobody but", "had kept the old key."))]
+# how the fake voice says each spelling, as (the word Parakeet writes, the phones): "Yole" gets a syllable more in
+# every other take
+SOUNDS = {"Eole": [("Eole", "iol")], "Ay-ole": [("Ay-ole", "eɪoʊl")], "Yole": [("Yole", "jol"), ("Yoley", "joli")]}
+
+
+class ScreenTest(SayOptionsTest):
+    """The options of a term on a machine whose take check has the phone model, while pronounce.SCREENS is on."""
+
+    test_the_pass_stores_the_respellings_beside_the_term_as_written = None
+    test_each_option_is_said_in_its_line_by_the_lines_voice = None
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(pronounce, "SCREENS", True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        lib.save_json(lib.chapter_dir(SLUG, 1) / "script.json", {"lines": SCREEN_SCRIPT})
+        self.blocks: list[tuple] = []
+
+        def hears(files, *, engine, comfy_url, blocks=("asr", "signal")):
+            # Hears the text the server was sent for each file, a word every 0.3 s, with the name as SOUNDS has it
+            # for the file and "tə" at every other word.
+            self.blocks.append(tuple(blocks))
+            texts = [f["text"] for f, _ in FakeServer.instances[-1].requests]
+            for i, _ in enumerate(files):
+                said = texts[i].split()
+                symbols, starts = "", []
+                for n, word in enumerate(said):
+                    spelling = next((s for s in SOUNDS if word.strip(".,!") == s), None)
+                    written, sound = SOUNDS[spelling][i % len(SOUNDS[spelling])] if spelling else (word, "tə")
+                    said[n] = word.replace(spelling, written) if spelling else word
+                    symbols += sound
+                    starts += [round(0.3 * n + 0.04 * j, 2) for j in range(len(sound))]
+                yield i, {"text": " ".join(said), "tokens": [f" {w}" for w in said],
+                          "starts": [round(0.3 * n, 2) for n in range(len(said))], "durations": [0.24] * len(said),
+                          "phone": {"v": 1, "engine": "zipa", "phones": symbols, "starts": starts}}
+
+        for p in (mock.patch.object(asr, "extra_blocks", lambda: {"phone"}), mock.patch.object(asr, "records", hears)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def test_each_option_is_said_in_eight_lines_and_only_a_steady_one_is_held_to(self):
+        self.answers.append({"options": [{"say": "Ay-ole", "why": "x"}, {"say": "Yole", "why": "x"}]})
+        pronounce.options_pass(SLUG, "Eole", log=lambda *_: None)
+        logs: list[str] = []
+        options = pronounce.render_options(SLUG, "Eole", log=logs.append)
+
+        # Each of the three options is said in its line, as before, and in seven other lines that have the term, in
+        # the same voice without a direction. The recognizer is asked for the words and the phones.
+        [server] = FakeServer.instances
+        texts = [f["text"] for f, _ in server.requests]
+        self.assertEqual(len(texts), 3 * pronounce.SCREEN_TAKES)
+        self.assertEqual(texts[0], "The guard told Lewis that Eole had not come back.")
+        self.assertEqual(texts[8], "The guard told Lewis that Ay-ole had not come back.")
+        self.assertEqual(len(set(texts[:8])), 8)
+        self.assertTrue(all("Ay-ole" in t for t in texts[8:16]) and all("Yole" in t for t in texts[16:]))
+        self.assertTrue(all("instruction" in f for f, _ in server.requests[::8]))
+        self.assertFalse(any("instruction" in f for n, (f, _) in enumerate(server.requests) if n % 8))
+        self.assertEqual(self.blocks, [("asr", "phone")])
+
+        # A spelling that every take says without an added sound gets its usual saying and counts as steady. One
+        # that half of the takes add a syllable to is not steady, and the log says it is not offered. Each saying
+        # is kept with the sounds both recognizers heard added.
+        got = {c["say"]: (c.get("said"), c.get("steady"), c.get("typical")) for c in options["candidates"]}
+        self.assertEqual(got["Eole"], ("iol", [8, 8], True))
+        self.assertEqual(got["Ay-ole"], ("eɪoʊl", [8, 8], True))
+        self.assertEqual(got["Yole"][1:], ([4, 8], True))
+        self.assertEqual([c.get("screen") for c in options["candidates"]], [pronounce.SCREEN_V] * 3)
+        self.assertEqual([pronounce.steady(c) for c in options["candidates"]], [True, True, False])
+        self.assertTrue(any("'Yole'" in line and "not offered" in line for line in logs), logs)
+        self.assertEqual([spans[0][2] for spans in options["candidates"][2]["sayings"]], ["", "V@3"] * 4)
+
+        # Only the clip AJ hears is kept of each option, and it holds what the recognizer heard.
+        left = sorted(p.name for p in (pronounce.SAY_OUTPUT / SLUG).glob("*.wav"))
+        self.assertEqual(left, sorted(Path(c["clip"]).name for c in options["candidates"]))
+        self.assertEqual(options["candidates"][1]["heard"], texts[8])
+
+        # The term is read as written, so its entry gets the usual saying of that option. A pick moves the usual
+        # saying with the spelling, and a spelling that is not steady, or was never screened, has none.
+        self.assertEqual(self.entry()["said"], "iol")
+        self.assertEqual(pronounce.set_say_as(SLUG, "Eole", "Ay-ole")["said"], "eɪoʊl")
+        self.assertNotIn("said", pronounce.set_say_as(SLUG, "Eole", "Yole"))
+        self.assertNotIn("said", pronounce.set_say_as(SLUG, "Eole", "Eeyore"))
+        self.assertEqual(pronounce.set_say_as(SLUG, "Eole", None, clear=True)["said"], "iol")
+
+        # Nothing is said again while every option is screened, and a typed spelling is screened alone.
+        pronounce.render_options(SLUG, "Eole", log=lambda *_: None, missing=True)
+        self.assertEqual(len(FakeServer.instances), 1)
+        pronounce.add_option(SLUG, "Eole", "Ay-ole")
+        self.assertEqual(self.entry()["said"], "iol")
+
+    def test_an_option_gets_one_take_and_no_count_while_the_screen_is_off(self):
+        # With the switch off, an option is said once in its line, as on a machine without the phone model, and
+        # gets no count.
+        with mock.patch.object(pronounce, "SCREENS", False):
+            pronounce.add_option(SLUG, "Eole", "Ay-ole")
+            options = pronounce.render_options(SLUG, "Eole", log=lambda *_: None)
+        self.assertEqual(len(FakeServer.instances[-1].requests), 2)
+        self.assertEqual(self.blocks, [("asr", "signal")])
+        self.assertFalse(any("steady" in c or "said" in c for c in options["candidates"]))
+        self.assertNotIn("said", self.entry())
+
+    def test_a_second_screen_uses_new_seeds_and_counts_with_the_first(self):
+        pronounce.add_option(SLUG, "Eole", "Ay-ole")
+        pronounce.render_options(SLUG, "Eole", log=lambda *_: None)
+        first = FakeServer.instances[-1].requests
+        self.assertEqual([c["steady"] for c in self.entry()["options"]["candidates"]], [[8, 8], [8, 8]])
+
+        # A spelling that is typed again is screened again, alone. Its clip is the same take, the seven other
+        # lines get seeds the first screen didn't use, and the count is over all fifteen takes.
+        pronounce.render_options(SLUG, "Eole", log=lambda *_: None, missing=True, again="Ay-ole")
+        second = FakeServer.instances[-1].requests
+        self.assertEqual(len(FakeServer.instances), 2)
+        self.assertEqual(len(second), pronounce.SCREEN_TAKES)
+        self.assertTrue(all("Ay-ole" in f["text"] for f, _ in second))
+        self.assertEqual(second[0][0]["seed"], first[8][0]["seed"])
+        self.assertFalse({f["seed"] for f, _ in second[1:]} & {f["seed"] for f, _ in first})
+        written, typed = self.entry()["options"]["candidates"]
+        self.assertEqual((written["steady"], typed["steady"], len(typed["sayings"])), ([8, 8], [15, 15], 15))
+
+        # Every option is said again when the line's voice changed, and the earlier sayings don't count then.
+        bible = lib.load_bible(SLUG)
+        bible["pronunciations"]["Louis"]["say"] = "Lou-ee"
+        lib.save_bible(SLUG, bible)
+        pronounce.render_options(SLUG, "Eole", log=lambda *_: None, missing=True)
+        self.assertEqual([c["steady"] for c in self.entry()["options"]["candidates"]], [[8, 8], [8, 8]])
+
+    def test_a_screen_that_could_not_count_its_takes_still_counts_with_the_next(self):
+        # No take of the spelling has a word in the name's place, so the screen gives no count. Its sayings are
+        # kept all the same, with the version of the screen.
+        pronounce.add_option(SLUG, "Eole", "Ay-ole")
+        with mock.patch.dict(SOUNDS, {"Ay-ole": [("", "")]}):
+            pronounce.render_options(SLUG, "Eole", log=lambda *_: None)
+        first = FakeServer.instances[-1].requests
+        typed = self.entry()["options"]["candidates"][1]
+        self.assertEqual((typed.get("steady"), typed["sayings"], typed["screen"]), (None, [[]] * 8, pronounce.SCREEN_V))
+        self.assertFalse(pronounce.steady(typed))
+
+        # The next screen of it gets new seeds for the seven other lines, and counts with those eight takes.
+        pronounce.render_options(SLUG, "Eole", log=lambda *_: None, missing=True, again="Ay-ole")
+        second = FakeServer.instances[-1].requests
+        self.assertFalse({f["seed"] for f, _ in second[1:]} & {f["seed"] for f, _ in first})
+        self.assertEqual(self.entry()["options"]["candidates"][1]["steady"], [8, 15])
+
+    def test_a_usual_saying_stays_until_its_spelling_is_screened_again_or_changed(self):
+        self.answers.append({"options": [{"say": "Ay-ole", "why": "x"}]})
+        pronounce.options_pass(SLUG, "Eole", log=lambda *_: None)
+        pronounce.render_options(SLUG, "Eole", log=lambda *_: None)
+        self.assertEqual(pronounce.set_say_as(SLUG, "Eole", "Ay-ole")["said"], "eɪoʊl")
+
+        # New options without the spelling in use, a typed spelling and a changed note leave the usual saying.
+        self.answers.append({"options": [{"say": "Yole", "why": "x"}]})
+        pronounce.options_pass(SLUG, "Eole", log=lambda *_: None)
+        self.assertEqual((self.entry()["say"], self.entry()["said"]), ("Ay-ole", "eɪoʊl"))
+        pronounce.add_option(SLUG, "Eole", "Ayohl")
+        pronounce.set_say_as(SLUG, "Eole", "Ay-ole", note="French.")
+        self.assertEqual(self.entry()["said"], "eɪoʊl")
+
+        # A screen of other spellings leaves it too, and so does a screen whose takes could not be heard.
+        pronounce.render_options(SLUG, "Eole", log=lambda *_: None)
+        self.assertEqual(self.entry()["said"], "eɪoʊl")
+        pronounce.add_option(SLUG, "Eole", "Ay-ole")
+        with mock.patch.object(asr, "records", mock.Mock(side_effect=ComfyError("Parakeet stopped"))):
+            pronounce.render_options(SLUG, "Eole", log=lambda *_: None, missing=True)
+        self.assertEqual(self.entry()["said"], "eɪoʊl")
+
+        # A screen that finds half the takes of the spelling in use add a syllable removes the usual saying.
+        with mock.patch.dict(SOUNDS, {"Ay-ole": [("Ay-ole", "eɪoʊl"), ("Ay-oley", "eɪoʊli")]}):
+            pronounce.render_options(SLUG, "Eole", log=lambda *_: None)
+        self.assertNotIn("said", self.entry())
+
+    def test_a_term_with_one_line_is_screened_in_that_line_and_a_failed_take_leaves_no_screening_file(self):
+        # The only line with the term is said eight times, the seven others without its direction.
+        lib.save_json(lib.chapter_dir(SLUG, 1) / "script.json", {"lines": OPTIONS_SCRIPT[:1] + OPTIONS_SCRIPT[2:3]})
+        pronounce.add_option(SLUG, "Eole", "Ay-ole")
+        options = pronounce.render_options(SLUG, "Eole", log=lambda *_: None)
+        texts = [f["text"] for f, _ in FakeServer.instances[-1].requests]
+        self.assertEqual((len(texts), len(set(texts[:8]))), (16, 1))
+        self.assertEqual([c["steady"] for c in options["candidates"]], [[8, 8], [8, 8]])
+
+        # A take that fails part way stops the job, and the screening takes made before it are removed.
+        FakeServer.fail_text = "The guard told Lewis that Ay-ole had not come back."
+        before = {p.name for p in (pronounce.SAY_OUTPUT / SLUG).glob("*.wav")}
+        with self.assertRaises(ComfyError):
+            pronounce.render_options(SLUG, "Eole", log=lambda *_: None)
+        left = {p.name for p in (pronounce.SAY_OUTPUT / SLUG).glob("*.wav")} - before
+        self.assertFalse([name for name in left if "_s" in name], left)
+
+    def test_an_option_is_steady_when_most_of_its_takes_add_no_sound(self):
+        # Seven of eight is steady and six is not. The clip AJ hears has to be one of the takes that add none,
+        # and fewer takes than a screen makes prove nothing.
+        v = pronounce.SCREEN_V
+        for count, typical, want in (([8, 8], True, True), ([7, 8], True, True), ([6, 8], True, False),
+                                     ([7, 8], False, False), ([0, 0], True, False), ([4, 4], True, False),
+                                     ([14, 16], True, True), ([13, 16], True, False)):
+            self.assertEqual(pronounce.steady({"screen": v, "steady": count, "typical": typical}), want, count)
+        # A count from a screen of another version proves nothing either, and neither does a candidate without one.
+        self.assertFalse(pronounce.steady({"steady": [8, 8], "typical": True}))
+        self.assertFalse(pronounce.steady({"screen": v, "said": "eɪoʊl"}))
+
+        # The takes of an option give how many of them add no sound, whether the first one is one of those, and
+        # the option's usual saying.
+        usual, odd = [["eɪoʊl", "deɪoʊls", ""]], [["eɪoʊli", "deɪoʊlis", "V@2"]]
+        self.assertEqual(pronounce.screened([usual] * 7 + [odd]),
+                         {"said": "eɪoʊl", "steady": [7, 8], "typical": True})
+        self.assertEqual(pronounce.screened([odd] + [usual] * 7),
+                         {"said": "eɪoʊl", "steady": [7, 8], "typical": False})
+        # A take that says the name twice has to say it right both times. A take without a span is a take that
+        # doesn't say it as spelled, so four good takes of eight are not four of four.
+        self.assertEqual(pronounce.screened([usual] * 4 + [usual + odd, []])["steady"], [4, 6])
+        self.assertEqual(pronounce.screened([usual] * 4 + [[]] * 4)["steady"], [4, 8])
+        self.assertEqual(pronounce.screened([[]] + [usual] * 7)["typical"], False)
+        self.assertEqual(pronounce.screened([usual, [], [], []]), {})
+        # A saying that doesn't hold what was added, as an older screen left it, is not a clean one.
+        self.assertEqual(pronounce.screened([[["eɪoʊl", "deɪoʊls"]]] * 8)["steady"], [0, 8])
+
+    def test_the_other_lines_of_an_option_are_spread_over_the_lines_that_have_the_term(self):
+        found = pronounce.lines_naming(SLUG, "Eole")
+        others = pronounce.screening_lines(found, (1, 2), 7)
+        # The line AJ hears and the line of one word are left out, and the seven come from across the rest.
+        self.assertEqual(len(others), 7)
+        self.assertNotIn(OPTIONS_SCRIPT[1], others)
+        self.assertNotIn(OPTIONS_SCRIPT[2], others)
+        self.assertEqual(len({line["text"] for line in others}), 7)
+        # With fewer lines of a sayable length than takes they repeat. A term whose other lines are all too short
+        # is said in those, and a term with no other line has none.
+        self.assertEqual([line["text"] for line in pronounce.screening_lines(found[:3], (1, 2), 3)],
+                         [SCREEN_SCRIPT[4]["text"]] * 3)
+        self.assertEqual([line["text"] for line in pronounce.screening_lines(found[:2], (1, 2), 2)], ["Eole!"] * 2)
+        self.assertEqual(pronounce.screening_lines(found[1:2], (1, 2), 7), [])
+
+        # A line whose words on both sides of the term are new comes before one that shares a word with a line
+        # already chosen, so a neighbour's sound doesn't pass for a part of the name.
+        texts = ["Then Eole replied to all of them.", "Then Eole replied once more to them.",
+                 "Soon Eole replied with a short laugh.", "The guard told Eole about the gate.",
+                 "Nobody but Eole knew the way down.", "At last Eole turned and waved once."]
+        beside = [(1, i, {"text": text}) for i, text in enumerate(texts)]
+        self.assertEqual([line["text"] for line in pronounce.screening_lines(beside, (0, 0), 4, "Eole")],
+                         [texts[0], texts[3], texts[4], texts[5]])
+        self.assertEqual([line["text"] for line in pronounce.screening_lines(beside, (0, 0), 4)], texts[:4])
+
+    def test_a_screening_line_is_said_in_its_own_speakers_voice(self):
+        serial, bible = lib.load_serial(SLUG), lib.load_bible(SLUG)
+        bible["characters"]["eole"]["voice_id"] = "eole"
+        line = {"speaker": "eole", "text": "x"}
+        # A speaker whose voice has no record is said by the fallback, and so is a speaker without a voice. The
+        # narrator's lines get the narrator's voice.
+        self.assertEqual(pronounce.line_voice(SLUG, serial, bible, line, "narrator"), "narrator")
+        lib.save_yaml(lib.serial_dir(SLUG) / "voices" / "eole.yaml", {"clip": "eole.wav"})
+        self.assertEqual(pronounce.line_voice(SLUG, serial, bible, line, "narrator"), "eole")
+        self.assertEqual(pronounce.line_voice(SLUG, serial, bible, {"speaker": "guard", "text": "x"}, "eole"), "narrator")
+        self.assertEqual(pronounce.line_voice(SLUG, serial, bible, {"speaker": "narrator", "text": "x"}, "eole"),
+                         "narrator")
 
 
 class HearSpellingTest(SayOptionsTest):

@@ -3,11 +3,17 @@ pronunciations.yaml. render.say_as_map and render.apply_say_as apply them to eve
 
 Pronunciation options: respellings of a term that a Claude pass proposes and that Breeze says inside a line of the
 script, stored as `options` on the term's entry for AJ to pick from. Nothing here files an option as a say-as.
+
+Screening: on a machine with the take check's phone model, each option is also said in other lines that have the
+term, each in its own speaker's voice, and the option gets the count of those takes that add no sound to its
+spelling, by the take check's name rule. The usual saying of the spelling a term has now is stored as `said` on the
+term's entry, for the Names tab.
 """
 from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import time
 from pathlib import Path
@@ -26,6 +32,13 @@ MAX_OPTIONS = 6
 CONTEXT_LINES = 3
 SAMPLE_WORDS = (6, 30)
 TYPED = "typed on the Names tab"
+# whether an options job screens its options. Off, an option gets its one clip, and every option is offered.
+SCREENS = True
+# how many takes say each option, with the one AJ hears, and the share of them that have to add no sound to it
+SCREEN_TAKES = 8
+STEADY_SHARE = 0.85
+# the version of what a screen counts. A candidate's count and sayings from another version are not read.
+SCREEN_V = 2
 
 
 def _clean(value: str | None, what: str, limit: int, required: bool) -> str:
@@ -45,8 +58,9 @@ def set_say_as(slug: str, term: str, say: str | None, *, note: str | None = None
     say: the spelling the voice reads. Ignored when clear is set.
     note: replaces the entry's note when given. An empty string removes the note.
     clear: remove the override. An entry that is then left without a respelling and without options is removed.
-    Returns the term's entry as saved, or None when it was removed. Raises ValueError on a bad term or say, or when
-    clearing a term that has no override.
+    Returns the term's entry as saved, or None when it was removed. A change of the spelling the voice is sent
+    also changes the entry's usual saying, by hold(). Raises ValueError on a bad term or say, or when clearing a
+    term that has no override.
     """
     # Validate
     term = _clean(term, "term", MAX_TERM, True)
@@ -62,6 +76,7 @@ def set_say_as(slug: str, term: str, say: str | None, *, note: str | None = None
     entries = lib.load_yaml(path, {}) or {}
     entry = entries.get(term)
     entry = dict(entry) if isinstance(entry, dict) else {}
+    was = entry.get("say") or term
     if clear:
         if not entry.get("say"):
             raise ValueError(f"{term!r} has no say-as override")
@@ -73,6 +88,8 @@ def set_say_as(slug: str, term: str, say: str | None, *, note: str | None = None
             entry["note"] = note
         else:
             entry.pop("note", None)
+    if (entry.get("say") or term) != was:
+        hold(entry, term)
     if clear and not entry.get("respelling") and not entry.get("options"):
         entries.pop(term, None)
         saved = None
@@ -81,6 +98,144 @@ def set_say_as(slug: str, term: str, say: str | None, *, note: str | None = None
         saved = entry
     lib.save_yaml(path, entries)
     return saved
+
+
+def steady(candidate) -> bool:
+    """Whether a screened option comes out as it is spelled.
+
+    candidate: an option of a term, or anything else.
+    Returns True when the option was screened by SCREEN_V, has SCREEN_TAKES screening takes or more, STEADY_SHARE
+    of them or more say the name without an added sound, and the take AJ hears is one of those. Never raises.
+    """
+    count = candidate.get("steady") if isinstance(candidate, dict) else None
+    return (isinstance(count, list) and len(count) == 2 and candidate.get("screen") == SCREEN_V
+            and all(isinstance(n, int) and not isinstance(n, bool) for n in count) and count[1] >= SCREEN_TAKES
+            and count[0] >= math.ceil(STEADY_SHARE * count[1]) and candidate.get("typical") is not False)
+
+
+def line_voice(slug: str, serial: dict, bible: dict, line: dict, fallback: str) -> str:
+    """The voice that says a script line in a render.
+
+    slug: the serial.
+    serial, bible: the serial's record and its bible.
+    line: the script line.
+    fallback: the voice to use when the line's voice has no record in the serial's voices folder.
+    Returns the voice of the line's speaker, or the narrator's for the narrator and for a speaker without one.
+    """
+    cast = ((bible.get("characters") or {}).get(line.get("speaker")) or {}).get("voice_id")
+    voice = cast or serial.get("narrator_voice_id") or fallback
+    return voice if (lib.serial_dir(slug) / "voices" / f"{voice}.yaml").is_file() else fallback
+
+
+def hold(entry: dict, term: str) -> None:
+    """Sets or removes an entry's `said`, how the term's spelling usually sounds, which leads the ways the Names
+    tab lists.
+
+    entry: the term's entry in pronunciations.yaml, changed in place.
+    term: the term as the text spells it.
+    It is the usual saying of the option that has the spelling the voice is sent now, the entry's say or the term
+    as written, when that option was screened and is steady. Any other entry is left without one. The callers are
+    a change of the spelling and a new screen of that option, so new options alone leave it as it is.
+    """
+    spelling = entry.get("say") or term
+    options = entry.get("options") if isinstance(entry.get("options"), dict) else {}
+    found = [c for c in options.get("candidates") or [] if isinstance(c, dict) and c.get("say") == spelling]
+    if found and steady(found[0]) and isinstance(found[0].get("said"), str):
+        entry["said"] = found[0]["said"]
+    else:
+        entry.pop("said", None)
+
+
+def spelled(bible: dict, term: str, say: str) -> dict:
+    """A copy of a bible with one term spoken another way.
+
+    bible: the serial's bible, which is not changed.
+    term: the term as the text spells it.
+    say: the spelling the voice reads. The term itself means as written.
+    """
+    entries = dict(bible.get("pronunciations") or {})
+    entry = {k: v for k, v in (entries.get(term) or {}).items() if k != "say"} if isinstance(entries.get(term), dict) else {}
+    entries[term] = {**entry, **({} if say == term else {"say": say})}
+    return {**bible, "pronunciations": entries}
+
+
+def screening_lines(found: list[tuple[int, int, dict]], main: tuple[int, int], count: int, term: str = "") -> list[dict]:
+    """The other lines an option is said in, so its name is heard between different words.
+
+    found: the lines that have the term, from lines_naming.
+    main: (chapter, index) of the line AJ hears, which is left out.
+    count: how many lines to return.
+    term: the term. With it, a line whose word before the term and word after it are both new comes before a line
+        that shares one with a line already chosen.
+    Returns count lines from across the ones with a word count inside SAMPLE_WORDS, or across all the others
+    when none has. With fewer lines than count they repeat, and [] when the term has no other line.
+    """
+    def size(item) -> int:
+        return len(str(item[2].get("text") or "").split())
+
+    def beside(item) -> tuple[str, str]:
+        m = re.search(rf"(?:([^\W\d_]+)\W+)?(?<!\w){re.escape(term)}(?!\w)(?:\W+([^\W\d_]+))?",
+                      str(item[2].get("text") or "")) if term else None
+        return ((m.group(1) or "").lower(), (m.group(2) or "").lower()) if m else ("", "")
+
+    others = [f for f in found if (f[0], f[1]) != main]
+    pool = [f for f in others if SAMPLE_WORDS[0] <= size(f) <= SAMPLE_WORDS[1]] or others
+    if not pool or count <= 0:
+        return []
+    if len(pool) < count:
+        return [pool[i % len(pool)][2] for i in range(count)]
+    stride = max(1, len(pool) // count)
+    order = [i for start in range(stride) for i in range(start, len(pool), stride)]
+    chosen, before, after = [], set(), set()
+    for i in order:
+        b, a = beside(pool[i])
+        if len(chosen) < count and b not in before and a not in after:
+            chosen.append(i)
+            before.add(b)
+            after.add(a)
+    chosen += [i for i in order if i not in chosen][: count - len(chosen)]
+    return [pool[i][2] for i in sorted(chosen)]
+
+
+def sayings(term: str, tokens: list[dict], record: dict) -> list[list[str]]:
+    """How one heard take said a term: [inside, window, added] for each place the term has in the line.
+
+    term: the term.
+    tokens: the token map of the text the take was sent, from breeze.voice_text.
+    record: what asr.records gave for the take, with the asr and phone blocks.
+    added names the sounds that both recognizers heard added to the spelling, by phones.adds, as "V@2 h@1" with
+    the sound and the count of the spelling's sounds before it, and is "" for a saying that adds none.
+    """
+    from . import phones, takecheck
+    asr = {"v": takecheck.ASR_V, "heard": str(record.get("text") or ""),
+           **{f: record[f] for f in takecheck.TOKEN_FIELDS if isinstance(record.get(f), list)}}
+    edits = takecheck.word_edits(asr["heard"], tokens)[0]
+    return [[s["inside"], s["window"],
+             " ".join(f"{sound}@{gap}"
+                      for sound, gap in phones.adds(s["said"], s["heard"], s["near"], s["after"], s["before"]))]
+            for s in takecheck.name_spans(asr, record.get("phone"), tokens, edits) if s["term"] == term]
+
+
+def screened(takes: list[list[list[str]]]) -> dict:
+    """What an option's screening takes say about it.
+
+    takes: the sayings of each take, from sayings(), with the take AJ hears first.
+    Returns {"steady", "typical", "said"}: [the takes that say the name and add no sound to it, the takes],
+    whether the first take is one of those, and the usual saying from phones.consensus over every saying, which
+    is left out when none gives one. A take without a saying is a take that doesn't say the name as spelled. {}
+    when fewer than half of the takes have a saying.
+    """
+    from . import phones
+    heard = [spans for spans in takes if spans]
+    if not heard or 2 * len(heard) < len(takes):
+        return {}
+
+    def clean(spans) -> bool:
+        return bool(spans) and all(len(s) > 2 and not s[2] for s in spans)
+
+    usual = phones.consensus([s for spans in heard for s in spans])
+    return {"steady": [sum(clean(spans) for spans in takes), len(takes)], "typical": clean(takes[0]),
+            **({"said": usual} if usual else {})}
 
 
 def lines_naming(slug: str, term: str) -> list[tuple[int, int, dict]]:
@@ -239,22 +394,32 @@ def options_pass(slug: str, term: str, *, backend="auto", model="opus", effort=N
 
 
 def render_options(slug: str, term: str, *, comfy_url: str = "http://127.0.0.1:8188", log=print,
-                   missing: bool = False) -> dict:
+                   missing: bool = False, again: str | None = None) -> dict:
     """Has Breeze say the options' line once for each candidate, in the voice that says the line in the chapter.
 
     slug: the serial.
     term: the term, which has options from options_pass or add_option.
     comfy_url: the ComfyUI that is asked to free the card first.
     log: receives the progress lines.
-    missing: say only the candidates that don't have a clip yet. When every candidate has one, nothing is said
-        and breeze-server isn't started. When the line's voice, its reference clip, its direction, its seed or
-        another say-as in the line is not what the clips were made with, every candidate is said again.
+    missing: say only the candidates that don't have a clip yet, and on a machine that screens, those that were
+        not screened by SCREEN_V. When every candidate has what it needs, nothing is said and breeze-server isn't
+        started. When the line's voice, its reference clip, its direction, its seed or another say-as in the line
+        is not what the clips were made with, every candidate is said again.
+    again: a spelling. On a machine that screens, the candidate with it is said and screened whatever it has.
     Returns the options as stored. Each candidate that was said gets clip, a 16-bit WAV under SAY_OUTPUT, seconds,
     seed, the text the voice was sent, and heard, what Parakeet made of it, when Parakeet runs here. The options'
-    made_with names what their clips were made with. Every candidate uses the
-    direction and the reference clip that the chapter's render uses for the line, and its seed, or the next seed
-    of cpp_take when a take's length doesn't fit the line. Raises ValueError when the term has no options or its
-    line is gone, and ComfyError when breeze-server cannot start or a take fails.
+    made_with names what their clips were made with. Every candidate uses the direction and the reference clip
+    that the chapter's render uses for the line, and its seed, or the next seed of cpp_take when a take's length
+    doesn't fit the line. While SCREENS is on, on a machine whose take check has the phone model, each candidate
+    is also said in SCREEN_TAKES - 1 other lines that have the term, each in the voice a render gives the line and
+    without a direction, and gets steady, typical and said from screened(). A term with no other line is said in
+    its own line again. Those takes are not kept, and their sayings are, under sayings, with SCREEN_V as screen,
+    also when too few of them were heard for a count. A candidate that
+    SCREEN_V screened before with the same voice and line is screened with new seeds, and its earlier sayings
+    count with the new ones, so each screen makes the count surer. When the candidate that has the term's
+    spelling was screened, the term's entry gets or loses its usual saying by hold(). When it was not, or the
+    takes could not be heard, the entry's stays. Raises ValueError when the term has no options or its line is
+    gone, and ComfyError when breeze-server cannot start or a take fails.
     """
     from . import asr, breeze
     from .render import apply_say_as, plan_slots, say_as_map
@@ -272,7 +437,16 @@ def render_options(slug: str, term: str, *, comfy_url: str = "http://127.0.0.1:8
     if index >= len(lines) or lines[index].get("text") != options["line"]["text"]:
         raise ValueError(f"line {index} of chapter {chapter} is not the line the options of {term!r} were made for")
     speaker_slot, slot_voice, _ = plan_slots(serial, bible, lines)
-    refs = breeze.stage_references(slug, set(slot_voice.values()), "cpp")
+    try:
+        screen = SCREENS and asr.choose(None) == "parakeet" and "phone" in asr.extra_blocks()
+    except Exception:
+        screen = False
+    others = screening_lines(lines_naming(slug, term), (chapter, index), SCREEN_TAKES - 1, term) if screen else []
+    if screen and not others:
+        others = [lines[index]] * (SCREEN_TAKES - 1)
+    narrator = slot_voice[0]
+    said_by = [line_voice(slug, serial, bible, other, narrator) for other in others]
+    refs = breeze.stage_references(slug, set(slot_voice.values()) | set(said_by), "cpp")
     meta, _ = lib.load_chapter(slug, chapter)
     seed = breeze.render_seed(meta.get("render") if isinstance(meta.get("render"), dict) else {}, None)
     plan = breeze.plan_takes(lines, speaker_slot, slot_voice, bible, seed, {v: r["sha1"] for v, r in refs.items()}, "cpp")
@@ -281,7 +455,10 @@ def render_options(slug: str, term: str, *, comfy_url: str = "http://127.0.0.1:8
     basis = [voice, refs[voice]["sha1"], direction, vseed, apply_say_as(lines[index]["text"], spoken)]
     made_with = hashlib.sha1(json.dumps(basis, default=str).encode("utf-8")).hexdigest()[:12]
     same = options.get("voice", voice) == voice and options.get("made_with", made_with) == made_with
-    todo = [n for n, c in enumerate(options["candidates"]) if not (missing and same and c.get("clip"))]
+    todo = [n for n, c in enumerate(options["candidates"])
+            if not (missing and same and c.get("clip")
+                    and (not screen or (c.get("steady") and c.get("screen") == SCREEN_V)))
+            or (screen and again is not None and c.get("say") == again)]
     if not todo:
         return options
     folder = SAY_OUTPUT / slug
@@ -294,35 +471,81 @@ def render_options(slug: str, term: str, *, comfy_url: str = "http://127.0.0.1:8
     breeze.wait_comfy_idle(comfy_url, log)
     breeze.free_comfy(comfy_url)
     server.start()
+    heard_in: list[tuple[int, Path, list[dict]]] = []
+    earlier: dict[int, list] = {}
+    fresh: set[int] = set()
     try:
-        wav = Path(refs[voice]["ref"]).read_bytes()
-        for n in todo:
-            candidate = options["candidates"][n]
-            say = {**spoken, **({} if candidate["say"] == term else {term: candidate["say"]})}
-            text = breeze.speakable(apply_say_as(lines[index]["text"], say))
-            got = breeze.cpp_take(server, wav, refs[voice]["transcript"], text, direction, vseed, index, log)
-            clip = folder / f"{stem}_{n}.wav"
-            breeze.write_wav(clip, got["pcm"], server.sample_rate)
-            candidate.update(clip=str(clip), seconds=round(len(got["pcm"]) / 2 / server.sample_rate, 2), text=text,
-                             seed=got["seed"])
-            candidate.pop("heard", None)
-            log(f"   {term} as {candidate['say']!r}: {candidate['seconds']} s  {clip.name}")
-    finally:
-        server.stop()
+        try:
+            wav = Path(refs[voice]["ref"]).read_bytes()
+            wavs = {v: Path(refs[v]["ref"]).read_bytes() for v in set(said_by)}
+            for n in todo:
+                candidate = options["candidates"][n]
+                say = {**spoken, **({} if candidate["say"] == term else {term: candidate["say"]})}
+                text = breeze.speakable(apply_say_as(lines[index]["text"], say))
+                got = breeze.cpp_take(server, wav, refs[voice]["transcript"], text, direction, vseed, index, log)
+                clip = folder / f"{stem}_{n}.wav"
+                breeze.write_wav(clip, got["pcm"], server.sample_rate)
+                candidate.update(clip=str(clip), seconds=round(len(got["pcm"]) / 2 / server.sample_rate, 2), text=text,
+                                 seed=got["seed"])
+                candidate.pop("heard", None)
+                kept = (candidate.get("sayings") if same and candidate.get("screen") == SCREEN_V
+                        and isinstance(candidate.get("sayings"), list) else [])
+                if not kept:
+                    for field in ("said", "steady", "typical", "sayings", "screen"):
+                        candidate.pop(field, None)
+                earlier[n] = kept[1:]
+                as_said = spelled(bible, term, candidate["say"])
+                heard_in.append((n, clip, breeze.voice_text(lines[index], as_said)[1]))
+                for m, (other, by) in enumerate(zip(others, said_by), len(earlier[n]) + 1):
+                    sent, tokens = breeze.voice_text(other, as_said)
+                    extra = breeze.cpp_take(server, wavs[by], refs[by]["transcript"], sent, "",
+                                            breeze.voice_seed(seed, by), index, log, first=m * (breeze.RETAKES + 1))
+                    file = folder / f"{stem}_{n}_s{m}.wav"
+                    breeze.write_wav(file, extra["pcm"], server.sample_rate)
+                    heard_in.append((n, file, tokens))
+                log(f"   {term} as {candidate['say']!r}: {candidate['seconds']} s  {clip.name}"
+                    + (f", and in {len(others)} other lines" if others else ""))
+        finally:
+            server.stop()
 
-    # Hear and record
-    try:
-        engine = asr.choose(None)
-        if engine == "parakeet":
-            files = [Path(options["candidates"][n]["clip"]) for n in todo]
-            for i, record in asr.records(files, engine=engine, comfy_url=comfy_url):
-                options["candidates"][todo[i]]["heard"] = str(record.get("text") or "")
-    except Exception as e:
-        log(f"   the options were not heard: {e}")
+        # Hear, screen and record
+        try:
+            engine = asr.choose(None)
+            if engine == "parakeet":
+                said: dict[int, list] = {}
+                blocks = {"blocks": ("asr", "phone")} if screen else {}
+                files = [file for _, file, _ in heard_in]
+                for i, record in asr.records(files, engine=engine, comfy_url=comfy_url, **blocks):
+                    n, file, tokens = heard_in[i]
+                    if str(file) == options["candidates"][n]["clip"]:
+                        options["candidates"][n]["heard"] = str(record.get("text") or "")
+                    if screen:
+                        said.setdefault(n, []).append(sayings(term, tokens, record))
+                for n, takes in said.items():
+                    candidate = options["candidates"][n]
+                    takes = takes[:1] + earlier[n] + takes[1:]
+                    found = screened(takes)
+                    for field in ("said", "steady", "typical"):
+                        candidate.pop(field, None)
+                    candidate.update(found, sayings=takes, screen=SCREEN_V)
+                    fresh.add(n)
+                    if found:
+                        count = found["steady"]
+                        log(f"   {term} as {candidate['say']!r}: {count[0]} of {count[1]} takes say it without an "
+                            f"added sound" + ("" if found["typical"] else ", and the clip is not one of them")
+                            + ("" if steady(candidate) else ", so it is not offered"))
+        except Exception as e:
+            log(f"   the options were not heard: {e}")
+    finally:
+        for n, file, _ in heard_in:
+            if str(file) != options["candidates"][n].get("clip"):
+                file.unlink(missing_ok=True)
     options.update(voice=voice, made_with=made_with, rendered_at=lib.now_iso())
     entries = lib.load_yaml(path, {}) or {}
     current = dict(entries[term]) if isinstance(entries.get(term), dict) else {}
     current["options"] = options
+    if any(options["candidates"][n].get("say") == (current.get("say") or term) for n in fresh):
+        hold(current, term)
     entries[term] = current
     lib.save_yaml(path, entries)
     return options

@@ -1384,23 +1384,28 @@ function listeningAt(sd) {
   return started.length ? Math.max(...started) : 0;
 }
 
-function nameOptions(t, slug, busy) {
+function nameOptions(t, slug, busy, screens) {
   const o = t.options;
   const silent = o && o.candidates.every((c) => !c.media);
+  const unscreened = o && !silent && o.candidates.some((c) => !c.steady && c.say !== t.term);
   const get = busy ? `<span class="small muted nowrap">working…</span>`
-    : (silent ? `<button class="sm" data-act="name-options" data-term="${esc(t.term)}" data-again="1">Say them</button>` : "")
+    : (silent ? `<button class="sm" data-act="name-options" data-term="${esc(t.term)}" data-again="1">Say them</button>`
+      : !screens ? "" : `<button class="sm" data-act="name-options" data-term="${esc(t.term)}" data-again="1" title="Say every option again in eight lines with new seeds. The takes count with the earlier ones, so the count gets surer.">${unscreened ? "Screen them" : "Screen again"}</button>`)
       + `<button class="sm" data-act="name-options" data-term="${esc(t.term)}">${o ? "New options" : "Get options"}</button>`;
   if (!o) return `<div class="row tight"><span class="small muted grow">No options yet. A Claude pass proposes respellings, and the voice says each one in a line of the script.</span>${get}</div>`;
   const current = t.say || t.term;
   const rows = o.candidates.map((c) => {
     const isCurrent = c.say === current;
     const use = isCurrent ? `<span class="small muted nowrap">in use</span>`
-      : `<button class="sm" data-act="name-use" data-term="${esc(t.term)}" data-say="${esc(c.say)}">Use this</button>`;
+      : c.offered ? `<button class="sm" data-act="name-use" data-term="${esc(t.term)}" data-say="${esc(c.say)}">Use this</button>`
+        : `<span class="small muted nowrap">not steady</span>`;
+    const screened = !c.steady ? ""
+      : `<div class="tr">${c.steady[0]} of ${c.steady[1]} takes say it without an added sound${c.typical ? "" : ", and this clip is not one of them"}</div>`;
     return `<div class="cand${isCurrent ? " chosen" : ""}">
       ${c.media ? playBtn(c.media.url, `${t.term} as ${c.say}`) : `<span class="small muted">no clip</span>`}
       <div><div>${esc(c.say)}${c.say === t.term ? " · as written" : ""}</div>
         ${c.why && c.say !== t.term ? `<div class="tr">${esc(c.why)}</div>` : ""}
-        ${c.heard ? `<div class="tr">heard as: ${esc(c.heard)}</div>` : ""}</div>
+        ${c.heard ? `<div class="tr">heard as: ${esc(c.heard)}</div>` : ""}${screened}</div>
       <div class="btns">${use}</div></div>`;
   }).join("");
   return `<div class="small muted">${o.voice ? `Said by ${esc(o.voice)} in ` : "In "}chapter ${esc(o.line?.chapter)}: ${esc(o.line?.text)}</div>
@@ -1412,25 +1417,34 @@ function namesTab(nm, sd, slug) {
   const jobs = (S.state?.jobs || []).filter((j) => j.slug === slug && (j.status === "queued" || j.status === "running"));
   const working = new Set(jobs.filter((j) => j.kind === "say-options").map((j) => j.meta?.term));
   const saving = new Set(jobs.filter((j) => j.kind === "say-as").map((j) => j.meta?.term));
-  const shown = S.namesAll ? nm.terms : nm.terms.filter((t) => t.spellings >= NAMES_UNSTABLE || t.options || t.say);
+  const ways = (t) => (t.ways ? t.ways.count : t.spellings);
+  const shown = S.namesAll ? nm.terms : nm.terms.filter((t) => ways(t) >= NAMES_UNSTABLE || t.options || t.say);
   const cards = shown.map((t) => {
     const i = nm.terms.indexOf(t);
     const top = t.top.map(([s, n]) => `${esc(s)} <span class="muted">${n}</span>`).join(" · ");
+    const w = t.ways;
+    const sounds = w ? w.ways.map(([s, n]) => `<span class="mono">${esc(s)}</span> <span class="muted">${n}</span>`).join(" · ") : "";
+    const found = (t.findings || []).map((f) => `chapter ${f.chapter} (${f.takes} of ${f.of})`).join(", ");
+    const adds = t.held && t.adds && t.adds[1] ? t.adds : null;
+    const waiting = nm.chapters.with.length - (nm.chapters.judged || []).length;
     const said = saving.has(t.term) ? `<span class="small muted nowrap">saving…</span>`
       : (working.has(t.term) ? "" : `<button class="sm" data-act="name-hear" data-term="${esc(t.term)}" title="Add this spelling to the options and have the voice say it">Hear it</button>`)
         + `<button class="sm" data-act="name-say" data-term="${esc(t.term)}" title="Use this spelling from the next render on">Save</button>`
         + (t.say ? `<button class="sm danger" data-act="name-use" data-term="${esc(t.term)}" data-say="${esc(t.term)}">Read as written</button>` : "");
     return `<details class="char" data-key="name:${esc(t.term)}" data-name-row data-term="${esc(t.term)}">
       <summary><span class="name">${esc(t.term)}</span>
-        ${t.spellings ? `<span class="tag">${plural(t.spellings, "spelling")}</span>` : ""}
-        <span class="small muted hide-sm">${t.heard ? `heard ${t.heard} times, ${t.as_written} as sent` : "not heard yet"}</span>
+        ${w ? `<span class="tag">${plural(w.count, "way")}</span>` : t.spellings ? `<span class="tag">${plural(t.spellings, "spelling")}</span>` : ""}
+        <span class="small muted hide-sm">${adds ? `${adds[0]} of ${adds[1]} takes add a sound` : w ? `${w.usual} of ${w.said} takes sound alike to the check` : t.heard ? `heard ${t.heard} times, ${t.as_written} as sent` : "not heard yet"}</span>
         <span class="grow"></span>
         ${t.say ? `<span class="pill approved">${esc(t.say)}</span>` : t.options ? `<span class="pill auto">options</span>` : ""}
       </summary>
       <div class="body">
-        ${t.heard ? `<div class="small"><b>Heard as.</b> ${top}${t.spellings > t.top.length ? ` · and ${t.spellings - t.top.length} more` : ""}</div>` : ""}
+        ${found ? `<div class="notice warn small">So many takes add a sound to this spelling that a render did not take them again for it: ${esc(found)}. Screen the options, and pick a spelling that comes out clean.</div>` : ""}
+        ${w ? `<div class="small"><b>Said as.</b> ${sounds}${w.count > w.ways.length ? ` · and ${w.count - w.ways.length} more` : ""}</div>` : ""}
+        ${t.heard ? `<div class="small"><b>Written as.</b> ${top}${t.spellings > t.top.length ? ` · and ${t.spellings - t.top.length} more` : ""}</div>` : ""}
+        ${t.held ? `<div class="small muted">The take check holds every take of this name to its spelling. A take in which both recognizers hear a sound the spelling doesn't have, such as an added syllable, is taken again by a render.${adds ? ` ${adds[0]} of ${adds[1]} takes add one` : " No take has been judged by this rule yet"}${waiting > 0 ? `, and ${plural(waiting, "chapter")} ${waiting === 1 ? "is" : "are"} still to be judged by it.` : "."}</div>` : ""}
         ${t.respelling ? `<div class="small"><b>Bible.</b> <span class="mono">${esc(t.respelling)}</span></div>` : ""}
-        ${nameOptions(t, slug, working.has(t.term))}
+        ${nameOptions(t, slug, working.has(t.term), nm.screens)}
         <div class="row tight" style="margin-top:8px"><input id="name-say-${i}" data-name-say placeholder="or type a spelling to hear or save" value="${esc(t.say)}" maxlength="120" class="grow" style="min-width:160px">${said}</div>
       </div></details>`;
   }).join("");
@@ -1446,9 +1460,9 @@ function namesTab(nm, sd, slug) {
         <button class="sm primary" data-act="names-render" data-heard="${heard}" data-chapters="${esc(JSON.stringify(order))}">Render them when the queue is empty</button>` : ""}
       <button class="sm ghost" data-act="names-forget">Not now</button></div></div>` : "";
   const missing = nm.chapters.without.length;
-  return `${pass}<p class="small muted">How the take check heard each name, over ${plural(nm.chapters.with.length, "chapter")}. Many spellings can mean the voice says the name many ways, or only that the recognizer writes it many ways, so listen before you change one.${missing ? ` ${plural(missing, "chapter")} ${missing === 1 ? "has" : "have"} takes that an older check heard without names: ${esc(rangeText(nm.chapters.without))}.` : ""}</p>
+  return `${pass}<p class="small muted">How the takes said each name, over ${plural(nm.chapters.with.length, "chapter")}. The ways are sorted by sound, in phonetic letters, and a name whose takes have not been heard for sound yet shows how the recognizer wrote it. The sorting is a hint: in a listening check it agreed with the ear on about six clips in ten, so listen before you change a name. A name with a spelling of yours also shows how many takes add a sound to that spelling, and that count held up in a listening check: 23 of 25 such takes sounded wrong.${missing ? ` ${plural(missing, "chapter")} ${missing === 1 ? "has" : "have"} takes that an older check heard without names: ${esc(rangeText(nm.chapters.without))}.` : ""}</p>
     <div class="row" style="margin-bottom:12px"><span class="muted small grow">${shown.length} of ${plural(nm.terms.length, "name")}</span>
-      <div class="filters"><button class="${S.namesAll ? "" : "on"}" data-act="names-all" data-all="0">${NAMES_UNSTABLE} spellings or more</button><button class="${S.namesAll ? "on" : ""}" data-act="names-all" data-all="1">all</button></div></div>
+      <div class="filters"><button class="${S.namesAll ? "" : "on"}" data-act="names-all" data-all="0">${NAMES_UNSTABLE} ways or more</button><button class="${S.namesAll ? "on" : ""}" data-act="names-all" data-all="1">all</button></div></div>
     <div class="panel">${cards || `<div class="empty">No name has been heard yet. A render or a take check records them.</div>`}</div>`;
 }
 

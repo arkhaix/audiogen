@@ -46,6 +46,7 @@ Do P0 first and wait for AJ. Then P1, P2 and P3 can run side by side. P4 comes a
 * Replace D1's counts of spellings with what was said.
 * No accuracy figure exists for any of this on synthetic voices. AJ's own picks are the labelled cases. Louis as "Lewis" and Lauriane as "Laurie Anne" are the first two.
 * It is done when a take that says a picked name another way is retaken in a scratch render, and the takes that say it right are left alone.
+* Built on 2026-11-13 as a rule on added sounds, which hears part of this. `p4-name-check.md` has what it misses and the steps from here.
 
 ## P5: heteronyms
 

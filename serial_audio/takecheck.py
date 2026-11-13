@@ -8,8 +8,9 @@ An entry holds the take's key and audio hash, its evidence and what judge() deri
 is in versioned blocks. "asr" has the transcript and, from Parakeet, the raw tokens with their start times,
 durations and log-probabilities. "signal" has the numbers take_measure.measure reads from the audio. On a machine
 that has their models, "vad" has the speech Silero VAD finds, "speaker" TitaNet small's embedding of the voice, and
-"asr2" the transcript of a second recognizer, Moonshine base English. A rule in judge() fires only on a block of the
-current version, so a take that Qwen3-ASR heard is judged on its words.
+"asr2" the transcript of a second recognizer, Moonshine base English, and "phone" the IPA that ZIPA small decodes
+with no text to guide it. A rule in judge() fires only on a block of the current version, so a take that Qwen3-ASR
+heard is judged on its words.
 
 A take with three or more inserted or dropped words is flagged. A take with a high word error rate but fewer slips
 is suspect, which is usually a name the recognizer spelled its own way. A transcript with no Latin letters is
@@ -27,19 +28,20 @@ import time
 from pathlib import Path
 
 from . import library as lib
+from . import phones
 from .asr import check_ready, choose, extra_blocks, model_name, model_problems, records, words
-from .parakeet_asr import ASR2_V, SPEAKER_V, VAD_V
+from .parakeet_asr import ASR2_V, PHONE_V, SPEAKER_V, VAD_V
 from .breeze import LEVEL_OFFSETS, TAKES_FILE, VOCAL_EVENTS, direction_class, keeps_its_pauses, voice_text
 from .comfy import ComfyError
 
 CHECK_FILE = "take_check.json"
 ASR_V = 2
 # the version of judge()'s rules. take_check.json records it as "rules", and verdicts under an older one are stale.
-JUDGE_V = 4
+JUDGE_V = 7
 # take_measure.SIGNAL_V, which this module cannot import, because take_measure needs numpy
 SIGNAL_V = 1
 # the blocks a machine gathers only when it has their models, with their versions
-EXTRA_V = {"vad": VAD_V, "speaker": SPEAKER_V, "asr2": ASR2_V}
+EXTRA_V = {"vad": VAD_V, "speaker": SPEAKER_V, "asr2": ASR2_V, "phone": PHONE_V}
 BLOCKS = ("asr", "signal", *EXTRA_V)
 KEPT = ("key", "audio", *BLOCKS)
 MAX_SLIPS = 3
@@ -98,6 +100,14 @@ DRIFT_MADS = 10.0
 DRIFT_MAD_FLOOR = 0.01
 # how far below the median similarity, in MADs, a take is left out of its voice's centre
 DRIFT_TRIM_MADS = 4.0
+# whether a take that adds a sound to a name is flagged. Off, a take's sayings and misses are still recorded.
+NAME_FLAGS = True
+# how far a name's window may be from a way of saying the name and still be that way, by phones.apart
+NAME_APART = 0.45
+# the seconds of a take on either side of a name's span that the name's window takes in
+NAME_PAD = 0.3
+# the seconds on either side of a name's span whose phones the name rule reads
+NAME_NEAR = 0.12
 
 
 def align(ref: list[str], hyp: list[str]) -> list[tuple[str, int | None, int | None]]:
@@ -368,6 +378,80 @@ def word_times(asr: dict) -> list[tuple[str, float, float]] | None:
     return out if [w for w, _, _ in out] == words(asr.get("heard") or "") else None
 
 
+def name_spans(asr: dict, phone, tokens: list[dict], edits: list[tuple]) -> list[dict]:
+    """Each name of a line as a take said it.
+
+    asr: the take's asr block, of ASR_V.
+    phone: the take's phone block, or None.
+    tokens: the line's token map.
+    edits: the line's words against the heard words, from word_edits.
+    Returns {"term", "inside", "window", "near", "said", "heard", "before", "after"} for each name of the line, in
+    order, whose place the recognizer's times give. inside, window and near are phones: those that start inside
+    the span of the words heard in the name's place, those from NAME_PAD before that span to NAME_PAD after it,
+    and those from NAME_NEAR before it to NAME_NEAR after it. said is the name's words as the voice was sent
+    them, heard the words heard in their place, and before and after the line's words on either side of the name,
+    "" at an end of the line. A name that no heard word stands for is left out. [] without a phone block of
+    PHONE_V or without token times.
+    """
+    symbols, starts = (phone.get(f) for f in ("phones", "starts")) if current(phone, PHONE_V) else (None, None)
+    timed = word_times(asr)
+    if (not timed or not isinstance(symbols, str) or not isinstance(starts, list) or len(symbols) != len(starts)
+            or not all(finite(s) for s in starts)):
+        return []
+    at: dict[int, list[int]] = {}
+    for step, e in enumerate(edits):
+        if e[1] is not None:
+            at.setdefault(e[1], []).append(step)
+    out, i = [], 0
+    while i < len(tokens):
+        term = tokens[i]["name"]
+        end = i + 1
+        while term and end < len(tokens) and tokens[end]["name"] == term:
+            end += 1
+        if term and i in at and end - 1 in at:
+            first, last = min(at[i]), max(at[end - 1])
+            while first and edits[first - 1][0] == "name" and edits[first - 1][1] is None:
+                first -= 1
+            while last + 1 < len(edits) and edits[last + 1][0] == "name" and edits[last + 1][1] is None:
+                last += 1
+            heard_at = sorted({edits[s][2] for s in range(first, last + 1) if edits[s][2] is not None})
+            if heard_at and heard_at[-1] < len(timed):
+                t0, t1 = timed[heard_at[0]][1], timed[heard_at[-1]][2]
+                inside, window, near = ("".join(p for p, s in zip(symbols, starts) if t0 - pad <= s < t1 + pad)
+                                        for pad in (0.0, NAME_PAD, NAME_NEAR))
+                if window:
+                    out.append({"term": term, "inside": inside, "window": window, "near": near,
+                                "said": " ".join(t["w"] for t in tokens[i:end]),
+                                "heard": " ".join(timed[j][0] for j in heard_at),
+                                "before": tokens[i - 1]["w"] if i else "",
+                                "after": tokens[end]["w"] if end < len(tokens) else ""})
+        i = end
+    return out
+
+
+def picked_spellings(bible: dict) -> dict[str, str]:
+    """{term: spelling} for the names the take check holds to a spelling: those that have a say-as.
+
+    bible: the serial's bible.
+    """
+    return {str(term): str(entry["say"]) for term, entry in (bible.get("pronunciations") or {}).items()
+            if isinstance(entry, dict) and entry.get("say")}
+
+
+def stale(data, bible: dict | None = None) -> bool:
+    """Whether the verdicts of a take_check.json need judging again from their evidence.
+
+    data: the file's content.
+    bible: the serial's bible, or None to compare the rules alone.
+    Returns True when the file's rules are not JUDGE_V, or when the picked spellings it was judged with, under
+    "names", are not the ones the bible has now.
+    """
+    if not isinstance(data, dict) or data.get("rules") != JUDGE_V:
+        return True
+    held = data.get("names") if isinstance(data.get("names"), dict) else {}
+    return bible is not None and held != picked_spellings(bible)
+
+
 def pause_cuts(asr: dict, signal: dict, edits: list[tuple], tokens: list[dict]) -> list[list[float]]:
     """The cuts that shorten each long pause that no punctuation explains.
 
@@ -444,7 +528,8 @@ def signal_reasons(signal: dict, words_said: int, baseline: dict | None, offset:
 
 def judge(asr: dict | None, signal: dict | None, tokens: list[dict], baseline: dict | None = None, *,
           cut_pauses: bool = True, offset: float = 0.0, vad: dict | None = None, speaker: dict | None = None,
-          asr2: dict | None = None, sounds: bool = False, plain: bool = False) -> dict:
+          asr2: dict | None = None, sounds: bool = False, plain: bool = False, phone: dict | None = None,
+          said: dict | None = None) -> dict:
     """The verdict for one take, from its evidence.
 
     asr: the take's asr block, or None. It is read only when it is of ASR_V.
@@ -456,14 +541,18 @@ def judge(asr: dict | None, signal: dict | None, tokens: list[dict], baseline: d
     vad, speaker, asr2: the take's other blocks, or None. Each is read only when it is of its version in EXTRA_V.
     sounds: whether the line asks for a sound after its words, from asks_for_sound.
     plain: whether a take of the line can show its voice's timbre, from shows_timbre.
+    phone: the take's phone block, or None. It is read only when it is of PHONE_V.
+    said: {term: spelling} for the names that are held to a spelling, from picked_spellings, or None.
     Returns {"words", "sub", "del", "ins", "wer", "names", "verdict", "reasons", "repairs"} with a verdict from
     VERDICTS. reasons names each rule that calls for a retake, and the verdict is flagged when it holds any.
     repairs holds the fixes the join applies, as {"cuts": [[start, end], ...]} in seconds of the take's file. The
     result also has "errors2" and "wer2", the second recognizer's word errors, when asr2 is current, "tail", the
     seconds of sound after the line's last word, when the blocks place it, and "similarity", the take's voice
-    against its voice's centre, when the speaker block and the baseline have both. A take without an asr block of
-    ASR_V is unreadable, with no word counted wrong, because no rule fires without its evidence. Uses the standard
-    library only, and never raises on a block that lacks a field.
+    against its voice's centre, when the speaker block and the baseline have both. With a current phone block it
+    has "said", {term: [[inside, window], ...]} from name_spans, and "missed", the terms of said that this take
+    says with an added sound, by phones.adds. A missed term is also the reason "name" while NAME_FLAGS is on. A take
+    without an asr block of ASR_V is unreadable, with no word counted wrong, because no rule fires without its
+    evidence. Uses the standard library only, and never raises on a block that lacks a field.
     """
     expected = [t["w"] for t in tokens]
     if not current(asr, ASR_V) or not isinstance(asr.get("heard"), str):
@@ -524,6 +613,18 @@ def judge(asr: dict | None, signal: dict | None, tokens: list[dict], baseline: d
                 and isinstance(baseline.get("m"), int) and baseline["m"] >= DRIFT_MIN
                 and extra["similarity"] < middle[0] - DRIFT_MADS * max(middle[1], DRIFT_MAD_FLOOR)):
             reasons.append("drift")
+
+    # Names
+    if current(phone, PHONE_V):
+        spans = name_spans(asr, phone, tokens, edits)
+        extra["said"] = {}
+        for span in spans:
+            extra["said"].setdefault(span["term"], []).append([span["inside"], span["window"]])
+        held = said if isinstance(said, dict) else {}
+        extra["missed"] = sorted({s["term"] for s in spans if s["term"] in held
+                                  and phones.adds(s["said"], s["heard"], s["near"], s["after"], s["before"])})
+        if extra["missed"] and NAME_FLAGS:
+            reasons.append("name")
 
     # Verdict
     suspect = wer > SUSPECT_WER and (len(expected) >= 2 or not heard)
@@ -628,12 +729,14 @@ def badness(result: dict) -> tuple:
     result: a take_check.json entry.
     Each slot is smaller for a better take, and None when the entry doesn't have evidence for it. An earlier slot
     outranks a later one. word errors counts the second recognizer's beside Parakeet's when the entry has them.
-    Compare two ranks with better(), which skips the slots either lacks.
+    name score counts the names the take says with an added sound, while NAME_FLAGS is on. Compare two ranks
+    with better(), which skips the slots either lacks.
     """
     reasons = result.get("reasons") if isinstance(result.get("reasons"), list) else []
     signal = sum(r in SIGNAL_REASONS for r in reasons) if current(result.get("signal"), SIGNAL_V) else None
     second = result.get("errors2") if isinstance(result.get("errors2"), int) else 0
-    return VERDICTS.index(result["verdict"]), result["sub"] + result["del"] + result["ins"] + second, None, signal, None
+    names = len(result["missed"]) if NAME_FLAGS and isinstance(result.get("missed"), list) else None
+    return VERDICTS.index(result["verdict"]), result["sub"] + result["del"] + result["ins"] + second, names, signal, None
 
 
 def better(new: dict, old: dict) -> bool:
@@ -803,7 +906,8 @@ def judged(entry: dict, line: dict, bible: dict, baseline: dict | None) -> dict:
     return {**kept, **judge(asr, signal, voice_text(line, bible)[1], baseline, cut_pauses=not keeps_its_pauses(line),
                             offset=LEVEL_OFFSETS[direction_class(line.get("direction"))], vad=entry.get("vad"),
                             speaker=entry.get("speaker"), asr2=entry.get("asr2"), sounds=asks_for_sound(line),
-                            plain=shows_timbre(line, signal))}
+                            plain=shows_timbre(line, signal), phone=entry.get("phone"),
+                            said=picked_spellings(bible))}
 
 
 def rejudged(entries: dict, takes: dict, lines: list[dict], bible: dict) -> dict:
@@ -840,8 +944,7 @@ def join_cuts(folder: Path, takes: dict, lines: list[dict], bible: dict, *, stor
     takes: {line: breeze_takes.json entry}.
     lines: the script lines.
     bible: the serial's bible.
-    stored: take the cuts as take_check.json holds them when its rules are JUDGE_V, and judge the evidence again only
-        when they are older.
+    stored: take the cuts as take_check.json holds them unless stale() calls for judging the evidence again.
     Returns {line: [[start, end], ...]} in seconds of each take's file, for the takes that have a cut. The cuts come
     from the evidence saved for a take's current audio, judged by the rules as they are now, and a take without both
     blocks in the current versions doesn't get any. Never raises.
@@ -849,7 +952,7 @@ def join_cuts(folder: Path, takes: dict, lines: list[dict], bible: dict, *, stor
     try:
         entries = saved_entries(folder, takes)
         path = folder / CHECK_FILE
-        if not stored or not path.is_file() or lib.load_json(path).get("rules") != JUDGE_V:
+        if not stored or not path.is_file() or stale(lib.load_json(path), bible):
             entries = rejudged(entries, takes, lines, bible)
         return {k: e["repairs"]["cuts"] for k, e in entries.items()
                 if current(e.get("asr"), ASR_V) and current(e.get("signal"), SIGNAL_V)
@@ -927,6 +1030,8 @@ def save_entries(folder: Path, entries: dict, engine: str, takes: dict | None = 
     engine: the recognizer that heard them.
     takes, lines, bible: all of the chapter's takes by line, the script lines and the bible. With them the file also
         gets each voice's baseline, under "voices".
+    The file keeps the rules and the picked spellings its other entries were judged with, so a file that mixes old
+    verdicts with these stays one that stale() sends to judging again.
     """
     path = folder / CHECK_FILE
     old = lib.load_json(path) if path.is_file() else {}
@@ -934,6 +1039,9 @@ def save_entries(folder: Path, entries: dict, engine: str, takes: dict | None = 
     data = {"at": lib.now_iso(), "model": model_name(engine), "asr": engine}
     if old.get("rules") == JUDGE_V or not old.get("takes"):
         data["rules"] = JUDGE_V
+    before = old.get("names") if isinstance(old.get("names"), dict) else {}
+    held = picked_spellings(bible) if bible is not None else before
+    data["names"] = held if not old.get("takes") or before == held else before
     if takes is not None and lines is not None and bible is not None:
         fresh = {k: e for k, e in merged.items() if isinstance(takes.get(k), dict)
                  and e.get("key") == takes[k].get("key") and e.get("audio") == takes[k].get("audio")}
@@ -965,6 +1073,28 @@ def voice_findings(entries: dict, takes: dict) -> list[dict]:
     return [{"voice": voice, "reason": reason, "lines": sorted(found), "of": counted[voice]}
             for (voice, reason), found in sorted(hits.items())
             if len(found) >= BREAKER_MIN and len(found) > BREAKER_SHARE * counted[voice]]
+
+
+def name_findings(entries: dict) -> list[dict]:
+    """The names that so many takes say with an added sound that the cause is the spelling and not a take.
+
+    entries: {line: entry} of the chapter's judged takes.
+    Returns [{"term", "lines", "of"}, ...] for each term that BREAKER_MIN flagged takes or more miss, and over
+    BREAKER_SHARE of the takes that say it. lines are those flagged lines and of counts the takes that say the term.
+    """
+    said: dict[str, int] = {}
+    hits: dict[str, list[int]] = {}
+    for k, entry in entries.items():
+        if entry.get("verdict") not in VERDICTS or not isinstance(entry.get("said"), dict):
+            continue
+        for term in entry["said"]:
+            said[term] = said.get(term, 0) + 1
+        if entry["verdict"] == "flagged" and "name" in (entry.get("reasons") or []):
+            for term in entry.get("missed") or []:
+                hits.setdefault(term, []).append(int(k))
+    return [{"term": term, "lines": sorted(found), "of": said.get(term, len(found))}
+            for term, found in sorted(hits.items())
+            if len(found) >= BREAKER_MIN and len(found) > BREAKER_SHARE * said.get(term, len(found))]
 
 
 def summarize(results: dict, takes: dict | None = None) -> dict:
@@ -1068,7 +1198,8 @@ def check_takes(slug: str, number: int, *, comfy_url: str = "http://127.0.0.1:81
     # Record
     summary = summarize(results, takes)
     write_check(lib.chapter_dir(slug, number) / CHECK_FILE,
-                {"at": summary["at"], "model": model_name(engine), "asr": engine, "rules": JUDGE_V, "voices": voices,
+                {"at": summary["at"], "model": model_name(engine), "asr": engine, "rules": JUDGE_V,
+                 "names": picked_spellings(bible), "voices": voices,
                  "takes": results})
     meta, _ = lib.load_chapter(slug, number)
     meta["render"]["check"] = summary

@@ -3,13 +3,13 @@
     python -I parakeet_asr.py < job.json
 
 The job on stdin is {"model": <folder>, "files": [<path>, ...], "threads": <n>, "blocks": [<block>, ...], "vad":
-<folder>, "speaker": <folder>, "asr2": <folder>}. blocks names the evidence to gather for every file, from BLOCKS.
+<folder>, "speaker": <folder>, "asr2": <folder>, "phone": <folder>}. blocks names the evidence to gather for every file, from BLOCKS.
 Without it the child gathers ["asr", "signal"], and with an empty list it gathers nothing. A job with "check": true
 hears no file: it loads the models of the blocks other than asr and signal and gives one line, {"loaded": [<block>,
 ...], "errors": {<block>: "..."}}. The Parakeet folder holds
 the int8 export from the k2-fsa asr-models release: encoder.int8.onnx, decoder.int8.onnx, joiner.int8.onnx and
-tokens.txt. vad, speaker and asr2 name the folders that
-hold VAD_FILES, SPEAKER_FILES and ASR2_FILES. A block whose folder the job doesn't name, or whose model doesn't
+tokens.txt. vad, speaker, asr2 and phone name the folders that
+hold VAD_FILES, SPEAKER_FILES, ASR2_FILES and PHONE_FILES. A block whose folder the job doesn't name, or whose model doesn't
 load, is left out.
 
 Each file gives one JSON line on stdout, in order: {"index": i, ...} with "text", "tokens", "starts", "durations" and
@@ -18,7 +18,8 @@ are the recognizer's raw tokens, and starts and durations are in seconds. signal
 at its own sample rate. vad is {"v", "engine", "segments": [[start, end], ...]}, the speech Silero VAD v5 finds, in
 seconds. speaker is {"v", "engine", "scale", "q"}: TitaNet small's embedding of the file at length 1, as int8 values
 in base64 that scale turns back into the embedding. asr2 is {"v", "engine", "heard", "tokens"}, the transcript of
-Moonshine base English. A block that fails for a file is {"v": n, "error": "..."}. A last line {"done": n, "seconds":
+Moonshine base English. phone is {"v", "engine", "phones", "starts"}: the IPA that ZIPA small decodes with no text
+to guide it, one character per symbol, and the second each symbol starts at. A block that fails for a file is {"v": n, "error": "..."}. A last line {"done": n, "seconds":
 s} follows. Runs under the audio Python (machine.AUDIO_PYTHON) with sherpa-onnx, numpy, scipy and soundfile. The top
 level imports the standard library only, and main imports take_measure from this folder.
 """
@@ -40,8 +41,12 @@ PHONE_FILES = ("model.int8.onnx", "tokens.txt")
 VAD_V = 1
 SPEAKER_V = 1
 ASR2_V = 1
-ENGINES = {"vad": "silero-vad-v5", "speaker": "titanet-small", "asr2": "moonshine-base-en"}
-BLOCKS = ("asr", "signal", "vad", "speaker", "asr2")
+PHONE_V = 1
+ENGINES = {"vad": "silero-vad-v5", "speaker": "titanet-small", "asr2": "moonshine-base-en",
+           "phone": "zipa-small-crctc-300k"}
+BLOCKS = ("asr", "signal", "vad", "speaker", "asr2", "phone")
+# sherpa-onnx times a Zipformer CTC token at 40 ms a frame, and ZIPA gives a frame every 20 ms
+PHONE_TIME_SCALE = 0.5
 VAD_THRESHOLD = 0.5
 VAD_MIN_SILENCE = 0.1
 VAD_MIN_SPEECH = 0.05
@@ -161,11 +166,15 @@ def models(job: dict, blocks: set[str], threads: int, errors: dict | None = None
             encoder=str(folder / ASR2_FILES[0]), decoder=str(folder / ASR2_FILES[1]),
             tokens=str(folder / ASR2_FILES[2]), num_threads=threads)
 
+    def zipa(folder: Path):
+        return sherpa_onnx.OfflineRecognizer.from_zipformer_ctc(
+            model=str(folder / PHONE_FILES[0]), tokens=str(folder / PHONE_FILES[1]), num_threads=threads)
+
     out = {}
     if "asr" in blocks:
         out["asr"] = recognizer(Path(job["model"]), threads)
     for block, files, load_model in (("vad", VAD_FILES, vad), ("speaker", SPEAKER_FILES, speaker),
-                                     ("asr2", ASR2_FILES, moonshine)):
+                                     ("asr2", ASR2_FILES, moonshine), ("phone", PHONE_FILES, zipa)):
         if block not in blocks or not job.get(block):
             continue
         folder = Path(job[block])
@@ -179,6 +188,16 @@ def models(job: dict, blocks: set[str], threads: int, errors: dict | None = None
             if errors is not None:
                 errors[block] = f"{type(e).__name__}: {e}"
     return out
+
+
+def phones(result) -> dict:
+    """{"phones", "starts"} of a ZIPA result: its symbols as one string, and the second each one starts at.
+
+    A token that is not one visible character is left out, with its time.
+    """
+    kept = [(str(token), float(at) * PHONE_TIME_SCALE) for token, at in zip(result.tokens, result.timestamps)
+            if len(str(token)) == 1 and not str(token).isspace()]
+    return {"phones": "".join(token for token, _ in kept), "starts": [round(at, 2) for _, at in kept]}
 
 
 def gather(found: dict, blocks: set[str], x, sr: int, tm) -> dict:
@@ -200,7 +219,7 @@ def gather(found: dict, blocks: set[str], x, sr: int, tm) -> dict:
             record["signal"] = tm.measure(x, sr)
         except Exception as e:
             record["signal"] = failed(tm.SIGNAL_V, e)
-    if found.keys() & {"asr", "vad", "speaker", "asr2"}:
+    if found.keys() & {"asr", "vad", "speaker", "asr2", "phone"}:
         x16 = at_rate(x, sr)
     if "asr" in found:
         stream = found["asr"].create_stream()
@@ -230,6 +249,14 @@ def gather(found: dict, blocks: set[str], x, sr: int, tm) -> dict:
                               "tokens": [str(t) for t in stream.result.tokens]}
         except Exception as e:
             record["asr2"] = failed(ASR2_V, e)
+    if "phone" in found:
+        try:
+            stream = found["phone"].create_stream()
+            stream.accept_waveform(RATE, x16)
+            found["phone"].decode_stream(stream)
+            record["phone"] = {"v": PHONE_V, "engine": ENGINES["phone"], **phones(stream.result)}
+        except Exception as e:
+            record["phone"] = failed(PHONE_V, e)
     return record
 
 

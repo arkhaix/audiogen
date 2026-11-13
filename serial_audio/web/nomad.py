@@ -67,7 +67,8 @@ CHECK_PER_TAKE = 0.5
 MOVE_PER_TAKE = 0.05
 # a cast candidate is about nine seconds of audio, two takes' worth
 CAST_TAKES = 2
-OPTION_TAKES = 7
+# about seven options, each said in pronounce.SCREEN_TAKES lines
+OPTION_TAKES = 56
 DEFAULT_LINES = 200
 WAIT_MARGIN = 120.0
 LLM_SLOTS = 3

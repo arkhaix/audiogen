@@ -45,7 +45,7 @@ python -m serial_audio.cli render <slug> <chapters> [--seed N] [--engine drama3|
 python -m serial_audio.cli check-takes <slug> <chapters> [--asr qwen3|parakeet] [--redo]   # flag Breeze takes that do not say their line
 python -m serial_audio.cli measure-takes <slug> <chapters> [--stored] [--json]   # each voice's take measures and what the check flags, read-only
 python -m serial_audio.cli backlog <slug> [chapters] [--all] [--json]   # the chapters a render would change, read-only
-python -m serial_audio.cli say-options <slug> <term> [--dry-run | --render-only | --add <spelling>]   # respellings of a term, each said in a line of the script. It doesn't file any
+python -m serial_audio.cli say-options <slug> <term> [--dry-run | --render-only | --add <spelling>]   # respellings of a term, each said in a line of the script and screened in seven more. It doesn't file any
 ```
 
 ## Web app
@@ -126,12 +126,26 @@ The bible page lists the pronunciations with their say-as overrides first. Edit,
 quick `say-as` job, and the table refreshes when it finishes. `say-as <slug> <term> <spoken>` does the same from the
 command line, and `--clear` removes an override. A term added only for an override has no respelling, and clearing
 its override removes the entry.
-The Names tab lists the names of the bible by how many ways the take check's recognizer spelled them, the most
-first, with the spellings and their counts. The recognizer can be what varies, so the list is a hint. Get options
+The Names tab lists the names of the bible by how many ways the takes said them, the most takes off the usual way
+first. The ways are sorted by sound, from the phones the take check decodes, and shown in phonetic letters with their
+counts. That sorting is a hint. A name that has a say-as comes before the others when takes add a sound to its
+spelling, and shows how many do, over the chapters whose check was judged by the rules as they are now. A name whose takes have not been heard for sound yet is listed by how the recognizer spelled it. Get options
 queues a `say-options` job for a name: a Claude pass proposes four to six respellings, and the voice that says one
 of the script's lines with the name says that line once for the name as written and once for each respelling, from
 the seed the chapter's render uses for the line. Each option has a play button, how the recognizer wrote the name in
-it, and Use this, which queues the `say-as` job for it. The job never files an option itself. Say them makes the
+it, and Use this, which queues the `say-as` job for it. On a node with the phone model the job also screens each
+option (`pronounce.SCREENS`): it says the option in seven other lines that have the name, each in its own speaker's
+voice, and counts how many of the eight takes say the name without an added sound, by the take check's `name` rule
+against the option's own spelling. A take in which the name can't be placed counts as one that doesn't. Each option
+has a play button, how the recognizer wrote the name in it, its count, and Use this, which queues the `say-as` job
+for it. An option is shown without Use this when under 85% of its takes are clean, which is fewer than seven of
+eight, or when the clip itself is not one of those takes. The name as written shows no count and keeps Use this,
+because the rule doesn't judge a name as written. The job never files an option itself. Screen them, or
+Screen again, says every option again in its line and in the seven others with new seeds, and counts the new takes
+with the earlier ones. A count from a screen before 2026-11-13 is not shown, and its option is screened again. Eight
+takes are a coarse measure: a spelling that six takes in ten say clean passes a screen of eight about one time in
+ten, and one that nine in ten say clean passes about four times in five, so screen again before you drop a spelling
+you like. The screen doesn't hear a vowel that only sounds different, so listen to the clip too. Say them makes the
 takes again for options that don't have any. The tab also has a box for a spelling of your own. Hear it adds the
 spelling to the options and has the voice say it, without a Claude pass, and Save files it as the say-as. New options
 replaces the options, the typed ones too. After a change it
@@ -215,9 +229,10 @@ checks it again.
    log-probabilities, and `signal` has what `take_measure.py` reads from the audio at its own sample rate (length,
    K-weighted level, peak, the longest run of full-scale samples, the span of speech, the silent runs inside it, how
    far the last second falls below the rest, and the spread and the largest step of loudness between windows of one
-   second). On a machine that has their models, three more blocks join them: `vad` has the speech that Silero VAD v5
-   finds, `speaker` has TitaNet small's embedding of the voice, packed as int8 values in base64, and `asr2` has the
-   transcript of a second recognizer from another family, Moonshine base English. A saved take that lacks only these
+   second). On a machine that has their models, four more blocks join them: `vad` has the speech that Silero VAD v5
+   finds, `speaker` has TitaNet small's embedding of the voice, packed as int8 values in base64, `asr2` has the
+   transcript of a second recognizer from another family, Moonshine base English, and `phone` has the phones that
+   ZIPA small decodes with no text to guide it, as one string with the second each phone starts at. A saved take that lacks only these
    is heard for them alone, and its transcript and signal stay. `takecheck.judge()`
    derives the rest from the blocks: the word counts, the verdict, the reasons for a retake and the repairs for the
    join. The words of the line come from `breeze.voice_text()`, which builds the text the voice is sent and a token
@@ -238,6 +253,7 @@ checks it again.
    * `tail`: Parakeet or the second recognizer heard a word after the line's last word, and the take's sound goes on more than 0.5 s past that word, in a line of four words or more that doesn't ask for a sound after its words, such as "(laugh)" or a direction that names a sound like laughing, a cough, a sigh, weeping or purring (`takecheck.TAIL_SOUNDS`).
    * `drift`: the voice's embedding lies more than 10 median absolute deviations, and at least 0.1, below the median similarity of the voice's takes in the chapter to their centre. Only a take with 3 s of speech or more, of a line without a direction or a vocal event, is judged on this, and only a voice with 8 such takes in the chapter has a centre.
    * `garbled`: a take of a line of four words or more that would be suspect, and that the second recognizer hears wrong too, by the same word rules.
+   * `name`: the take adds a sound to a name that has a say-as. Both recognizers have to hear it: Parakeet's spelling of the name and ZIPA's phones in the name's place each have a syllable or a consonant that the say-as spelling doesn't have, the same one. `phones.adds` compares them as skeletons, the consonants in order with one mark for each run of vowels, so a vowel that only sounds different is not heard, and neither is a sound the take leaves out. A name without a say-as is not judged. `takecheck.NAME_FLAGS` switches the flag off and keeps the record.
 
    A take with a high word error rate and no reason is suspect. `repairs.cuts` lists each pause of 0.6 s or more
    between two words of the line that have no punctuation between them, cut down to 0.25 s. When the take's sound goes on more than 0.5 s past the line's last word, Parakeet
@@ -246,7 +262,12 @@ checks it again.
    inside that run to the end of the file, which ends the take with a fade out. A line with a vocal event
    or a direction about pace keeps its pauses. The file also holds each voice's baseline for the chapter, the median
    and spread of its level and of its seconds of speech per word, the centre of its embeddings with the median and
-   spread of their similarity to it, and the version of the rules. A render judges the
+   spread of their similarity to it, and the version of the rules. Each entry of a take with a phone block
+   records under `said` the phones of every name in it, and under `missed` the names the `name` rule found. When
+   `name` flags four takes or more and over a quarter of the takes that say a name in a chapter, the cause is the
+   spelling: the render records a name finding, takes none of them again for the name, and the Names tab shows it. A
+   take that another reason flags as well is still taken again. The file records the picked spellings it was judged
+   with, under `names`, and it is judged again when a name gets, changes or loses its say-as. A render judges the
    saved evidence again when the rules are newer than the file's. `render.check` in `chapter.yaml` has the summary.
    After the join, `render` runs the check over the whole chapter and reuses the evidence gathered before the join.
    When the recognizer can't run, the check is skipped and recorded as such. `check-takes <slug> <chapters>` runs it

@@ -9,6 +9,7 @@ The research behind the plan is in `reports/TTS take quality checks.md`, with th
 * `README.md`: how to use this folder, what AJ decided, the shared contract, and where things stand.
 * `phase-1.md`: use what the pipeline already has. No new model.
 * `phase-2.md`: three small CPU models and a second recognizer. It changes hosts.
+* `p4-name-check.md`: an addendum to P4 of phase 2. What the name check hears and misses, and the steps to refine it.
 * `phase-3.md`: rank takes on delivery. Emphasis, direction and pitch.
 
 ## How to use this folder
@@ -81,10 +82,21 @@ These ten points hold for all three phases.
 ## Lessons from phase 2
 
 * On the laptop, Python's `write_text` writes CRLF, so an edit script that reads a file with `read_text` and writes it back turns an LF file into CRLF. git normalizes the endings and the deploy sends LF, but a diff against a deployed copy then shows every line. Read and write bytes, and keep the file's own endings.
-* aj-legion5 hard-reset three times on 2026-11-12, at 08:19, 19:03 and 19:41 (Kernel-Power 41, with no bug check). The last two came while a scratch gathering ran on its CPU beside the app's backlog checks, and the first came before that work. Run long CPU work on jsc-m1, which gathered 22 chapters' blocks in 21 minutes.
+* aj-legion5 hard-reset three times on 2026-11-12, at 08:19, 19:03 and 19:41 (Kernel-Power 41, with no bug check). The last two came while a scratch gathering ran on its CPU beside the app's backlog checks, and the first came before that work. jsc-m1 is there for long CPU work when the laptop is busy: it gathered 22 chapters' blocks in 21 minutes.
 * A word that a recognizer hears after a line's last word is often its own way of hearing that word, such as "keep, Anna" as "keep on, huh?". Count it only when the take's sound goes on past the word.
 * On a line of one to three words, two recognizers of different families hear the same homophone ("Simon guessed" as "Simon guest" nine times), so a second opinion doesn't settle a short line.
 * A direction changes a voice's timbre on purpose ("echoing through the hall", "deep, armored voice"), so judge drift only on lines without one.
+* Eight takes say little about a spelling that most takes get right. Three screens of the same six options, with different lines, gave AJ's pick "Eh-ole" 5, 5 and 8 of 8, and the library's 328 takes say it one way 84% of the time. Count what a small sample can tell before a rule hangs on it, and let a second sample add to the first.
+* A cloned voice says a spelling its own way. Vouivre's own voice said "Vwee-vruh" as "wih-ver" where the narrator says "vwee-vroo", so measure a name in the voices that say it.
+* A reference cut from a few takes of one line carries the line's neighbours. Take it from lines whose words beside the name differ, and keep an end phone only when half of the takes have it.
+* A new input to judging needs the same care as a new rule. The name's reference came after a chapter's check, and nothing judged the saved takes again until the check file recorded the references it was judged with. Both reviews caught it.
+* Have AJ listen before a rule that judges how something sounds goes live. P4's name rule passed every test and a scratch render, and his marks on 40 clips then agreed with it on 23. The page took him a few minutes. Build the page before the rule, from the first measurements, and hide what the measure says of each clip.
+* A measure that lets a reference match any part of a window can't hear what was added. Five of the seven takes it passed and AJ rejected say "ay-oh-lee" or "ay-oh-lay" for "Eh-ole".
+* Two recognizers of different kinds that have to agree on the same added sound made a flag worth acting on. One recognizer's phones gave 10 false flags in 17, and the two together gave 2 in 25.
+* Compare what the ear compares. AJ accepts a vowel that sounds different and rejects an added syllable or consonant, and the first measure weighed those the other way round. Read the marks for the kind of difference he rejects before choosing a distance.
+* Draw a listening page at random within what a rule flags and within what it passes, and keep the count each sample was drawn from. The marks then give how often a flag is right and how often a pass is wrong. The first page was picked near the limit and could give neither.
+* Parakeet's word times run about 0.2 s late in running speech against ZIPA's phones, so a word's span holds the next word's first sounds. A sound after a name is the name's only with a second sign.
+* Judging 9,971 saved takes again took 69 s on the laptop, about 7 ms a take. A page of the app can't do that on a request, so it reads what a check or a render has written.
 * A model whose files are all there can still fail to load. Try the load once in a process before a block counts, or a node hears its takes again on every render.
 
 ## Labelled takes
@@ -97,7 +109,7 @@ The laptop has a scratch copy of The Hundred Reigns with the evidence of all 9,3
 
 ## Where things stand
 
-As of 2026-11-12:
+As of 2026-11-13:
 
 * Done and deployed: a render retakes a saved take when a check flagged it (`DECISIONS.md`, "A render takes a saved take again when a check flagged it"). The Hundred Reigns had no flagged take in 9,383 afterwards.
 * Phase 1, S1: done and deployed on 2026-11-12 (`DECISIONS.md`, "A render keeps the chapter's seed").
@@ -114,5 +126,10 @@ As of 2026-11-12:
 * AJ started the backlog renders himself on 2026-11-12 from the Names tab. After his picks for Eole and Vouivre he queued a backlog render of the 31 chapters that say either name, and each render also gives the chapter the new join. Chapters 11, 25, 30, 35 and 47 say neither name and still have the old join, so they still need a backlog render. Phase 1 also waits for what AJ says is wrong with the tab. Chapters 1 to 6 are Drama 3 renders, and chapters 7 to 10, 15 and 18 have takes of voices that were cast again since, so a backlog render of those makes many takes, and they stay out of a pass until he decides.
 * Phase 2, P0: the spike is done, and the list of models went to AJ on 2026-11-12 (`docs/machines.md`, "The take check's other models", and `DECISIONS.md`, "The take check's other models are Silero VAD v5, TitaNet small, Moonshine base and ZIPA small"). AJ approved it that evening, and the four folders are on both nodes, checked by hash. Each node's take check loads all three blocks.
 * Phase 2, P1, P2 and P3: done and deployed on 2026-11-12, first at 22:04 with version 3 of the rules and then with version 4 (`DECISIONS.md`, "The take check flags a tail, a drifting voice and a take both recognizers hear wrong, and cuts a tail"). Their numbers come from a scratch copy whose takes have all five blocks, in `D:\fish.wt\scratch\p2` on the laptop for chapters 7 to 26 and in `/Users/aj/serial-audio/scratch/p2` on the Mac for 27 to 48. A scratch render of chapters 44, 42 and 33 on the Mac took every flagged line again, kept a new take for each, and cut two tails. With the models on both nodes, the first render or check of each chapter hears its saved takes for the three new blocks. On 2026-11-12 a take check of chapters 40 to 51 on the cluster, the chapters ahead of AJ, gathered the blocks in about a minute a chapter. It flagged `drift` in chapter 44 line 45, chapter 50 line 163 and chapter 51 line 77, and `garbled` in chapter 49 line 129, and it left tail cuts to make in chapters 40, 41, 42 and 46.
-* Phase 2, P4 and P5: not started. P4 needs the models on both nodes and AJ's picks on the Names tab, of which he made two on 2026-11-12.
+* Phase 2, P4: done and deployed on 2026-11-13 at 12:40, in its second version (`DECISIONS.md`, "The take check flags a name when both recognizers hear a sound its spelling doesn't have"). The first version went out at 09:40 and was switched off at 10:13, after AJ's marks on 40 clips agreed with it on 23. The second passed his marks on 55 new clips: of the 25 it flags, 23 sound wrong to him. Its numbers come from `D:\fish.wt\scratch\p4` on the laptop: the library as containers had it that morning, the 826 takes that say Eole, Vouivre, Louis or Lauriane with their phones in `phones.jsonl`, and every take of chapters 21 and 22. `skel.py` there is the prototype, `v2_score.py` scores it on the first marks and counts its flags, and `v2_marks.py` scores it on the second. `listen.py` and `listen2.py` built the two pages, and `listen\key.json`, `answers.txt`, `key2.json` and `answers2.txt` hold each clip's take and his marks.
+* What the name rule does to the library as of that deploy: every name with a say-as is held to it, and a chapter's saved takes are judged by it at the chapter's next check or render. A backlog take check of the 40 chapters whose check holds names ran at 12:41 that day for this. It heard nothing again and changed no audio. By it, 140 of the 345 takes that say Eole add a sound, 6 of 157 for Vouivre, and none of 140 for Louis and 186 for Lauriane. At four takes of "Eh-ole" in ten, the breaker will hold Eole's retakes in most chapters, and the Names tab reports the name. Its fix is a spelling that screens clean, which is AJ's to pick on the Names tab. No render has run with the rule yet.
+* What the name rule doesn't hear is the open part of P4: a vowel that only sounds different ("vroo" for "vruh", 5 of the 6 clips of Vouivre it passed), an added vowel in a possessive or before a vowel or an h when Parakeet's spelling doesn't show it (3 of the 15 clips of Eole it passed), and a sound the take drops. A rule for any of these needs its own listening page first. `p4-name-check.md` has the steps, N0 to N7, and none is started.
+* Phase 2, P5: not started. It measures first, and the chapters scripted before C1 need the marks pass for it, one Claude pass a chapter.
+* AJ was on chapter 43 on 2026-11-13. A backlog take check of chapters 43 to 52 and then 11 to 42, without 15 and 18, ran on the app that day and gathered the `phone` block for all 40. It changed no audio.
+* Ahead of AJ on 2026-11-12, a render would take a line again in chapters 44, 49, 50 and 51 and cut a tail in 40, 41, 42 and 46. He hasn't queued those.
 * Phase 3: not started.

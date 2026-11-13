@@ -723,8 +723,8 @@ def retake_flagged(folder: Path, lines: list[dict], bible: dict, saved: dict, ma
     lines: the script lines.
     bible: the serial's bible.
     saved: the chapter's takes by line. The entry of a replaced take is updated in place, the entry of every line
-        taken again records its last round as retake_rounds, and the entry of a take a voice finding covers
-        records its reasons as retake_held.
+        taken again records its last round as retake_rounds, and the entry of a take whose reasons the findings
+        cover records them as retake_held.
     made: the lines, as keys of saved, to check: the ones this render made, the ones whose saved take an earlier
         check flagged, and the ones whose saved take doesn't have evidence of the current versions.
     again: again(line, round) takes a line again and returns its entry, with the audio in a file of its own.
@@ -732,17 +732,19 @@ def retake_flagged(folder: Path, lines: list[dict], bible: dict, saved: dict, ma
     comfy_url: the ComfyUI address the recognizer functions take.
     log: receives the progress lines.
     rounds: how many rounds a flagged line gets, over every render of its take.
-    Returns {"replaced", "findings", "left"}: the lines whose take was replaced, the voice findings from
-    takecheck.voice_findings, and the flagged lines that the render's ceiling left for a later render. A new take
+    Returns {"replaced", "findings", "names", "left"}: the lines whose take was replaced, the voice findings from
+    takecheck.voice_findings, the name findings from takecheck.name_findings, and the flagged lines that the
+    render's ceiling left for a later render. A new take
     replaces the old one only when takecheck.better ranks it above. A line goes on from the round its retake_rounds
     records, so a line that has been through every round is heard and not taken again. A take is not taken again
-    when a voice finding covers every reason it is flagged for. The render takes lines again at most retake_ceiling
+    when a finding covers every reason it is flagged for: a voice finding for the reason, or for the reason "name"
+    a name finding for each name the take misses. The render takes lines again at most retake_ceiling
     times, the worst lines first. Does nothing unless this machine's recognizer is Parakeet, which leaves the card
     to breeze-server.
     Never raises. A failure is logged, and the takes replaced before it stay replaced, in saved and in
     take_check.json.
     """
-    out: dict = {"replaced": [], "findings": [], "left": []}
+    out: dict = {"replaced": [], "findings": [], "names": [], "left": []}
     replaced: list[int] = out["replaced"]
     pending: dict[str, dict] = {}
     try:
@@ -756,14 +758,24 @@ def retake_flagged(folder: Path, lines: list[dict], bible: dict, saved: dict, ma
         results = takecheck.check_entries({k: saved[k] for k in made}, lines, bible, **check)
         takecheck.save_entries(folder, results, engine, **record)
 
-        # Voice findings
-        out["findings"] = takecheck.voice_findings(takecheck.saved_entries(folder, saved), saved)
+        # Voice and name findings
+        judged = takecheck.saved_entries(folder, saved)
+        out["findings"] = takecheck.voice_findings(judged, saved)
+        out["names"] = takecheck.name_findings(judged)
         tripped = {(f["voice"], f["reason"]) for f in out["findings"]}
+        off = {f["term"] for f in out["names"]}
+
+        def explained(k: str, reason: str) -> bool:
+            missed = results[k].get("missed") or []
+            if reason == "name" and missed and all(term in off for term in missed):
+                return True
+            return (saved[k].get("voice"), reason) in tripped
+
         held, changed = set(), False
         for k in made:
             reasons = sorted(results[k].get("reasons") or [])
             covered = (results[k]["verdict"] == "flagged" and bool(reasons)
-                       and all((saved[k].get("voice"), r) in tripped for r in reasons))
+                       and all(explained(k, r) for r in reasons))
             if covered:
                 held.add(k)
             if saved[k].get("retake_held") != (reasons if covered else None):
@@ -774,6 +786,9 @@ def retake_flagged(folder: Path, lines: list[dict], bible: dict, saved: dict, ma
         for f in out["findings"]:
             log(f"   voice finding: {f['reason']} flags {len(f['lines'])} of the {f['of']} takes of {f['voice']}, so "
                 f"the cause is the voice and those takes are not taken again")
+        for f in out["names"]:
+            log(f"   name finding: {len(f['lines'])} of the {f['of']} takes that say {f['term']} add a sound to its "
+                f"spelling, so the cause is the spelling and those takes are not taken again")
         if changed:
             save()
 
@@ -856,18 +871,18 @@ def flagged_before(folder: Path, saved: dict, lines: list[dict] | None = None, b
 
     folder: the chapter folder, which holds take_check.json.
     saved: the chapter's takes by line.
-    lines, bible: the script lines and the serial's bible. With them, a file whose verdicts come from older rules
-        than takecheck.JUDGE_V is judged again from its evidence first, without being written.
+    lines, bible: the script lines and the serial's bible. With them, a file that takecheck.stale names, for older
+        rules or other picked spellings, is judged again from its evidence first, without being written.
     Returns the lines as keys of saved. A verdict counts only for the take and the audio it was heard in. A line
-    that has been through every retake round is left out, and so is a take whose reasons a voice finding covered
-    (retake_held). A take_check.json that cannot be read or parsed counts as no verdicts.
+    that has been through every retake round is left out, and so is a take whose reasons a voice finding or a name
+    finding covered (retake_held). A take_check.json that cannot be read or parsed counts as no verdicts.
     """
     from . import takecheck
     path = folder / takecheck.CHECK_FILE
     try:
         data = lib.load_json(path) if path.is_file() else {}
         checked = data.get("takes") or {}
-        if lines is not None and bible is not None and data.get("rules") != takecheck.JUDGE_V:
+        if lines is not None and bible is not None and takecheck.stale(data, bible):
             try:
                 checked = takecheck.rejudged(checked, saved, lines, bible)
             except Exception:
@@ -1156,6 +1171,7 @@ def render_breeze(slug: str, number: int, *, seed: int | None = None, comfy_url:
         log(f"   {len(retry) - len(again_lines)} saved takes don't have evidence from the current check, so they "
             f"are heard before the join")
     findings = last.get("voice_findings") if isinstance(last.get("voice_findings"), list) else []
+    names_off = last.get("name_findings") if isinstance(last.get("name_findings"), list) else []
 
     # Takes
     generated_seconds = 0.0
@@ -1224,8 +1240,9 @@ def render_breeze(slug: str, number: int, *, seed: int | None = None, comfy_url:
                     write_wav(file, got["pcm"], server.sample_rate)
                     return {"key": key, "file": str(file), **take_fields(got), **({"pieces": pieces} if pieces > 1 else {})}
 
-                findings = retake_flagged(folder, lines, bible, saved, list(by_line), again, comfy_url=comfy_url,
-                                          log=log, save=lambda: save_takes(takes_path, saved, runner))["findings"]
+                checked = retake_flagged(folder, lines, bible, saved, list(by_line), again, comfy_url=comfy_url,
+                                         log=log, save=lambda: save_takes(takes_path, saved, runner))
+                findings, names_off = checked["findings"], checked["names"]
         finally:
             if server is not None:
                 server.__exit__(None, None, None)
@@ -1284,6 +1301,8 @@ def render_breeze(slug: str, number: int, *, seed: int | None = None, comfy_url:
                                 "seconds": summary["seconds"]}
     if findings:
         meta["render"]["voice_findings"] = findings
+    if names_off:
+        meta["render"]["name_findings"] = names_off
     if not (stale or retry) and isinstance(last.get("check"), dict):
         meta["render"]["check"] = last["check"]
     meta["status"] = "rendered"

@@ -16,8 +16,10 @@ from ..casting import NARRATOR_ID, needs_narrator
 from ..comfy import ComfyError
 from ..breeze import TAKES_FILE
 from ..render import COMFY_OUTPUT, plan_engine, plan_slots
+from .. import phones, pronounce, takecheck
 from ..asr import words
-from ..takecheck import CHECK_FILE, JUDGE_V, VERDICTS, for_take, heard, rejudged
+from ..pronounce import steady
+from ..takecheck import CHECK_FILE, NAME_APART, VERDICTS, for_take, heard, rejudged, stale
 from .jobs import INCOMING, read_tail
 
 AUDIO_SUFFIXES = {".opus", ".flac", ".wav", ".mp3", ".ogg", ".m4a"}
@@ -25,8 +27,12 @@ MEDIA_MIRROR: Path | None = None
 IMPORTANCE_ORDER = {"major": 0, "recurring": 1, "minor": 2, "one_off": 3}
 _Loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
 _cache: dict[str, tuple[float, int, object]] = {}
-_names_cache: dict[str, tuple[tuple, dict | None]] = {}
+_names_cache: dict[str, tuple[tuple, tuple]] = {}
+_ways_cache: dict[str, tuple[tuple, dict]] = {}
 NAMES_SHOWN = 12
+# the most sayings of one name that the Names page sorts into ways, and the most it takes a reference from
+SAID_MAX = 400
+SAID_SAMPLE = 16
 
 
 def _yaml(path: Path, default=None):
@@ -304,7 +310,7 @@ def _take_check(folder: Path, script: dict | None, meta: dict, names: dict, bibl
     if isinstance(check, dict) and not check.get("skipped") and (folder / CHECK_FILE).is_file():
         checked = lib.load_json(folder / CHECK_FILE)
         results = checked.get("takes") or {}
-        if bible is not None and checked.get("rules") != JUDGE_V:
+        if bible is not None and stale(checked, bible):
             try:
                 results = rejudged(results, takes, script["lines"], bible)
             except Exception:
@@ -398,27 +404,36 @@ def voice_findings(slug: str) -> dict[str, list[dict]]:
     return out
 
 
-def _names_in(folder: Path) -> dict[str, Counter] | None:
-    """How a chapter's take check heard each name.
+def _heard_in(folder: Path) -> tuple[dict[str, Counter] | None, dict[str, list], dict, tuple]:
+    """How a chapter's take check heard each name, and how its takes said it.
 
     folder: the chapter folder.
-    Returns {term: Counter of spellings} over the check's entries for the takes' current audio, with a possessive
-    's left off a spelling. None when the chapter doesn't have both files, when one doesn't parse, or when no entry
-    holds names, which is a check from before the rules recorded them.
+    Returns (spellings, said, check, stamp). spellings is {term: Counter of spellings} over the check's entries
+    for the takes' current audio, with a possessive 's left off a spelling. It is None when the chapter doesn't
+    have both files, when one doesn't parse, or when no entry holds names, which is a check from before the rules
+    recorded them. said is {term: [[inside, window], ...]}, the phones of each saying from the entries that have
+    them. check is {"rules", "names", "missed"}: the rules and the picked spellings the file was judged with, and
+    {term: [the takes that say it with an added sound, the takes that say it]}. stamp changes when either file
+    does.
     """
     takes_path, check_path = folder / TAKES_FILE, folder / CHECK_FILE
     try:
         a, b = takes_path.stat(), check_path.stat()
     except OSError:
-        return None
+        return None, {}, {}, ()
     key, stamp = str(folder), (a.st_mtime_ns, a.st_size, b.st_mtime_ns, b.st_size)
     hit = _names_cache.get(key)
     if hit and hit[0] == stamp:
-        return hit[1]
+        return (*hit[1], stamp)
     found: dict[str, Counter] | None = None
+    said: dict[str, list] = {}
+    check: dict = {}
     try:
         takes = lib.load_json(takes_path).get("takes") or {}
-        entries = lib.load_json(check_path).get("takes") or {}
+        data = lib.load_json(check_path)
+        entries = data.get("takes") or {}
+        missed: dict[str, list[int]] = {}
+        check = {"rules": data.get("rules"), "names": data.get("names"), "missed": missed}
         for k, entry in entries.items():
             if not for_take(entry, takes.get(k)) or not isinstance(entry.get("names"), dict):
                 continue
@@ -427,14 +442,49 @@ def _names_in(folder: Path) -> dict[str, Counter] | None:
                 for spelling in spellings if isinstance(spellings, list) else []:
                     if isinstance(spelling, str):
                         found.setdefault(str(term), Counter())[spelling.removesuffix("'s")] += 1
+            off = entry.get("missed") if isinstance(entry.get("missed"), list) else []
+            for term, spans in (entry["said"].items() if isinstance(entry.get("said"), dict) else ()):
+                said.setdefault(str(term), []).extend(
+                    [str(s[0]), str(s[1])] for s in (spans if isinstance(spans, list) else [])
+                    if isinstance(s, list) and len(s) == 2)
+                count = missed.setdefault(str(term), [0, 0])
+                count[0] += term in off
+                count[1] += 1
     except (OSError, ValueError, AttributeError, TypeError):
-        found = None
-    _names_cache[key] = (stamp, found)
-    return found
+        found, said, check = None, {}, {}
+    _names_cache[key] = (stamp, (found, said, check))
+    return found, said, check, stamp
 
 
-def _options_view(options) -> dict | None:
-    """A term's pronunciation options for the Names page, each candidate with its clip's media, or None."""
+def _ways(spans: list, ref: str | None) -> dict:
+    """How the sayings of one name sort into ways, for the Names page.
+
+    spans: [inside, window] for each saying.
+    ref: the usual saying of the name's spelling, or None for the usual way of a sample of SAID_SAMPLE of the spans.
+    Returns {"said", "usual", "count", "ways"}: how many sayings were sorted, at most SAID_MAX of them thinned
+    evenly, how many of those are the first way, how many ways there are, and the NAMES_SHOWN most frequent ways as
+    [phones, count]. A saying whose window has a way's phones in it is that way.
+    """
+    if len(spans) > SAID_MAX:
+        spans = [spans[i * len(spans) // SAID_MAX] for i in range(SAID_MAX)]
+    ref = ref or phones.consensus(spans, SAID_SAMPLE)
+    if not ref:
+        return {"said": 0, "usual": 0, "count": 0, "ways": []}
+    usual = [s for s in spans if ref in s[1]]
+    rest = [s for s in spans if ref not in s[1]]
+    found = phones.ways(rest, ref, NAME_APART)
+    found[0]["count"] += len(usual)
+    found = [w for w in found if w["count"]] or found[:1]
+    return {"said": len(spans), "usual": found[0]["count"] if found[0]["phones"] == ref else 0, "count": len(found),
+            "ways": [[w["phones"], w["count"]] for w in found[:NAMES_SHOWN]]}
+
+
+def _options_view(options, term: str = "") -> dict | None:
+    """A term's pronunciation options for the Names page, each candidate with its clip's media, or None.
+
+    options: the term's options from pronunciations.yaml.
+    term: the term as the text spells it, whose own candidate shows no count.
+    """
     if not isinstance(options, dict) or not isinstance(options.get("candidates"), list):
         return None
     return {"line": options.get("line"), "voice": options.get("voice"),
@@ -442,8 +492,26 @@ def _options_view(options) -> dict | None:
             "candidates": [{"say": c.get("say"), "why": c.get("why"),
                             "heard": _heard_as(c.get("text"), c.get("say"), c.get("heard")),
                             "seconds": c.get("seconds"),
-                            "media": comfy_media(c["clip"]) if isinstance(c.get("clip"), str) else None}
+                            "media": comfy_media(c["clip"]) if isinstance(c.get("clip"), str) else None,
+                            "steady": _count(c, term),
+                            "typical": c.get("typical") is not False or _count(c, term) is None,
+                            "offered": _count(c, term) is None or steady(c)}
                            for c in options["candidates"] if isinstance(c, dict)]}
+
+
+def _count(candidate: dict, term: str = "") -> list[int] | None:
+    """A candidate's screening count as [takes without an added sound, takes].
+
+    candidate: an option of a term.
+    term: the term as the text spells it.
+    Returns None while pronounce.SCREENS is off, for a candidate that pronounce.SCREEN_V did not screen, for the
+    term as written, which the name rule doesn't judge, and for a count that is not two whole numbers.
+    """
+    value = candidate.get("steady")
+    ok = (pronounce.SCREENS and candidate.get("screen") == pronounce.SCREEN_V and candidate.get("say") != term
+          and isinstance(value, list) and len(value) == 2
+          and all(isinstance(n, int) and not isinstance(n, bool) for n in value))
+    return [value[0], value[1]] if ok else None
 
 
 def _heard_as(text, say, heard) -> str:
@@ -478,43 +546,89 @@ def names_heard(slug: str) -> dict:
     "respelling", "heard", "spellings", "as_written", "top", "chapters", "options"}: the name as the bible has it,
     its say-as and its respelling or "", how many times a take's check heard it, in how many spellings, how many of
     those times in the spelling the voice is sent, the NAMES_SHOWN most frequent spellings as [spelling, count],
-    the chapters, and its pronunciation options or None. The options are {"line", "voice", "at", "candidates"},
-    and a candidate is {"say", "why", "heard", "seconds", "media"}, where heard is how the recognizer wrote the
-    spelling in the candidate's take. The terms with the most spellings come first,
-    and a term that has options but was never heard comes after them. chapters lists the chapters with Breeze
-    takes whose check holds names and those whose check doesn't yet.
+    the chapters, and its pronunciation options or None. A term whose takes have phones also has "ways", from
+    _ways: how its sayings sort into ways by sound, the first being the usual saying of its spelling when the
+    bible has one and else its usual way. A term is "held" while it has a say-as and takecheck.NAME_FLAGS is on,
+    and then "adds" is [the takes that say it with an added sound, the takes that say it], over the chapters
+    whose check was judged by the rules and the picked spellings as they are now. "findings" lists the chapters
+    where a render found so many takes with an added sound that it took none again, as {"chapter", "takes",
+    "of"}. The options are {"line", "voice", "at", "candidates"}, and a candidate is {"say", "why", "heard",
+    "seconds", "media", "steady", "typical", "offered"}, where heard is how the recognizer wrote the spelling in
+    the candidate's take, steady is [the screening takes without an added sound, the screening takes] or None,
+    typical is whether the clip is one of those, and offered is False for a screened candidate that
+    pronounce.steady rejects. The candidate that is the term as written has no count and is offered. While
+    pronounce.SCREENS is off, steady is None and every candidate is offered.
+    "screens" in the answer says whether options jobs screen. The held terms with the most takes that add a
+    sound come first, then the terms with the most sayings off their first way, then those with the most
+    spellings, and a term that has options but was never heard comes after them. chapters lists the chapters
+    with Breeze takes whose check holds names, those whose check doesn't yet, and under "judged" those of the
+    first whose check is current.
     """
-    pronunciations = _bible(slug).get("pronunciations") or {}
+    bible = _bible(slug)
+    pronunciations = bible.get("pronunciations") or {}
+    held = takecheck.picked_spellings(bible) if takecheck.NAME_FLAGS else {}
     counts: dict[str, Counter] = {}
     where: dict[str, list[int]] = {}
-    known, unknown = [], []
+    spans: dict[str, list] = {}
+    adds: dict[str, list[int]] = {}
+    findings: dict[str, list[dict]] = {}
+    known, unknown, judged, stamps = [], [], [], []
     for n in lib.list_chapters(slug):
         folder = lib.chapter_dir(slug, n)
         if not (folder / TAKES_FILE).is_file():
             continue
-        found = _names_in(folder)
+        found, said, check, stamp = _heard_in(folder)
         if found is None:
             unknown.append(n)
             continue
         known.append(n)
+        stamps.append(stamp)
+        if not stale(check, bible):
+            judged.append(n)
+            for term, (missed, saying) in check["missed"].items():
+                if term in held:
+                    count = adds.setdefault(term, [0, 0])
+                    count[0] += missed
+                    count[1] += saying
         for term, spellings in found.items():
             counts.setdefault(term, Counter()).update(spellings)
             where.setdefault(term, []).append(n)
-    terms = []
-    for term, spellings in counts.items():
-        entry = pronunciations.get(term) if isinstance(pronunciations.get(term), dict) else {}
+        for term, sayings in said.items():
+            spans.setdefault(term, []).extend(sayings)
+            counts.setdefault(term, Counter())
+            if n not in where.setdefault(term, []):
+                where[term].append(n)
+        off = (_chapter_meta(slug, n).get("render") or {}).get("name_findings")
+        for f in off if isinstance(off, list) else []:
+            if isinstance(f, dict) and isinstance(f.get("term"), str) and isinstance(f.get("lines"), list):
+                findings.setdefault(f["term"], []).append({"chapter": n, "takes": len(f["lines"]), "of": f.get("of")})
+    refs = {str(term): entry["said"] for term, entry in pronunciations.items()
+            if isinstance(entry, dict) and isinstance(entry.get("said"), str) and entry["said"]}
+    key = (tuple(stamps), tuple(sorted(refs.items())))
+    if _ways_cache.get(slug, (None,))[0] != key:
+        _ways_cache[slug] = (key, {term: _ways(found, refs.get(term)) for term, found in spans.items()})
+    ways = _ways_cache[slug][1]
+
+    def view(term: str, entry: dict, spellings: Counter) -> dict:
         sent = " ".join(words(str(entry.get("say") or term)))
-        terms.append({"term": term, "say": str(entry.get("say") or ""), "respelling": str(entry.get("respelling") or ""),
-                      "heard": sum(spellings.values()), "spellings": len(spellings), "as_written": spellings.get(sent, 0),
-                      "top": [[s, c] for s, c in spellings.most_common(NAMES_SHOWN)], "chapters": where[term],
-                      "options": _options_view(entry.get("options"))})
-    for term, entry in pronunciations.items():
-        if term not in counts and isinstance(entry, dict) and _options_view(entry.get("options")):
-            terms.append({"term": term, "say": str(entry.get("say") or ""), "respelling": str(entry.get("respelling") or ""),
-                          "heard": 0, "spellings": 0, "as_written": 0, "top": [], "chapters": [],
-                          "options": _options_view(entry.get("options"))})
-    terms.sort(key=lambda t: (-t["spellings"], -t["heard"], t["term"]))
-    return {"terms": terms, "chapters": {"with": known, "without": unknown}}
+        return {"term": term, "say": str(entry.get("say") or ""), "respelling": str(entry.get("respelling") or ""),
+                "heard": sum(spellings.values()), "spellings": len(spellings), "as_written": spellings.get(sent, 0),
+                "top": [[s, c] for s, c in spellings.most_common(NAMES_SHOWN)], "chapters": where.get(term, []),
+                "options": _options_view(entry.get("options"), term), "held": term in held,
+                **({"adds": adds.get(term, [0, 0])} if term in held else {}),
+                "findings": findings.get(term, []), **({"ways": ways[term]} if ways.get(term, {}).get("said") else {})}
+
+    terms = [view(term, pronunciations.get(term) if isinstance(pronunciations.get(term), dict) else {}, spellings)
+             for term, spellings in counts.items()]
+    terms += [view(term, entry, Counter()) for term, entry in pronunciations.items()
+              if term not in counts and isinstance(entry, dict) and _options_view(entry.get("options"))]
+
+    def off(t: dict) -> int:
+        return t["ways"]["said"] - t["ways"]["usual"] if "ways" in t else 0
+
+    terms.sort(key=lambda t: (-t.get("adds", [0])[0], -off(t), -t["spellings"], -t["heard"], t["term"]))
+    return {"terms": terms, "chapters": {"with": known, "without": unknown, "judged": judged},
+            "screens": pronounce.SCREENS}
 
 
 def voices(slug: str) -> dict:

@@ -15,7 +15,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from serial_audio import asr, breeze, machine, parakeet_asr, takecheck
+from serial_audio import asr, breeze, machine, parakeet_asr, phones, takecheck
 from serial_audio import library as lib
 from serial_audio.asr import words
 from serial_audio.comfy import ComfyError
@@ -1733,7 +1733,7 @@ class NamesHeardTest(unittest.TestCase):
         # The name with the most spellings is first. A possessive is the same spelling, and a say-as name counts as
         # written when it is heard as the voice is sent it.
         got = views.names_heard("s")
-        self.assertEqual(got["chapters"], {"with": [1, 2], "without": [3]})
+        self.assertEqual(got["chapters"], {"with": [1, 2], "without": [3], "judged": []})
         self.assertEqual([(t["term"], t["heard"], t["spellings"], t["as_written"]) for t in got["terms"]],
                          [("Eole", 4, 3, 0), ("Lauriane", 2, 2, 1), ("Casval", 1, 1, 1)])
         eole, lauriane, _ = got["terms"]
@@ -1750,7 +1750,79 @@ class NamesHeardTest(unittest.TestCase):
 
         # A check file that doesn't parse puts its chapter with the ones that don't have names yet.
         (two / takecheck.CHECK_FILE).write_bytes(b"{")
-        self.assertEqual(views.names_heard("s")["chapters"], {"with": [1], "without": [2, 3]})
+        self.assertEqual(views.names_heard("s")["chapters"], {"with": [1], "without": [2, 3], "judged": []})
+
+    def test_a_name_whose_takes_have_phones_is_listed_by_the_ways_it_was_said(self):
+        from serial_audio import pronounce
+        from serial_audio.web import views
+        for target, switch in ((takecheck, "NAME_FLAGS"), (pronounce, "SCREENS")):
+            patcher = mock.patch.object(target, switch, True)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        one = self.chapter(1, [{"Eole": ["aol"]}] * 6 + [{"Lauriane": ["laurie anne"]}])
+        check = lib.load_json(one / takecheck.CHECK_FILE)
+        sayings = ["eɪoʊl", "eɪoʊl", "eɪɔl", "kæzvɔl", "kæzvɔl", "hɛli"]
+        for i, name in enumerate(sayings):
+            check["takes"][str(i)]["said"] = {"Eole": [[name, f"nd{name}sɛd"]]}
+        lib.save_json(one / takecheck.CHECK_FILE, check)
+        lib.save_chapter_meta("s", 1, {"number": 1, "render": {"name_findings": [{"term": "Eole", "lines": [3, 4, 5],
+                                                                                   "of": 6}]}})
+
+        # Without a picked saying the first way is the usual one. The sayings sort by sound though the recognizer
+        # wrote one spelling, and the name with the most sayings off its first way is first.
+        got = views.names_heard("s")
+        eole, lauriane = got["terms"]
+        self.assertEqual((eole["term"], eole["spellings"], eole["held"]), ("Eole", 1, False))
+        self.assertEqual(eole["ways"], {"said": 6, "usual": 3, "count": 3,
+                                        "ways": [["eɪoʊl", 3], ["kæzvɔl", 2], ["hɛli", 1]]})
+        self.assertNotIn("ways", lauriane)
+        self.assertEqual(eole["findings"], [{"chapter": 1, "takes": 3, "of": 6}])
+
+        # A name with a say-as is held to its spelling, and the usual saying of the spelling leads the ways.
+        bible = lib.load_bible("s")
+        bible["pronunciations"]["Eole"].update(say="Cazvol", said="kæzvɔl")
+        lib.save_bible("s", bible)
+        got = views.names_heard("s")
+        eole = got["terms"][0]
+        self.assertEqual((eole["held"], eole["ways"]["usual"], eole["ways"]["ways"][0]), (True, 2, ["kæzvɔl", 2]))
+
+        # The takes that add a sound to the spelling are counted over the chapters whose check was judged by the
+        # rules and the spellings as they are now. This chapter's was not, so it counts for nothing yet.
+        self.assertEqual((eole["adds"], got["chapters"]["judged"]), ([0, 0], []))
+        check = lib.load_json(one / takecheck.CHECK_FILE)
+        check.update(rules=takecheck.JUDGE_V, names=takecheck.picked_spellings(bible))
+        for i in (0, 1, 2, 5):
+            check["takes"][str(i)]["missed"] = ["Eole"]
+        lib.save_json(one / takecheck.CHECK_FILE, check)
+        got = views.names_heard("s")
+        self.assertEqual((got["terms"][0]["term"], got["terms"][0]["adds"], got["chapters"]["judged"]),
+                         ("Eole", [4, 6], [1]))
+        self.assertEqual(got["terms"][1]["adds"], [0, 0])
+
+        # A candidate that was screened shows its count, and one that is not steady is not offered. A count from
+        # an older screen is not shown, and its candidate is offered as an unscreened one is. So is the name as
+        # written, whatever its count, because the rule doesn't judge a name as written.
+        screen = pronounce.SCREEN_V
+        bible["pronunciations"]["Eole"]["options"] = {"line": {"chapter": 1}, "candidates": [
+            {"say": "Eole", "said": "iol", "steady": [2, 8], "typical": False, "screen": screen},
+            {"say": "Cazvol", "said": "kæzvɔl", "steady": [8, 8], "typical": True, "screen": screen},
+            {"say": "Ay-ole", "said": "eɪoʊl", "steady": [5, 8], "typical": True, "screen": screen},
+            {"say": "Ay-ohl", "said": "eɪoʊl", "steady": [3, 8], "typical": True}]}
+        lib.save_bible("s", bible)
+        shown = views.names_heard("s")["terms"][0]["options"]["candidates"]
+        self.assertEqual([(c["say"], c["steady"], c["offered"]) for c in shown],
+                         [("Eole", None, True), ("Cazvol", [8, 8], True), ("Ay-ole", [5, 8], False),
+                          ("Ay-ohl", None, True)])
+        self.assertTrue(views.names_heard("s")["screens"])
+
+        # While the rule and the screen are off, no name is held, no count is shown and every option is offered.
+        # The ways are still listed.
+        with mock.patch.object(takecheck, "NAME_FLAGS", False), mock.patch.object(pronounce, "SCREENS", False):
+            got = views.names_heard("s")
+            eole = got["terms"][0]
+            self.assertEqual((got["screens"], eole["held"], eole["ways"]["ways"][0]), (False, False, ["kæzvɔl", 2]))
+            self.assertNotIn("adds", eole)
+            self.assertEqual([(c["steady"], c["offered"]) for c in eole["options"]["candidates"]], [(None, True)] * 4)
 
 
 class CppTakeTest(unittest.TestCase):
@@ -1864,6 +1936,7 @@ class ExtraBlocksTest(unittest.TestCase):
 
         with mock.patch.object(machine, "VAD_MODEL", vad), mock.patch.object(machine, "ASR2_MODEL", moonshine), \
                 mock.patch.object(machine, "SPEAKER_MODEL", self.root / "none"), \
+                mock.patch.object(machine, "PHONE_MODEL", self.root / "nophone"), \
                 mock.patch.object(machine, "PARAKEET_MODEL", parakeet), mock.patch.dict(asr._LOADS, clear=True), \
                 mock.patch.object(asr, "_load", load):
             # A block counts when its folder holds all its files and its model loads. A missing folder leaves its
@@ -1883,15 +1956,20 @@ class ExtraBlocksTest(unittest.TestCase):
             self.assertIn("SERIAL_AUDIO_ASR2_MODEL", problems["asr2"])
             self.assertIn(parakeet_asr.ASR2_FILES[1], problems["asr2"])
 
-            # ZIPA's folder gets the same check, though no block reads it yet.
+            # ZIPA's folder gets the same check, and a whole one adds the phone block to the load.
             phone = self.folder("phone", parakeet_asr.PHONE_FILES[:1])
             with mock.patch.object(machine, "PHONE_MODEL", phone):
                 self.assertIn("SERIAL_AUDIO_PHONE_MODEL", asr.model_problems()["phone"])
+            whole = self.folder("zipa", parakeet_asr.PHONE_FILES)
+            with mock.patch.object(machine, "PHONE_MODEL", whole), mock.patch.dict(asr._LOADS, clear=True), \
+                    mock.patch.object(asr, "_load", lambda folders: (set(folders), {})):
+                self.assertEqual(REAL_EXTRA_BLOCKS(), {"vad", "phone"})
 
         # A model whose files are there but don't load leaves its block out, and model_problems names the error.
         # A load tried for other folders isn't reported.
         with mock.patch.object(machine, "VAD_MODEL", vad), mock.patch.object(machine, "ASR2_MODEL", self.root / "no"), \
                 mock.patch.object(machine, "SPEAKER_MODEL", self.root / "none"), mock.patch.dict(asr._LOADS, clear=True), \
+                mock.patch.object(machine, "PHONE_MODEL", self.root / "nophone"), \
                 mock.patch.object(asr, "_load", lambda folders: (set(), {"vad": "RuntimeError: bad model"})):
             self.assertEqual(asr.model_problems(), {})
             self.assertEqual(REAL_EXTRA_BLOCKS(), set())
@@ -2203,6 +2281,333 @@ class SecondOpinionTest(unittest.TestCase):
         # Against a take without the second recognizer, only Parakeet's errors count.
         self.assertFalse(takecheck.better(entry(3, 0), entry(2)))
         self.assertTrue(takecheck.better(entry(2), entry(3, 0)))
+
+
+def said_at(*parts: tuple[str, float]) -> dict:
+    """A phone block that says each string from its second on, with a phone every 0.04 s."""
+    symbols, starts = "", []
+    for said, at in parts:
+        symbols += said
+        starts += [round(at + 0.04 * n, 2) for n in range(len(said))]
+    return {"v": takecheck.PHONE_V, "engine": "zipa-small-crctc-300k", "phones": symbols, "starts": starts}
+
+
+NAME_BIBLE = {"characters": {}, "pronunciations": {"Eole": {"say": "Eh-ole", "said": "eɪoʊl"}}}
+NAME_LINE = {"speaker": "narrator", "text": "Tell Eole to wait."}
+
+
+def name_phones(name: str) -> dict:
+    """The phone block of a take of NAME_LINE that says the name as given."""
+    return said_at(("tɛl", 0.0), (name, 0.3), ("tə", 0.6), ("weɪt", 0.9))
+
+
+# how Parakeet writes the name in a take whose phones say it with an added sound
+NAME_HEARD = {"jol": "Yol", "ɪtɔl": "It all", "eɪoʊli": "Aoli"}
+
+
+def name_heard(name: str) -> str:
+    """What Parakeet hears in a take of NAME_LINE that says the name as given. A sound the phones add is in its
+    spelling too, and any other saying is "Aol"."""
+    return f"Tell {NAME_HEARD.get(name, 'Aol')} to wait."
+
+
+class PhonesTest(unittest.TestCase):
+    def test_a_window_holds_a_reference_whatever_stands_around_it(self):
+        # The reference as a part of the window is no distance, whatever is before and after it.
+        self.assertEqual(phones.apart("luis", "ændluissɛd"), 0.0)
+        # A near vowel costs little, a missing first phone a quarter of four, and other phones most of it.
+        self.assertLess(phones.apart("luis", "ændluɪssɛd"), 0.15)
+        self.assertEqual(phones.apart("luis", "uissɛd"), 0.25)
+        self.assertGreater(phones.apart("luis", "kæpɪtən"), 0.6)
+        # The picked "ay-ole" against ways the voice has said it. With a glide or a near vowel it is the same
+        # saying, and as "yol" or "it all" it is another.
+        for window, same in (("ndeɪjoʊlsɛd", True), ("ndeɪɔlsɛd", True), ("jolsɛd", False), ("ɪtɔlsɛd", False)):
+            self.assertEqual(phones.apart("eɪoʊl", window) <= takecheck.NAME_APART, same, window)
+        # End to end, a neighbour's phone at either end counts.
+        self.assertEqual(phones.whole("luis", "luis"), 0.0)
+        self.assertEqual(phones.whole("luis", "luisk"), 0.2)
+
+    def test_the_reference_of_a_name_is_its_usual_saying_without_a_neighbours_phone(self):
+        # Most spans carry a phone of the word before or after. The reference is what the windows share.
+        spans = [["luisk", "ɪdluiskən"], ["luis", "æzluisən"], ["luisf", "ætluisfɛl"], ["dluis", "ndluisɹɪ"],
+                 ["luis", "luisweɪ"], ["luɪs", "təluɪsæz"]]
+        self.assertEqual(phones.consensus(spans), "luis")
+        self.assertEqual(phones.consensus([["luisk", "ɪdluiskən"], ["luisf", "ætluisfɛl"], ["dluis", "ndluisɹɪ"]]),
+                         "luis")
+        # Sayings that all have the phone keep it, and sayings without phones give no reference.
+        self.assertEqual(phones.consensus([["luisk", "luiskən"]] * 3), "luisk")
+        self.assertIsNone(phones.consensus([["", "ən"]]))
+
+        # The sayings sort into ways by what their windows hold, the reference first and then the most frequent.
+        found = phones.ways([["eɪoʊl", "deɪoʊls"], ["eɪɔl", "eɪɔlɹɪ"], ["hɛli", "hɛlisɛ"], ["jol", "ndjolsɛ"],
+                             ["jol", "jollʊk"]], "eɪoʊl", takecheck.NAME_APART)
+        self.assertEqual(found, [{"phones": "eɪoʊl", "count": 2}, {"phones": "jol", "count": 2},
+                                 {"phones": "hɛli", "count": 1}])
+        self.assertEqual(phones.ways([], "eɪoʊl", takecheck.NAME_APART), [{"phones": "eɪoʊl", "count": 0}])
+        self.assertEqual(phones.ways([], None, takecheck.NAME_APART), [])
+
+    def test_a_skeleton_is_the_consonants_with_one_vowel_for_each_run(self):
+        # From a spelling, read as English: a final e after a consonant is silent unless it is read loud, a w or a
+        # y after a vowel is part of the vowel, an h counts only before a vowel, and each symbol knows its word.
+        self.assertEqual(phones.spelled("Eh-ole"), (["V", "l"], [0, 1]))
+        self.assertEqual(phones.spelled("Lewis")[0], ["l", "V", "s"])
+        self.assertEqual(phones.spelled("Laurie Anne"), (["l", "V", "ɹ", "V", "n"], [0, 0, 0, 0, 1]))
+        self.assertEqual(phones.spelled("Vweevra")[0], ["v", "w", "V", "v", "ɹ", "V"])
+        self.assertEqual(phones.spelled("y'all")[0], ["j", "V", "l"])
+        self.assertEqual((phones.spelled("aole")[0], phones.spelled("aole", loud=True)[0]), (["V", "l"], ["V", "l", "V"]))
+        # From phones: a glide after a vowel is part of the vowel, and a glottal stop and a mark are left out.
+        self.assertEqual(phones.sounded("eɪjoʊl"), ["V", "l"])
+        self.assertEqual(phones.sounded("heɪhoʊlm"), ["h", "V", "h", "V", "l", "m"])
+        self.assertEqual(phones.sounded("ʔeɪoʊlː"), ["V", "l"])
+        # A possessive may add its z, and a vowel before it after a hissing sound.
+        self.assertEqual(phones.forms("eh ole's"), [["V", "l"], ["V", "l", "z"]])
+        self.assertEqual(phones.forms("lewis'"), [["l", "V", "s"], ["l", "V", "s", "z"], ["l", "V", "s", "V", "z"]])
+
+    def test_a_saying_adds_a_sound_when_both_recognizers_hear_it(self):
+        # Each case is a saying AJ marked on the listening pages of 2026-11-13, as (the name's words, Parakeet's
+        # spelling, ZIPA's phones in and around the span, the next word, the word before).
+        def adds(*case) -> list:
+            return phones.adds(*case)
+
+        # A syllable after the name, an h inside it and a consonant before it, each heard by both.
+        self.assertEqual(adds("eh ole", "aeoli", "eɪoʊliɪnsɪ", "insisted", ""), [("V", 2)])
+        self.assertEqual(adds("eh ole", "a ho", "uheɪhoʊlm", "she", "to"), [("h", 2)])
+        self.assertEqual(adds("eh ole", "so well", "soʊwɛlʃ", "shook", ""), [("s", 0)])
+        self.assertEqual(adds("eh ole", "y'all", "jol", "", ""), [("j", 0)])
+        self.assertEqual(adds("vwee vruh", "vrivru", "stvɹivɹuənd", "and", "least"), [("ɹ", 2)])
+        # Sayings he hears as picked: nothing added, or the two recognizers hear different sounds.
+        self.assertEqual(adds("eh ole", "aol", "eoʊldblɪ", "blinked", ""), [])
+        self.assertEqual(adds("eh ole", "they all", "hiɔlɹɪme", "remained", ""), [])
+        self.assertEqual(adds("eh ole", "hale", "etɪlglæn", "glanced", ""), [])
+        # A sound only one of the two hears is not added, and neither is a sound the saying lacks.
+        self.assertEqual(adds("eh ole", "aol", "jol", "to", ""), [])
+        self.assertEqual(adds("eh ole", "yol", "eɪoʊl", "to", ""), [])
+        self.assertEqual(adds("eh ole", "ao", "eɪoʊ", "recalled", ""), [])
+
+        # A final e of the spelling is a vowel where the vowel in the phones can't be the next word's.
+        self.assertEqual(adds("eh ole", "aole", "eoʊleɪb", "bit", ""), [("V", 2)])
+        # It is silent before a vowel or an h, before the name's own last sound, and in a possessive. The first
+        # and the last of these are sayings he hears another way, which the rule lets pass.
+        self.assertEqual(adds("eh ole", "eole", "oleəp", "appeared", ""), [])
+        self.assertEqual(adds("eh ole", "aole", "eoʊleɪh", "had", ""), [])
+        self.assertEqual(adds("laurie anne", "lorianne", "lɔɹiænnɑ", "nodded", ""), [])
+        # So it is before a word without letters, such as a number, whose first sound is not known. At the end
+        # of the line no word follows, and it is a vowel.
+        self.assertEqual(adds("eh ole", "aole", "eoʊleɪt", "8", "told"), [])
+        self.assertEqual(adds("eh ole", "aole", "eoʊleɪ", "", "told"), [("V", 2)])
+        self.assertEqual(adds("eh ole's", "aeole's", "eɪoʊleɪɛsfɹɛnd", "friendship", "of"), [])
+        # A possessive's own sounds are not added, and a vowel before them that the spelling has too is.
+        self.assertEqual(adds("laurie anne's", "lorianne's", "lɔɹiænɛzgeɪ", "gaze", ""), [])
+        self.assertEqual(adds("lewis'", "louis", "luisɪsmæ", "madness", "of"), [])
+        self.assertEqual(adds("eh ole's", "aoli's", "eɪoʊliɛsɹəfj", "refusal", ""), [("V", 2)])
+
+        # The neighbours' sounds are not the name's: a heard word that holds none of the name, the next word's
+        # phones inside the span, and a consonant that the word before ends in.
+        self.assertEqual(adds("vwee vruh", "lord vuivru", "ənlɔɹdvuwivɹusmɑ", "smirked", "dragonlord"), [])
+        self.assertEqual(adds("vwee vruh", "vouivreux", "vwivɹuwɑzn", "was", "like"), [])
+        self.assertEqual(adds("eh ole", "lol", "llol", "to", "tell"), [])
+        self.assertEqual(adds("eh ole", "yol", "ljol", "to", "tell"), [("j", 0)])
+        # Without phones, without a spelling or without a name there is nothing to hold.
+        for case in (("eh ole", "aol", "", "to", ""), ("eh ole", "", "eɪoʊl", "to", ""), ("", "aol", "eɪoʊl", "to", "")):
+            self.assertEqual(adds(*case), [], case)
+
+    def test_the_child_gives_a_takes_phones_as_one_string_with_their_seconds(self):
+        # sherpa-onnx times ZIPA's tokens at twice their seconds. The word boundary and a token that is not one
+        # symbol are left out with their times.
+        result = mock.Mock(tokens=[" ", "l", "u", "<unk>", "ɪ"], timestamps=[0.0, 0.16, 0.32, 0.4, 0.48])
+        self.assertEqual(parakeet_asr.phones(result), {"phones": "luɪ", "starts": [0.08, 0.16, 0.24]})
+
+
+class NameTest(unittest.TestCase):
+    """The name rule as it works while takecheck.NAME_FLAGS is on. The last test is the rule switched off."""
+
+    def setUp(self):
+        patcher = mock.patch.object(takecheck, "NAME_FLAGS", True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def judge(self, name: str, heard: str | None = None, **more) -> dict:
+        tokens = breeze.voice_text(NAME_LINE, NAME_BIBLE)[1]
+        blocks = {"phone": name_phones(name), "said": takecheck.picked_spellings(NAME_BIBLE), **more}
+        return takecheck.judge(timed(name_heard(name) if heard is None else heard), None, tokens, **blocks)
+
+    def test_a_take_is_held_to_the_spelling_that_was_picked_for_a_name(self):
+        # The name's phones are the ones inside the span of the word heard in its place, and its window takes in
+        # the words around it.
+        right = self.judge("eɪoʊl")
+        self.assertEqual((right["verdict"], right["reasons"], right["missed"]), ("ok", [], []))
+        self.assertEqual(right["said"], {"Eole": [["eɪoʊl", "tɛleɪoʊltə"]]})
+        self.assertEqual(self.judge("eɪɔl")["reasons"], [])
+
+        # A take that both recognizers hear an added sound in is flagged for it: a consonant before the name, a
+        # syllable after it, or a word in its place that has more sounds.
+        wrong = self.judge("jol")
+        self.assertEqual((wrong["verdict"], wrong["reasons"], wrong["missed"]), ("flagged", ["name"], ["Eole"]))
+        for name in ("eɪoʊli", "ɪtɔl"):
+            self.assertEqual(self.judge(name)["missed"], ["Eole"], name)
+        # A sound that only the phones have, or only the spelling, is not enough.
+        self.assertEqual(self.judge("jol", "Tell Aol to wait.")["missed"], [])
+        self.assertEqual(self.judge("eɪoʊl", "Tell Yol to wait.")["missed"], [])
+
+        # A name that is not held to a spelling is recorded and not judged.
+        free = self.judge("jol", said={})
+        self.assertEqual((free["reasons"], free["missed"], free["said"]), ([], [], {"Eole": [["jol", "tɛljoltə"]]}))
+
+        # Without a phone block of this version the rule has no evidence, and the entry says nothing of names.
+        for phone in (None, {**name_phones("jol"), "v": takecheck.PHONE_V + 1}, {"v": takecheck.PHONE_V, "error": "x"}):
+            got = self.judge("jol", phone=phone)
+            self.assertEqual((got["reasons"], "said" in got and bool(got["said"]), got.get("missed") or []),
+                             ([], False, []), phone)
+        # A name the recognizer heard no word for has no span to judge.
+        dropped = self.judge("jol", heard="Tell to wait.")
+        self.assertEqual((dropped["said"], dropped["missed"]), ({}, []))
+
+        # The rank counts the names a take misses, after its word errors, and skips the slot without evidence.
+        self.assertEqual((takecheck.badness(right)[2], takecheck.badness(wrong)[2]), (0, 1))
+        self.assertIsNone(takecheck.badness(self.judge("jol", phone=None))[2])
+        self.assertTrue(takecheck.better(right, wrong))
+        self.assertFalse(takecheck.better(wrong, right))
+
+    def test_a_names_span_carries_what_the_rule_reads(self):
+        # The words the voice was sent for the name, the words heard in their place, the line's words on either
+        # side, and the phones in the span, near it and in the window around it.
+        tokens = breeze.voice_text(NAME_LINE, NAME_BIBLE)[1]
+        asr = timed("Tell Aoli to wait.")
+        edits = takecheck.word_edits(asr["heard"], tokens)[0]
+        self.assertEqual(takecheck.name_spans(asr, name_phones("eɪoʊli"), tokens, edits),
+                         [{"term": "Eole", "inside": "eɪoʊli", "window": "tɛleɪoʊlitə", "near": "eɪoʊlitə",
+                           "said": "eh ole", "heard": "aoli", "before": "tell", "after": "to"}])
+        # A name at an end of the line has no word on that side.
+        last = {"speaker": "narrator", "text": "Eole"}
+        tokens = breeze.voice_text(last, NAME_BIBLE)[1]
+        asr = timed("Aol", 0.3)
+        edits = takecheck.word_edits(asr["heard"], tokens)[0]
+        span = takecheck.name_spans(asr, name_phones("eɪoʊl"), tokens, edits)[0]
+        self.assertEqual((span["before"], span["after"], span["said"]), ("", "", "eh ole"))
+
+    def test_a_saved_entry_is_judged_with_the_bibles_picked_spellings(self):
+        entry = {"key": "k", "audio": "a", "asr": timed(name_heard("jol")), "phone": name_phones("jol")}
+        got = takecheck.judged(entry, NAME_LINE, NAME_BIBLE, None)
+        self.assertEqual((got["missed"], got["phone"]), (["Eole"], entry["phone"]))
+        self.assertEqual(takecheck.picked_spellings(NAME_BIBLE), {"Eole": "Eh-ole"})
+        # A bible whose entry has no say-as holds no take to a spelling.
+        loose = {"characters": {}, "pronunciations": {"Eole": {"note": "a siren"}}}
+        self.assertEqual(takecheck.picked_spellings(loose), {})
+        self.assertEqual(takecheck.judged(entry, NAME_LINE, loose, None)["reasons"], [])
+
+    def test_a_take_that_misses_a_name_is_recorded_and_not_flagged_while_the_rule_is_off(self):
+        # With the switch off, a take's sayings and misses are still recorded, the take is not flagged for them,
+        # and the rank skips the name slot.
+        with mock.patch.object(takecheck, "NAME_FLAGS", False):
+            wrong = self.judge("jol")
+            self.assertEqual((wrong["verdict"], wrong["reasons"], wrong["missed"]), ("ok", [], ["Eole"]))
+            self.assertEqual(wrong["said"], {"Eole": [["jol", "tɛljoltə"]]})
+            self.assertIsNone(takecheck.badness(wrong)[2])
+            self.assertFalse(takecheck.better(self.judge("eɪoʊl"), wrong))
+
+    def test_a_name_that_many_takes_miss_is_a_name_finding(self):
+        def entry(missed: bool) -> dict:
+            return {"verdict": "flagged" if missed else "ok", "reasons": ["name"] if missed else [],
+                    "said": {"Eole": [["x", "x"]]}, "missed": ["Eole"] if missed else []}
+
+        self.assertEqual(takecheck.name_findings({str(i): entry(i < 4) for i in range(12)}),
+                         [{"term": "Eole", "lines": [0, 1, 2, 3], "of": 12}])
+        # Fewer than BREAKER_MIN takes, or a quarter or less of the takes that say the name, is not a finding.
+        self.assertEqual(takecheck.name_findings({str(i): entry(i < 3) for i in range(6)}), [])
+        self.assertEqual(takecheck.name_findings({str(i): entry(i < 4) for i in range(16)}), [])
+
+
+class NameRetakeTest(unittest.TestCase):
+    """A render's check before the join, on takes of NAME_LINE whose file holds the phones of the name, while
+    takecheck.NAME_FLAGS is on."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.folder = Path(self.tmp.name)
+        self.logs: list[str] = []
+        self.asked: list[tuple[str, int]] = []
+
+        def hears(files, *, engine, comfy_url, blocks=("asr", "signal")):
+            for i, f in enumerate(files):
+                name = Path(f).read_text(encoding="utf-8")
+                yield i, {**record(name_heard(name)), "phone": name_phones(name)}
+
+        for p in (mock.patch.object(takecheck, "records", hears),
+                  mock.patch.object(takecheck, "NAME_FLAGS", True),
+                  mock.patch.object(takecheck, "check_ready", lambda *a, **k: None),
+                  mock.patch.object(takecheck, "extra_blocks", lambda: {"phone"}),
+                  mock.patch.object(breeze, "choose_asr", lambda *a, **k: "parakeet")):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def takes(self, names: list[str]) -> dict:
+        saved = {}
+        for i, name in enumerate(names):
+            file = self.folder / f"l{i:04d}.wav"
+            file.write_text(name, encoding="utf-8")
+            saved[str(i)] = {"key": f"k{i}", "file": str(file), "voice": "narrator", "seed": 5, "audio": f"a{i}"}
+        return saved
+
+    def retake(self, saved: dict) -> dict:
+        def again(k: str, round_: int) -> dict:
+            self.asked.append((k, round_))
+            file = self.folder / f"l{int(k):04d}.retake.wav"
+            file.write_text("eɪoʊl", encoding="utf-8")
+            return {"key": f"k{k}", "file": str(file), "seed": 90 + round_, "audio": f"b{k}"}
+
+        return breeze.retake_flagged(self.folder, [NAME_LINE] * len(saved), NAME_BIBLE, saved, list(saved), again,
+                                     comfy_url="", log=self.logs.append, save=lambda: None)
+
+    def test_a_take_that_adds_a_sound_to_a_picked_name_is_taken_again(self):
+        # One take of six adds a sound to the name. It alone is taken again, and its new take is kept.
+        saved = self.takes(["eɪoʊl", "eɪɔl", "jol", "eɪoʊl", "eɪjoʊl", "eɪoʊl"])
+        got = self.retake(saved)
+        self.assertEqual((got["replaced"], got["names"], self.asked), ([2], [], [("2", 1)]))
+        self.assertEqual(Path(saved["2"]["file"]).read_text(encoding="utf-8"), "eɪoʊl")
+        self.assertEqual([saved[k]["audio"] for k in saved], ["a0", "a1", "b2", "a3", "a4", "a5"])
+        checked = lib.load_json(self.folder / takecheck.CHECK_FILE)["takes"]
+        self.assertEqual({k: e["verdict"] for k, e in checked.items()}, {str(i): "ok" for i in range(6)})
+        self.assertEqual(checked["2"]["phone"], name_phones("eɪoʊl"))
+
+    def test_a_name_most_takes_miss_is_reported_and_not_taken_again(self):
+        # Four of six takes add a sound to the name, so the cause is the spelling. No line is taken again, each
+        # take records that it is held, and the render gets the finding.
+        saved = self.takes(["jol", "jol", "ɪtɔl", "jol", "eɪoʊl", "eɪoʊl"])
+        got = self.retake(saved)
+        self.assertEqual((got["replaced"], self.asked), ([], []))
+        self.assertEqual(got["names"], [{"term": "Eole", "lines": [0, 1, 2, 3], "of": 6}])
+        self.assertEqual([saved[k].get("retake_held") for k in saved], [["name"]] * 4 + [None, None])
+        self.assertTrue(any("name finding" in line and "Eole" in line for line in self.logs), self.logs)
+        # A later render leaves the held takes alone.
+        self.assertEqual(breeze.flagged_before(self.folder, saved), set())
+
+    def test_a_spelling_that_comes_after_the_check_gets_the_saved_takes_judged_again(self):
+        # The chapter is checked while the name is not held to a spelling, so no take is flagged for it.
+        loose = {"characters": {}, "pronunciations": {"Eole": {"note": "a siren"}}}
+        saved = self.takes(["eɪoʊl", "jol", "eɪoʊl", "eɪoʊl", "eɪoʊl", "eɪoʊl"])
+        lines = [NAME_LINE] * len(saved)
+        results = takecheck.check_entries(saved, lines, loose, engine="parakeet", comfy_url="", log=lambda *_: None)
+        takecheck.save_entries(self.folder, results, "parakeet", saved, lines, loose)
+        data = lib.load_json(self.folder / takecheck.CHECK_FILE)
+        self.assertEqual((data["rules"], data["names"]), (takecheck.JUDGE_V, {}))
+        self.assertFalse(takecheck.stale(data, loose))
+        self.assertEqual(breeze.flagged_before(self.folder, saved, lines, loose), set())
+
+        # The name gets a spelling. The file was judged without it, so its verdicts are judged again from the
+        # evidence, and a render then takes the line that adds a sound to the name again.
+        self.assertTrue(takecheck.stale(data, NAME_BIBLE))
+        self.assertFalse(takecheck.stale(data))
+        self.assertEqual(breeze.flagged_before(self.folder, saved, lines, NAME_BIBLE), {"1"})
+        got = self.retake({k: saved[k] for k in ("1",)} | saved)
+        self.assertEqual((got["replaced"], self.asked), ([1], [("1", 1)]))
+
+        # A file that still mixes verdicts from before the spelling keeps saying so. A whole check doesn't.
+        partial = takecheck.check_entries({"1": saved["1"]}, lines, NAME_BIBLE, engine="parakeet", comfy_url="",
+                                          log=lambda *_: None)
+        (self.folder / takecheck.CHECK_FILE).write_text(json.dumps({**data, "takes": data["takes"]}), encoding="utf-8")
+        takecheck.save_entries(self.folder, partial, "parakeet", saved, lines, NAME_BIBLE)
+        self.assertTrue(takecheck.stale(lib.load_json(self.folder / takecheck.CHECK_FILE), NAME_BIBLE))
 
 
 if __name__ == "__main__":

@@ -148,7 +148,7 @@ on 127.0.0.1, so query it with `NOMAD_ADDR=http://containers.goblin-truck.ts.net
 
 Phase 2 of the take quality plan (`docs/take-quality/phase-2.md`) adds four sherpa-onnx models beside Parakeet on
 each breeze node. AJ approved the list on 2026-11-12, and that evening the four folders were copied to both nodes
-from the copies below, every file checked against these hashes, and each node's take check loaded all three blocks. The code reads a folder only
+from the copies below, every file checked against these hashes, and each node's take check loaded all three blocks of that day. The code reads a folder only
 when it holds all its files and its model loads. A node without them gathers Parakeet's two blocks as before, and the
 rules that need the other blocks don't fire there. The tail rule and the cut of a tail need only those two blocks,
 so they work without the models.
@@ -170,9 +170,10 @@ so they work without the models.
 * A copy of each folder, with the hashes above, is in `D:\fish.wt\scratch\models` on the laptop, and the files the
   spike used are in `/Users/aj/serial-audio/scratch/spike/models` on the Mac. Installing them is a copy and a hash
   check.
-* Nothing reads ZIPA until package P4.
+* ZIPA gives the `phone` block since package P4 of 2026-11-13. The take check's name rule, the screening of a
+  say-as option and the Names tab read it. On the laptop it decoded 826 takes, 7,930 s of audio, in 137 s.
 * Once a node has the folders, the first render or check of each chapter there hears the chapter's saved takes for
-  the three new blocks, at about 0.5 s a take on the laptop's CPU, or about 2 minutes for a chapter of 220 takes.
+  the new blocks, at about 0.5 s a take on the laptop's CPU, or about 2 minutes for a chapter of 220 takes.
   aj-legion5 hard-reset three times on 2026-11-12, and two of those came while a scratch gathering of these blocks
   ran on its CPU. With the folders on the Mac first, the chapters the Mac checks get the blocks there, and the
   laptop hears only the rest once it has them.

@@ -488,7 +488,8 @@ def cmd_say_options(args) -> int:
             options_pass(args.slug, args.term, backend=args.backend, model=args.model, effort=args.effort,
                          on_limit=args.on_limit)
         if not args.dry_run:
-            options = render_options(args.slug, args.term, comfy_url=args.comfy_url, missing=args.add is not None)
+            options = render_options(args.slug, args.term, comfy_url=args.comfy_url, missing=args.add is not None,
+                                     again=args.add)
             said = [c for c in options["candidates"] if c.get("clip") and c["clip"] != had.get(c.get("say"))]
             print(f"{args.term}: {len(said)} of {len(options['candidates'])} options said by {options.get('voice')}")
     except (ValueError, FileNotFoundError) as e:

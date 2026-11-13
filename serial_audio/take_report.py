@@ -25,7 +25,8 @@ def take_row(chapter: int, k: str, take: dict, entry: dict, line: dict, said: st
     line: its script line.
     said: the text the voice was sent.
     baseline: the voice's baseline for the chapter, or None.
-    Returns the record. A measure the take doesn't have evidence for is None. drift is how many median absolute
+    Returns the record. A measure the take doesn't have evidence for is None. names_said and missed are the
+    names the take says, in phones, and the ones it says with an added sound. drift is how many median absolute
     deviations the take's similarity lies from its voice's median in the chapter, below being negative, with the
     deviation at least DRIFT_MAD_FLOOR as the drift rule takes it.
     """
@@ -39,8 +40,9 @@ def take_row(chapter: int, k: str, take: dict, entry: dict, line: dict, said: st
            "errors": entry["sub"] + entry["del"] + entry["ins"], "sub": entry["sub"], "del": entry["del"],
            "ins": entry["ins"], "names": entry["names"], "cuts": entry["repairs"]["cuts"],
            "heard2": ((entry.get("asr2") or {}).get("heard") if isinstance(entry.get("asr2"), dict) else None)}
-    for name in ("errors2", "tail", "similarity"):
+    for name in ("errors2", "tail", "similarity", "missed"):
         row[name] = entry.get(name)
+    row["names_said"] = entry.get("said")
     middle = (baseline or {}).get("similarity")
     row["drift"] = (round((row["similarity"] - middle[0]) / max(middle[1], DRIFT_MAD_FLOOR), 1)
                     if isinstance(row["similarity"], (int, float)) and isinstance(middle, list) and len(middle) == 2

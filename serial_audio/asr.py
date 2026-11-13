@@ -24,9 +24,8 @@ ENGINES = ("qwen3", "parakeet")
 # the evidence blocks Parakeet's child gathers beside its own, with the model folder and the files each needs
 EXTRA_MODELS = {"vad": ("VAD_MODEL", VAD_FILES, "SERIAL_AUDIO_VAD_MODEL"),
                 "speaker": ("SPEAKER_MODEL", SPEAKER_FILES, "SERIAL_AUDIO_SPEAKER_MODEL"),
-                "asr2": ("ASR2_MODEL", ASR2_FILES, "SERIAL_AUDIO_ASR2_MODEL")}
-# models whose folders model_problems checks, though no block reads them
-LATER_MODELS = {"phone": ("PHONE_MODEL", PHONE_FILES, "SERIAL_AUDIO_PHONE_MODEL")}
+                "asr2": ("ASR2_MODEL", ASR2_FILES, "SERIAL_AUDIO_ASR2_MODEL"),
+                "phone": ("PHONE_MODEL", PHONE_FILES, "SERIAL_AUDIO_PHONE_MODEL")}
 # what loading the optional models gave in this process, by the folders it loaded them from
 _LOADS: dict[tuple, tuple[set[str], dict[str, str]]] = {}
 QWEN3_MODEL = "qwen3_asr_1.7b_bf16.safetensors"
@@ -102,7 +101,7 @@ def _folder_exists(block: str) -> bool:
 def model_problems() -> dict[str, str]:
     """The take check's optional model folders that exist and lack a file, or whose model didn't load.
 
-    Returns {block: problem}, for the blocks of EXTRA_MODELS and LATER_MODELS, with a problem that names the
+    Returns {block: problem}, for the blocks of EXTRA_MODELS, with a problem that names the
     missing files or the load error, and the variable that moves the folder. A folder that doesn't exist is not a
     problem, and a load is reported only after extra_blocks tried it in this process. Never raises.
     """
@@ -115,7 +114,7 @@ def model_problems() -> dict[str, str]:
 
 def _file_problems() -> dict[str, str]:
     out = {}
-    for block, (attr, names, variable) in {**EXTRA_MODELS, **LATER_MODELS}.items():
+    for block, (attr, names, variable) in EXTRA_MODELS.items():
         try:
             folder = getattr(machine, attr)
             if folder.is_dir():
