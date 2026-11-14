@@ -40,6 +40,8 @@ This is an addendum to the take quality plan. AJ asked for it on 2026-11-13: whe
 
 * List the takes in the library that are flagged and have used their rounds, by reason and by chapter. `after2.py` in `D:\fish.wt\scratch\n1` reads most of what this needs.
 * The count decides the size of the rest. A handful in a book needs a plain list. Hundreds would mean a rule is wrong, and the fix is the rule.
+* Counted on 2026-11-14 at 08:20 from the check files on containers, 77 chapters: 24 flagged takes in 18 chapters. A render would take 11 of them again, and those were queued that morning. The other 13 have been through their rounds: 1 for a name, line 119 of chapter 75, and 12 for other reasons, which are `swing` in 5, `level` and `short` in 2 each, and `fading`, `drift`, `dropped` and `garbled` in 1 each. 11 of the 13 are in chapters 56 to 80, ahead of AJ, who was on chapter 55. So it is a handful, and a plain list is enough. The count read `verdict` and `reasons` of each entry and compared with the `backlog` list. It did not use `after2.py`.
+* After that morning's backlog renders the book has 16 flagged takes. Two are flagged for a name after all five rounds: line 46 of chapter 22 and line 119 of chapter 75.
 
 ### E1: keep the takes that were tried
 

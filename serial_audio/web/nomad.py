@@ -16,6 +16,7 @@ takes the mirror lacks still needs the node that made them.
 """
 from __future__ import annotations
 
+import hashlib
 import heapq
 import hmac
 import json
@@ -104,6 +105,10 @@ LLM_SLOTS = 3
 NODE_POLL = 15.0
 JOB_POLL = 5.0
 END_GRACE = 30.0
+BUNDLE_BUILDS = 3
+TAKE_BACKS = 2
+EVICT = True
+EVICT_SECONDS = 20.0
 STOP_GRACE = 90.0
 TICK_SECONDS = 2.0
 TAIL_BYTES = 6000
@@ -261,6 +266,31 @@ def _chapters(job: dict) -> set[int]:
     return set((job.get("meta") or {}).get("chapters") or [])
 
 
+def _begun(n: dict) -> bool:
+    """Whether a worker has run any of a job's stage: the app built the stage's bundle for a worker, and a worker
+    sent back a part of the stage's log.
+
+    n: the job's nomad record.
+    """
+    return bool(n.get("contact")) and bool(n.get("log_got"))
+
+
+def _key_sha(key) -> str:
+    """The hash a job's record keeps of a key that is no longer its key. Never raises."""
+    return hashlib.sha256(str(key).encode("utf-8", "surrogateescape")).hexdigest()
+
+
+def _unstarted(job: dict) -> bool:
+    """Whether a running job was handed to a worker that never ran it, so it can be queued again.
+
+    job: the job, with its nomad record.
+    Returns False for a job that was asked to stop, and for one that was queued again TAKE_BACKS times already.
+    """
+    n = job["nomad"]
+    return (bool(n.get("follows")) and not _begun(n) and not n.get("cancel")
+            and job.get("taken_back", 0) < TAKE_BACKS)
+
+
 def _share_chapter(a: set[int], b: set[int]) -> bool:
     """Whether two jobs with these chapters may work on one chapter. A job that names none may work on any."""
     return not a or not b or bool(a & b)
@@ -416,6 +446,7 @@ class NomadJobManager(JobManager):
         self._mirror_cache: dict[tuple[str, int], tuple[tuple, bool]] = {}
         self._work: dict[str, tuple[float, int, int]] = {}
         self._work_marks = 0
+        self._applied: dict[str, int] = {}
         self._words_cache: dict[tuple[str, int], tuple[float, int]] = {}
         self._outlook: dict[str, dict] = {}
         self._outlook_at = 0.0
@@ -584,6 +615,11 @@ class NomadJobManager(JobManager):
                     job["stopping"] = True
                     self._append_log(job, "\n[web] stop requested; the worker stops within a few seconds\n")
                     self._skip_batch(job, "an earlier job in the batch was stopped")
+                elif n.get("evict") and not n.get("by_user"):
+                    n["by_user"] = True
+                    self._append_log(job, "\n[web] stop requested while the job was pausing for another, so it is "
+                                          "not queued again\n")
+                    self._skip_batch(job, "an earlier job in the batch was stopped")
                 self._save()
                 return job
         if not local:
@@ -691,6 +727,7 @@ class NomadJobManager(JobManager):
         for item in snap["jobs"]:
             if item.get("nomad"):
                 item["nomad"] = {k: v for k, v in item["nomad"].items() if k not in ("key", "marks")}
+            item.pop("gave_way", None)
             if item["status"] not in ("queued", "running"):
                 continue
             item.pop("estimate", None)
@@ -733,7 +770,6 @@ class NomadJobManager(JobManager):
         for jid in dispatch:
             self._dispatch(jid)
         self._poll_work(now)
-        # a pass over a long queue holds the lock for a while, so the passes take a twentieth of the time at most
         if now - self._outlook_at >= OUTLOOK_REST * self._outlook_cost:
             with self.lock:
                 began = time.time()
@@ -775,11 +811,17 @@ class NomadJobManager(JobManager):
             with self.lock:
                 self._work[jid] = (time.time() if marked == self._work_marks else 0.0, needed, unheard)
 
-    def _stale_work(self, slug: str | None) -> None:
-        """Marks the counts of a serial's queued renders for counting again. They stand until then."""
+    def _stale_work(self, slug: str | None, chapters: set[int] | None = None) -> None:
+        """Marks the counts of a serial's queued renders for counting again. They stand until then.
+
+        slug: the serial.
+        chapters: the chapters whose renders are marked, or None for every render of the serial.
+        A count that _poll_work is reading at that moment is marked too, whatever its serial and chapter.
+        """
         self._work_marks += 1
         for jid, (_, needed, unheard) in list(self._work.items()):
-            if (self.jobs.get(jid) or {}).get("slug") == slug:
+            other = self.jobs.get(jid) or {}
+            if other.get("slug") == slug and (chapters is None or chapters & _chapters(other)):
                 self._work[jid] = (0.0, needed, unheard)
 
     def _poll_nodes(self) -> None:
@@ -832,7 +874,7 @@ class NomadJobManager(JobManager):
         n["polled"] = seen["polled"]
         err = seen.get("error")
         if err is not None:
-            if err.status == 404 and n.get("follows") and not n.get("contact"):
+            if err.status == 404 and _unstarted(job):
                 self._take_back(job, f"Nomad no longer knows the task that was handed this job, {n['dispatched']}")
             elif err.status == 404:
                 self._finish(job, "lost", f"Nomad no longer knows job {n['dispatched']}")
@@ -851,8 +893,8 @@ class NomadJobManager(JobManager):
         n["wait"] = None
         if status not in ("complete", "failed", "lost"):
             return
-        if n.get("follows") and not n.get("contact"):
-            self._take_back(job, f"the task on {n['node']} that was handed this job ended before it took it")
+        if _unstarted(job):
+            self._take_back(job, f"the task on {n['node']} that was handed this job ended before it ran it")
             return
         if not n.get("ended_seen"):
             n["ended_seen"] = now
@@ -866,13 +908,18 @@ class NomadJobManager(JobManager):
         tail = seen.get("tail") or ""
         if tail.strip():
             self._append_log(job, "\n[web] the end of the task's stderr in Nomad:\n" + tail.rstrip() + "\n")
+        if n.get("evict") and not n.get("by_user"):
+            self._queue_evicted(job, answered=False)
+            return
         self._finish(job, "lost" if status == "lost" else "failed",
                      f"the Nomad allocation on {n['node']} ended {status} without a result" + (f": {last}" if last else ""))
 
     def _check_stop(self, job: dict, now: float) -> None:
         n = job["nomad"]
         if n.get("cancel") and now - n.get("stop_at", now) > STOP_GRACE:
-            self._finish(job, "stopped", f"the worker did not confirm the stop; check Nomad job {n.get('dispatched')}")
+            paused = n.get("evict") and not n.get("by_user")
+            why = "the worker did not confirm the stop" + (" that paused it for another job" if paused else "")
+            self._finish(job, "stopped", f"{why}; check Nomad job {n.get('dispatched')}")
 
     def _finish(self, job: dict, status: str, note: str, code: int | None = None) -> None:
         job.update({"status": status, "finished": now_iso(), "note": note, "exit_code": code})
@@ -971,18 +1018,20 @@ class NomadJobManager(JobManager):
         return True
 
     def _take_back(self, job: dict, why: str) -> None:
-        """Queues a job again that was handed to a worker which never fetched its bundle.
+        """Queues a job again that was handed to a worker which never ran it.
 
         job: the job, running and handed to a worker by _handed.
         why: what happened to the worker's task, for the job's log.
+        Returns nothing. The job's next worker gets another key, so that worker's key no longer fits the job.
         """
         n = job["nomad"]
         if n["stage"] == 0 and not n.get("reports"):
             job.pop("nomad")
+            job["started"] = None
         else:
-            n.update({"dispatched": None, "alloc": None, "follows": None, "dispatching": False,
-                      "client_status": None, "ended_seen": None, "wait": None})
-        job.update({"status": "queued", "note": None})
+            n.update({"dispatched": None, "alloc": None, "follows": None, "dispatching": False, "contact": None,
+                      "client_status": None, "ended_seen": None, "wait": None, "key": secrets.token_urlsafe(24)})
+        job.update({"status": "queued", "note": None, "taken_back": job.get("taken_back", 0) + 1})
         self._append_log(job, f"[web] {why}, so the job is queued again\n")
         self._save()
 
@@ -1090,10 +1139,19 @@ class NomadJobManager(JobManager):
         of them, gets that node. Any other job goes to the ready node where its estimated finish is earliest,
         counting the node's running job and the queued jobs already waiting for it, and waits for a busy node when
         that beats every free one by WAIT_MARGIN. A job that waits adds its estimate to the node's timeline for
-        the rest of the pass.
+        the rest of the pass. For a job that is not backlog work, a node counts as free after EVICT_SECONDS when
+        _evictable allows its running job and that job has more than EVICT_SECONDS and WAIT_MARGIN left. When such
+        a node is the choice, and no busy node that frees by itself ends the job within WAIT_MARGIN of it, that
+        running job is asked to stop and this one waits for its node. A job asks one running job to stop.
         """
-        busy = {j["nomad"].get("target") or j["nomad"].get("node") for j in running
-                if j.get("nomad") and self.lane(j) in GPU_CLASSES}
+        on = {j["nomad"].get("target") or j["nomad"].get("node"): j for j in running
+              if j.get("nomad") and self.lane(j) in GPU_CLASSES}
+        busy = set(on)
+        asked = next((j for j in running if job.get("id") and (j.get("nomad") or {}).get("evict") == job["id"]), None)
+        stopping = (asked["nomad"].get("target") or asked["nomad"].get("node")) if asked else None
+        gives = {} if job.get("backlog") or asked or job.get("asked_stop") else {
+            name: j for name, j in on.items()
+            if self._evictable(j) and self._remaining(j) > EVICT_SECONDS + WAIT_MARGIN}
         holder, required = self.holder(job)
         if required and holder:
             w = next((w for w in self.workers if w["name"] == holder), None)
@@ -1104,6 +1162,10 @@ class NomadJobManager(JobManager):
                 return None, None, f"waiting for {need}: {_why_not(w)}"
             if holder in busy:
                 self._plan[holder] = self._plan.get(holder, 0.0) + self._duration(job, holder, holder)
+                if holder in gives:
+                    self._evict(gives[holder], job)
+                if holder in gives or holder == stopping:
+                    return None, None, f"waiting for {on[holder]['title']} to stop on {holder}, which is backlog work"
                 return None, None, f"waiting for {need} and is running another GPU job"
             if lane not in w["classes"]:
                 return None, None, f"{need}, does not offer {lane} jobs"
@@ -1114,7 +1176,13 @@ class NomadJobManager(JobManager):
         ready = [w for w in offering if w["ready"]]
         if not ready:
             return None, None, f"no {lane} node is ready: " + ", ".join(_why_not(w) for w in offering)
+        if stopping in {w["name"] for w in ready}:
+            self._plan[stopping] = self._plan.get(stopping, 0.0) + self._duration(job, stopping, holder)
+            return None, None, f"waiting for {asked['title']} to stop on {stopping}, which is backlog work"
         free = {w["name"]: self._free_at(w["name"], running) for w in ready}
+        for name in gives:
+            if name in free:
+                free[name] = min(free[name], EVICT_SECONDS + self._plan.get(name, 0.0))
         est = {w["name"]: free[w["name"]] + self._duration(job, w["name"], holder) for w in ready}
         order = [w["name"] for w in sorted(ready, key=lambda w: (est[w["name"]], w.get("gpu") != "nvidia", w["name"]))]
         best = order[0]
@@ -1123,7 +1191,16 @@ class NomadJobManager(JobManager):
         idle = [name for name in order if name not in busy]
         if idle and est[best] + WAIT_MARGIN > est[idle[0]]:
             return idle[0], lane, None
+        if best in gives:
+            own = next((name for name in order if name in busy and name not in gives), None)
+            if own is not None and est[own] < est[best] + WAIT_MARGIN:
+                best = own
+                if idle and est[best] + WAIT_MARGIN > est[idle[0]]:
+                    return idle[0], lane, None
         self._plan[best] = self._plan.get(best, 0.0) + self._duration(job, best, holder)
+        if best in gives:
+            self._evict(gives[best], job)
+            return None, None, f"waiting for {on[best]['title']} to stop on {best}, which is backlog work"
         if idle:
             return None, None, (f"waiting for {best}, about {_mins(est[best])} min, instead of about "
                                 f"{_mins(est[idle[0]])} min on {idle[0]} now")
@@ -1133,10 +1210,58 @@ class NomadJobManager(JobManager):
 
     def _free_at(self, node: str, running: list[dict]) -> float:
         """Seconds until node can take a job: its running GPU job's remaining estimate, plus the queued jobs that
-        chose to wait for it earlier in this pass."""
-        mine = [self._remaining(j) for j in running if j.get("nomad") and self.lane(j) in GPU_CLASSES
+        chose to wait for it earlier in this pass. A job that was asked to stop counts EVICT_SECONDS at most."""
+        mine = [min(self._remaining(j), EVICT_SECONDS) if j["nomad"].get("cancel") else self._remaining(j)
+                for j in running if j.get("nomad") and self.lane(j) in GPU_CLASSES
                 and (j["nomad"].get("target") or j["nomad"].get("node")) == node]
         return max(mine, default=0.0) + self._plan.get(node, 0.0)
+
+    def _evictable(self, job: dict) -> bool:
+        """Whether a running job gives its node to a job that is not backlog work.
+
+        job: a running job.
+        Returns True for a backlog Breeze render whose bundle a worker fetched, that has not started its join,
+        that nobody asked to stop and that has not given way before. False while EVICT is off.
+        """
+        n = job.get("nomad") or {}
+        return (EVICT and bool(job.get("backlog")) and self._is_breeze(job) and bool(n.get("contact"))
+                and not (job.get("meta") or {}).get("decode_only") and "join" not in (n.get("marks") or {})
+                and not n.get("cancel") and not job.get("evicted"))
+
+    def _evict(self, job: dict, other: dict) -> None:
+        """Asks the worker of a backlog render to stop, so its node goes to a job that is not backlog work.
+
+        job: the render, which _evictable allows.
+        other: the job that gets the node.
+        Returns nothing. The render is queued again when its worker confirms the stop, or when its task ends
+        without a result. It ends as stopped when the worker does not confirm within STOP_GRACE.
+        """
+        job["nomad"].update({"cancel": True, "stop_at": time.time(), "evict": other.get("id") or True})
+        job["stopping"] = True
+        other["asked_stop"] = job["id"]
+        self._append_log(job, f"\n[web] paused for {other.get('title')}: backlog work gives its node to a job "
+                              f"that is not; the worker stops within a few seconds\n")
+        self._save()
+
+    def _queue_evicted(self, job: dict, answered: bool = True) -> None:
+        """Queues a backlog render again that was asked to stop for another job.
+
+        job: the render.
+        answered: whether its worker sent the stopped stage's result, which was just applied.
+        Returns nothing. The render keeps the takes the app has, and it gives way once. A repeated upload of
+        that result gets the report the first one got.
+        """
+        n = job.pop("nomad")
+        other = self.jobs.get(n["evict"]) if isinstance(n.get("evict"), str) else None
+        job.pop("stopping", None)
+        job.update({"status": "queued", "started": None, "exit_code": None, "evicted": True,
+                    "gave_way": {"key_sha": _key_sha(n.get("key")),
+                                 "report": (n.get("reports") or {}).get(str(n.get("stage")))},
+                    "note": f"paused for {other['title'] if other else 'another job'} and queued again"})
+        self._takes_cache.clear()
+        self._append_log(job, f"\n[web] {job['note']}, " + ("with the takes it made\n" if answered else
+                                                            "after its task ended without a result\n"))
+        self._save()
 
     def _remaining(self, job: dict, count: bool = True) -> float:
         """Seconds a running job is estimated to keep its node.
@@ -1390,7 +1515,9 @@ class NomadJobManager(JobManager):
         are not counted yet, or it waits for such a job. A node whose running job has no end in sight takes no
         queued job. Follows the scheduler's rules in outline: one GPU job a node, LLM_SLOTS Claude jobs, a job
         after the running and the earlier queued jobs it conflicts with, backlog work as backlog_wait holds it,
-        and a GPU job on the node where it ends first. Starts no job and counts no take.
+        a GPU job on the node where it ends first, and a backlog render that gives its node to a job that is not
+        backlog work and goes on when every such job has ended. It does not start or stop a job, and it does not
+        count a take.
         """
         running = [j for j in self.jobs.values() if j["status"] == "running"]
         queued = sorted((j for j in self.jobs.values() if j["status"] == "queued"), key=start_order)
@@ -1398,6 +1525,9 @@ class NomadJobManager(JobManager):
         free: dict[str, float] = {}
         # the GPU nodes whose running job has no end in sight
         gone: set[str] = set()
+        soft: dict[str, dict] = {}
+        paused: list[tuple[dict, float]] = []
+        last = 0.0
         slots: list[float] = []
         ends: dict[str, float | None] = {}
         out: dict[str, dict] = {}
@@ -1419,11 +1549,21 @@ class NomadJobManager(JobManager):
                     if name in ready and name not in gone and st["class"] in ready[name]["classes"]}
             if not cost:
                 return None
-            best = min(cost, key=lambda name: (max(t, free.get(name, 0.0)) + cost[name],
-                                               ready[name].get("gpu") != "nvidia", name))
-            start = max(t, free.get(best, 0.0))
-            free[best] = start + cost[best]
-            return start, free[best], best
+            def at(name: str) -> float:
+                wait = max(t, free.get(name, 0.0))
+                return min(wait, t + EVICT_SECONDS) if name in soft and not job.get("backlog") else wait
+
+            best = min(cost, key=lambda name: (at(name) + cost[name], ready[name].get("gpu") != "nvidia", name))
+            start = at(best)
+            end = start + cost[best]
+            if start < max(t, free.get(best, 0.0)):
+                rest = max(0.0, free[best] - t)
+                paused.append((soft[best], rest))
+                # a job that waits for the render gets a time before the render's own is known
+                ends[soft[best]["id"]] = out[soft[best]["id"]]["end_in"] = end + EVICT_SECONDS + rest
+            soft.pop(best, None)
+            free[best] = end
+            return start, end, best
 
         def run(job: dict, stages: list[dict], t: float | None) -> dict:
             first = on = None
@@ -1444,6 +1584,8 @@ class NomadJobManager(JobManager):
             n = job.get("nomad")
             left = self._remaining(job, count=False) if n else LOCAL_SECONDS
             t = left if left < 86400.0 else None
+            if n and n.get("cancel"):
+                t = EVICT_SECONDS if t is None else min(t, EVICT_SECONDS)
             if n:
                 st, node = n["stages"][n["stage"]], n.get("target") or n.get("node")
                 if st["class"] == "llm":
@@ -1452,6 +1594,8 @@ class NomadJobManager(JobManager):
                     gone.add(node)
                 elif node:
                     free[node] = max(free.get(node, 0.0), t)
+                    if self._evictable(job) and t > EVICT_SECONDS + WAIT_MARGIN:
+                        soft[node] = job
             ends[job["id"]] = run(job, n["stages"][n["stage"] + 1:] if n else [], t)["end"]
             out[job["id"]] = {"end_in": ends[job["id"]], "on": (n or {}).get("node")}
 
@@ -1478,7 +1622,17 @@ class NomadJobManager(JobManager):
             ends[job["id"]] = got["end"]
             out[job["id"]] = {"estimate": got["estimate"] or None, "start_in": got["start"], "end_in": got["end"],
                               "on": got["on"]}
+            if not job.get("backlog") and got["end"] is not None:
+                last = max(last, got["end"])
             done.append(job)
+
+        # A render that gave way goes on when the jobs that are not backlog work have ended
+        for gave, rest in paused:
+            names = [name for name, w in ready.items() if name not in gone and "breeze" in w["classes"]]
+            if names:
+                node = min(names, key=lambda name: free.get(name, 0.0))
+                free[node] = max(free.get(node, 0.0), last) + EVICT_SECONDS + rest
+                out[gave["id"]]["end_in"] = free[node]
         return out
 
     def _takes_needed(self, job: dict, lines: int) -> int:
@@ -1682,7 +1836,9 @@ class NomadJobManager(JobManager):
 
         jid, key: the job and the key the app gave it.
         node: the name the worker reports for its node, recorded as where the job runs.
-        Returns the zip bytes. Raises WorkerError when the key is wrong or the job no longer wants to run.
+        Returns the zip bytes, built while no result changed the serial. Raises WorkerError when the key is wrong
+        or the job no longer wants to run, and with status 503 when a result landed during each of BUNDLE_BUILDS
+        builds.
         """
         # Check
         with self.lock:
@@ -1700,7 +1856,16 @@ class NomadJobManager(JobManager):
 
         # Build outside the lock, then check again
         fetched = now_iso()
-        data = exchange.build_bundle(slug, info)
+        for _ in range(BUNDLE_BUILDS):
+            with self.lock:
+                seen = self._applied.get(slug, 0)
+            data = exchange.build_bundle(slug, info)
+            with self.lock:
+                # a result applied during the build leaves the bundle with files of two states of the serial
+                if self._applied.get(slug, 0) == seen:
+                    break
+        else:
+            raise WorkerError(503, "results changed the serial during each build of the bundle, so fetch it again")
         with self.lock:
             job = self._worker_job(jid, key, str(info["stage"]))
             n = job["nomad"]
@@ -1804,6 +1969,10 @@ class NomadJobManager(JobManager):
         if job is None:
             raise WorkerError(404, f"no job {jid}")
         n = job.get("nomad")
+        last = job.get("gave_way") or {}
+        if last.get("report") is not None and key and hmac.compare_digest(str(last.get("key_sha") or ""),
+                                                                          _key_sha(key)):
+            return job, last["report"]
         if not n or not _key_ok(n, key):
             raise WorkerError(403, "wrong key for this job")
         done = (n.get("reports") or {}).get(str(stage if stage not in (None, "") else n["stage"]))
@@ -1845,9 +2014,12 @@ class NomadJobManager(JobManager):
             st = n["stages"][n["stage"]]
             task = n.get("dispatched")
             code = info.get("exit_code")
-            cancelled = bool(info.get("cancelled")) or bool(n.get("cancel"))
+            paused = bool(n.get("evict")) and not n.get("by_user")
+            # a render that ends by itself while it is asked to give way has finished
+            cancelled = bool(info.get("cancelled")) or (bool(n.get("cancel")) and not paused)
             success = code == 0 and not cancelled
             keep = success or (st["class"] == "llm" and not cancelled)
+            self._applied[job["slug"]] = self._applied.get(job["slug"], 0) + 1
             try:
                 report = exchange.apply_result(job["slug"], info, archive, success=keep,
                                                conflicts_dir=self.state_dir / "conflicts" / jid,
@@ -1859,14 +2031,15 @@ class NomadJobManager(JobManager):
             node = info.get("node") or n.get("node")
             if success and not late:
                 self._record_timing(job, node, time.time())
-            if job["kind"] not in BACKLOG_BESIDE:
-                self._stale_work(job.get("slug"))
+            self._stale_work(job.get("slug"), _chapters(job) if job["kind"] in BACKLOG_BESIDE else None)
             self._record_placement(job, node, report, success)
             node = node or "the node"
 
             # Finish the stage
             if late:
                 self._save()
+            elif cancelled and paused:
+                self._queue_evicted(job)
             elif cancelled:
                 self._finish(job, "stopped", "stopped from the web app", code)
             elif not success:

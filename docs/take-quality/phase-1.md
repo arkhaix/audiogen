@@ -50,13 +50,44 @@ Everything in tracks A and D reads what this package stores.
 
 ## F3: a backlog job gives way to a priority job
 
-Not started. AJ asked for it on 2026-11-13: "jobs should be pause-able and evictable. if a priority job needs a worker that is busy with a backlog job, then the backlog job should be paused and returned to the queue so that the priority job can run without waiting".
+Built on 2026-11-14 for the cluster, and deployed that day at 12:11 on AJ's word. Its first version had an Opus and a Codex review, and its second an Opus review. What they found is fixed. The third version went out while its Opus review was still running. That review found two medium bugs, and a fourth version with their fixes was deployed at 12:19. Nobody has reviewed the fourth version. The 59 deployed files match the tree by hash. No backlog render has given way on the real cluster as of 12:25, so the rule has run only in the tests.
+
+The two bugs of the third version, which was live for eight minutes while no backlog work ran:
+
+* `_evict()` kept the id of the render it asked in `asked` on the waiting job. `jobs.py` already has a field of that name, the time a render was asked for again, and reads it as a time. The mark is `asked_stop` now.
+* With three nodes, a job that chose to wait for a busy node that frees by itself did not look at the idle nodes again, so it could wait where an idle node ended it within `WAIT_MARGIN`. AJ asked for it on 2026-11-13: "jobs should be pause-able and evictable. if a priority job needs a worker that is busy with a backlog job, then the backlog job should be paused and returned to the queue so that the priority job can run without waiting".
+
+What was built, in `serial_audio/web/nomad.py` (`DECISIONS.md`, "A backlog render gives its node to a job that is not backlog work"):
+
+* `_pick_node()` counts a node as free after `EVICT_SECONDS`, 20 s, for a job that is not backlog work, when the node's running job is one that `_evictable()` allows and has more than `EVICT_SECONDS` and `WAIT_MARGIN` left, which is 140 s. When that node is where the job ends first, `_evict()` asks the render's worker to stop and the job waits with "waiting for Render · ch N to stop on the node, which is backlog work". Nothing is stopped when a free node, or a busy node that frees by itself, ends the job within `WAIT_MARGIN`, 120 s, of that.
+* A job that has to run on the node that holds its files asks the render on that node.
+* A job asks one render, which `asked_stop` on its record keeps, and waits for that render's node, also when another node frees first. While the job runs no backlog work starts, so one node stands idle either way, and a stop that is not used loses the render's check for nothing.
+* `_free_at()` counts the node of any job that was asked to stop as free within `EVICT_SECONDS`, also after a stop that AJ asked for.
+* `_evictable()` allows a backlog Breeze render whose bundle a worker has fetched, before its join starts. A join, a take check, a cast, a `say-options` job and a render that only joins are left to finish, because a stop loses their work. A stop during a render's check loses the check, which the next run does again.
+* When the worker confirms the stop, `_queue_evicted()` puts the render back in the queue as backlog work, as it was before it started, with the note "paused for Render · ch N and queued again". It keeps its takes (the measurement below).
+* A render that gave way once has `evicted` on its record and runs to its end the next time.
+* A stop that AJ asks for while a render pauses is his: the render ends as stopped and is not queued again. The job that waits for its node still gets that node.
+* A render that ends by itself before the stop reaches it is done. One whose task ends without a result is queued again. A second upload of a paused render's result gets the report the first one got, from `gave_way` on the job's record.
+* `_forecast()` follows the rule in outline: the job starts on the node after `EVICT_SECONDS`, and the render goes on when the jobs that are not backlog work have ended.
+* `nomad.EVICT` switches all of it off.
+
+Known and left: for the first seconds of a paused render's next run, its progress reads the last line of the run before, because both runs write one log.
+
+The reviews: Opus found that a stop by AJ during a pause cut the job's link to the render, so the job asked a second one. Codex found that the requeue refused a repeated upload of the result, and that the forecast put two jobs on one node at once. Both also had low points, and all but the one above are fixed. A third reviewer, astra, stopped at the Codex usage limit without a report. The Opus review of the second version found three more, none of which loses data: a render was asked to stop whatever time it had left, a render that was asked was wasted when its job then started on another node, and one job could ask two renders. The third version has the three rules above for them.
+
+Not built: the one-machine executor still lets a running backlog job finish. Nobody runs that executor on a library since 2026-11-07.
+
+Tests: `tests/test_kept.py` has the rule in eleven tests of `HandNextTest`, and each of its 22 parts has a test that fails without it. The 341 unit tests pass. `tests/e2e_fake_nomad.py` has a second fake node, which Nomad lists once a scenario switches it on, and a scenario on Windows where two backlog renders hold both nodes and a third job gets one of them paused. It passed on 2026-11-14 with 72 checks. Its renders are stand-in commands, so it shows the order of the jobs and not the takes.
+
+The spec, as it was written before the build:
 
 * Today a running backlog job is left to finish, by F2's third sentence and by the entry in `DECISIONS.md`. This package reverses that for the case AJ names. A priority job is any job that is not backlog work, until he says otherwise.
 * When `_pick_node()` in `serial_audio/web/nomad.py` would make a priority job wait for a node that runs backlog work, stop that backlog job, put it back in the queue as backlog work, and give the node to the priority job. With backlog work on both nodes, pick the node where the priority job ends soonest. Don't evict when the priority job can start at once on a free node that ends it as soon.
 * A stopped job already keeps what it made. A worker that is told to stop sends back its resumable files, such as the takes list of a Breeze render (`exchange.RESUMABLE`), and the app keeps a copy of every take. So the evicted render makes only the takes it had not made, on either node. Check that this holds for a render stopped in each of its steps: while it makes takes, while it checks them, and in the join. Decide for each step whether to stop at once or let the step end. A join takes about a minute and can't be resumed.
 * Decide what pause means for the other kinds: a take check, a cast between its briefs and its voices, and a `say-options` job. A job that can't be resumed without losing work may be left to finish, and the plan should say which.
 * Measure what an eviction costs before choosing the rule: the time from the stop request to a free node, and the time the evicted job loses when it starts again, which is the bundle fetch and the start of breeze-server, about 25 s on the laptop by the estimates of 2026-11-13.
+* Measured on 2026-11-14 on aj-legion5 with a render of a throwaway serial, 16 takes, stopped during its check before the join: the job ended as stopped 5.3 s after the stop request. The worker sent the takes list and the 16 take files with the stop, and all 16 were in the app's mirror. The same render queued again made no take, heard the 16 again, joined them and wrote its audio. So a stop loses no take. It loses the check, whose evidence is not among the files a stopped job sends back, and a join. Nobody has timed a stop on jsc-m1 or dev-arch, or one during the takes, which the laptop made too fast to catch.
+* A render that names no seed takes the chapter's from its last render record, which a stopped render doesn't write. So an evicted render that is queued again with its own arguments plans the takes it made before. A render queued by hand from another seed would not.
 * Keep an evicted job from starving. One that is evicted again and again never ends, so cap the count or let a backlog job that was evicted run to its end the next time.
 * Show it. The job list says that a job was paused for another and is queued again, and the wait reason of the priority job names the job it is waiting to stop.
 * The one-machine executor runs one heavy job at a time, so the same rule applies there with one node.

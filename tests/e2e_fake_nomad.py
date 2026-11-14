@@ -27,8 +27,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
+SECOND = "fake-node-2"
 REGISTERED = {"serial-audio-breeze", "serial-audio-comfyui", "serial-audio-llm", "serial-audio-breeze-fake-node",
-              "serial-audio-comfyui-fake-node"}
+              "serial-audio-comfyui-fake-node", f"serial-audio-breeze-{SECOND}"}
 SLUG = "demo"
 SERIAL = {
     "serial.yaml": "title: Demo\nauthor: Test\nsource:\n  type: epub\nnarration:\n  point_of_view: third_person\n"
@@ -65,6 +66,8 @@ class FakeNomad:
         self.tokens: dict[str, str] = {}
         self.delay_next = 0.0
         self.lock = threading.Lock()
+        # the second node offers breeze jobs only, and Nomad lists it once a scenario switches it on
+        self.second = False
 
     def dispatch(self, parent: str, body: dict) -> dict:
         with self.lock:
@@ -74,6 +77,7 @@ class FakeNomad:
             child = f"{parent}/dispatch-{int(time.time())}-{uuid.uuid4().hex[:8]}"
             self.tokens[token] = child
             entry = {"parent": parent, "meta": body["Meta"], "proc": None, "alloc": uuid.uuid4().hex,
+                     "node": SECOND if parent.endswith("-" + SECOND) else "fake-node",
                      "created": time.time_ns(), "task": self.root / "alloc" / child.replace("/", "_")}
             self.children[child] = entry
             delay, self.delay_next = self.delay_next, 0.0
@@ -84,9 +88,10 @@ class FakeNomad:
         task = entry["task"]
         (task / "local").mkdir(parents=True, exist_ok=True)
         shutil.copy2(REPO / "deploy" / "nomad" / "bootstrap.py", task / "local" / "bootstrap.py")
-        env = {**os.environ, "SERIAL_AUDIO_APP": self.app_url, "SERIAL_AUDIO_NODE": "fake-node",
+        lock = "gpu.lock" if entry["node"] == "fake-node" else f"gpu-{entry['node']}.lock"
+        env = {**os.environ, "SERIAL_AUDIO_APP": self.app_url, "SERIAL_AUDIO_NODE": entry["node"],
                "SERIAL_AUDIO_CONFIG": str(self.config), "NOMAD_TASK_DIR": str(task / "local"),
-               "SERIAL_AUDIO_GPU_LOCK": str(self.root / "gpu.lock"),
+               "SERIAL_AUDIO_GPU_LOCK": str(self.root / lock),
                "PYTHONUNBUFFERED": "1", "PYTHONIOENCODING": "utf-8",
                **{f"NOMAD_META_{k}": v for k, v in entry["meta"].items()}}
         out = (task / "stdout.log").open("wb")
@@ -103,7 +108,7 @@ class FakeNomad:
             return []
         code = proc.poll()
         status = "running" if code is None else ("complete" if code == 0 else "failed")
-        return [{"ID": entry["alloc"], "NodeName": "fake-node", "ClientStatus": status, "CreateTime": entry["created"],
+        return [{"ID": entry["alloc"], "NodeName": entry["node"], "ClientStatus": status, "CreateTime": entry["created"],
                  "TaskStates": {"work": {"Events": [{"Type": "Terminated", "DisplayMessage": f"Exit Code: {code}"}]}}}]
 
     def serve(self, port: int) -> ThreadingHTTPServer:
@@ -123,8 +128,13 @@ class FakeNomad:
             def do_GET(self):
                 path = urllib.parse.unquote(urllib.parse.urlsplit(self.path).path)
                 if path == "/v1/nodes":
-                    return self.reply([{"ID": "n1", "Name": "fake-node", "Status": "ready", "Drain": False,
-                                        "SchedulingEligibility": "eligible", "ModifyIndex": 1}])
+                    names = [("n1", "fake-node")] + ([("n2", SECOND)] if fake.second else [])
+                    return self.reply([{"ID": ident, "Name": name, "Status": "ready", "Drain": False,
+                                        "SchedulingEligibility": "eligible", "ModifyIndex": 1}
+                                       for ident, name in names])
+                if path == "/v1/node/n2":
+                    return self.reply({"ID": "n2", "Name": SECOND, "Attributes": {"kernel.name": sys.platform},
+                                       "Meta": {"serial_audio": "breeze", "busy": "false"}})
                 if path == "/v1/node/n1":
                     return self.reply({"ID": "n1", "Name": "fake-node", "Attributes": {"kernel.name": sys.platform},
                                        "Meta": {"serial_audio": "breeze,comfyui,llm", "busy": "false"}})
@@ -460,6 +470,44 @@ def inside(slug: str) -> int:
             check(comfy.cancelled == ["prompt-1"], f"the stop cancelled the job's ComfyUI prompt ({comfy.cancelled})")
         finally:
             dummy.kill()
+
+    # A backlog render gives its node to a job that is not backlog work, and runs again after it
+    if os.name == "nt":
+        fake.second = True
+        check(run_until(lambda: {w["name"] for w in m.workers} == {"fake-node", SECOND}, 60),
+              f"the app sees the second node ({[w['name'] for w in m.workers]})")
+        dummy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)", "serial_audio.cli", "render",
+                                  "dummy", "1"])
+        try:
+            pair = m.submit([{"kind": "render", "params": {"slug": slug, "chapter": 2, "backlog": True}},
+                             {"kind": "render", "params": {"slug": slug, "chapter": 3, "backlog": True}}],
+                            stop_on_failure=False)
+            for job in pair:
+                job["args"] = ["chapters", slug]
+            check(run_until(lambda: all((j.get("nomad") or {}).get("contact") for j in pair), 90),
+                  "two backlog renders run beside each other")
+            check({(j.get("nomad") or {}).get("node") for j in pair} == {"fake-node", SECOND},
+                  f"one on each node ({[(j.get('nomad') or {}).get('node') for j in pair]})")
+            other = submit("render", {"slug": slug, "chapter": 4}, args=["chapters", slug])
+            check(run_until(lambda: any(j.get("evicted") for j in pair), 90),
+                  f"one backlog render was paused and queued again ({[(j['status'], j.get('note')) for j in pair]})")
+            gave = next((j for j in pair if j.get("evicted")), pair[0])
+            stayed = pair[1] if gave is pair[0] else pair[0]
+            check(gave["status"] == "queued" and gave.get("backlog") and "nomad" not in gave,
+                  f"it is queued as backlog work, as before it started ({gave['status']}, {gave.get('note')})")
+            check("paused for Render" in log(gave), "its log says which job it was paused for")
+            check(stayed["status"] == "running" and not stayed["nomad"].get("cancel"),
+                  f"the other backlog render was not asked to stop ({stayed['status']})")
+            check(run_until(lambda: (other.get("nomad") or {}).get("contact"), 90) and stayed["status"] == "running",
+                  f"the job that is not backlog work got the freed node while a backlog render still ran "
+                  f"({(other.get('nomad') or {}).get('node')})")
+        finally:
+            dummy.kill()
+        check(run_until(lambda: all(finished(j)() for j in pair + [other]), 180), "all three finished once the machine was free")
+        check([j["status"] for j in pair + [other]] == ["done"] * 3, f"all three are done ({[j['status'] for j in pair + [other]]})")
+        check(gave.get("evicted") is True and other["finished"] <= (gave["nomad"].get("dispatched_at") or ""),
+              f"the paused render ran again after the other job ({gave.get('evicted')})")
+        check("gave_way" not in json.dumps(m.snapshot()["jobs"]), "the snapshot hides the paused attempt's key")
 
     httpd.shutdown()
     print(f"\n{len(failures)} failure(s)" + (": " + "; ".join(failures) if failures else ""), flush=True)

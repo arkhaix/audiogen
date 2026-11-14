@@ -74,7 +74,7 @@ def text_runs(text: str, lines: list[dict]) -> list[dict]:
 
     text: the chapter's text.md. Its heading line is left out.
     lines: the script lines. When the chapter has a heading, the script's first line is the heading as a reader says
-    it, and it is left out too, unless its words are the chapter's opening words.
+    it, and it is left out too, unless its words are the chapter's opening words and not the heading's.
     Returns {"kind", "words", "line", "quote"} per run. kind is "dropped" for chapter words the script doesn't have,
     and "added" for script words the chapter doesn't have. words counts the run's words. line is the script line that
     holds the run's first word, or for a dropped run the line the script goes on with, which is len(lines) at the
@@ -85,7 +85,7 @@ def text_runs(text: str, lines: list[dict]) -> list[dict]:
     script, line_of = [], []
     for i, line in enumerate(lines):
         found = compare_words(line.get("text") or "")
-        if i == 0 and heading and found and not _opens(found, chapter):
+        if i == 0 and heading and found and not _opens(found, chapter, heading):
             continue
         script += found
         line_of += [i] * len(found)
@@ -102,10 +102,22 @@ def text_runs(text: str, lines: list[dict]) -> list[dict]:
     return runs
 
 
-def _opens(found: list[tuple[str, str]], chapter: list[tuple[str, str]]) -> bool:
-    """Whether a script line's words are the first words of the chapter's body, give or take a normalization."""
+def _opens(found: list[tuple[str, str]], chapter: list[tuple[str, str]], heading: list[tuple[str, str]]) -> bool:
+    """Whether a script's first line is the first words of the chapter's body, give or take a normalization.
+
+    found: the line's words.
+    chapter: the words of the chapter's body.
+    heading: the words of the chapter's heading line.
+    Returns True when at least half of the line matches the body's first words and the line is closer to them
+    than to the heading.
+    """
     said = [k for k, _ in found]
-    return difflib.SequenceMatcher(None, said, [k for k, _ in chapter[: len(said)]], autojunk=False).ratio() >= 0.5
+
+    def near(words: list[tuple[str, str]]) -> float:
+        return difflib.SequenceMatcher(None, said, [k for k, _ in words], autojunk=False).ratio()
+
+    body = near(chapter[: len(said)])
+    return body >= 0.5 and body > near(heading)
 
 
 def _run(kind: str, words: list[tuple[str, str]], line: int) -> dict:

@@ -374,6 +374,16 @@ class ScriptAgainstChapterTest(unittest.TestCase):
                   {"speaker": "narrator", "text": "The road ran north along the river for a day and a night."}]
         self.assertEqual(screenplay.text_runs(road, spoken), [])
 
+        # A chapter whose text opens with the words of its title: the heading as a reader says it is still left
+        # out, and the same words in the next line are the chapter's.
+        clerk = "# Chapter III: The Harbor Clerk\n\nThe harbor clerk came at noon with a ledger under her arm.\n"
+        said = [{"speaker": "narrator", "text": "Chapter Three. The Harbor Clerk."},
+                {"speaker": "narrator", "text": "The harbor clerk came at noon with a ledger under her arm."}]
+        self.assertEqual(screenplay.text_runs(clerk, said), [])
+        # A script of that chapter without the heading line starts with chapter text, so its words count.
+        self.assertEqual(screenplay.text_runs(clerk, [{"speaker": "narrator", "text": "The harbor clerk came at noon."}]),
+                         [{"kind": "dropped", "words": 6, "line": 1, "quote": "with a ledger under her arm"}])
+
         # A chapter without a heading doesn't have a heading line in its script.
         self.assertEqual(screenplay.text_runs(road.split("\n", 2)[2], spoken),
                          [{"kind": "added", "words": 6, "line": 0, "quote": "Chapter Five The Long Road Home"}])

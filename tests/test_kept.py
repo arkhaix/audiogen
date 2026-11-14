@@ -682,6 +682,7 @@ class HandNextTest(unittest.TestCase):
                   mock.patch.object(self.m, "_record_placement", lambda *a: None),
                   mock.patch.object(self.m, "_already_done", lambda job: None),
                   mock.patch.object(self.m, "_duration", lambda *a, **k: 60.0),
+                  mock.patch.object(self.m, "_remaining", lambda j, count=True: 3600.0 if j.get("long") else 60.0),
                   mock.patch.object(self.m, "holder", lambda job: (None, False))):
             p.start()
             self.addCleanup(p.stop)
@@ -774,20 +775,166 @@ class HandNextTest(unittest.TestCase):
         # The task ended and never fetched the bundle: the job is as it was before it was handed over.
         self.m._apply_poll(b, ended, 2.0)
         self.assertEqual((b["status"], b.get("nomad")), ("queued", None))
-        self.assertIn("ended before it took it, so the job is queued again", self.logged["b"][-1])
+        self.assertIn("ended before it ran it, so the job is queued again", self.logged["b"][-1])
         self.assertNotIn("next", self.result(a))
 
-        # A handed job that did fetch its bundle and then lost its task fails like any other.
+        # The app built the bundle and the worker never got it, so it sent no log: the job is queued again too.
         b2 = self.render("b2", 3, 3)
         a2 = self.running("a2", 4, 4)
         self.m.jobs.pop("b")
         self.result(a2)
         self.assertEqual(b2["nomad"]["follows"], "a2")
         self.m.worker_bundle("b2", b2["nomad"]["key"], "laptop")
+        self.assertTrue(b2["nomad"]["contact"] and b2["started"])
         self.m._apply_poll(b2, ended, 3.0)
-        self.assertEqual(b2["status"], "running")
-        self.m._apply_poll(b2, {**ended, "tail": ""}, 3.0 + self.nomad.END_GRACE + 1)
-        self.assertEqual(b2["status"], "failed")
+        self.assertEqual((b2["status"], b2.get("nomad"), b2["started"]), ("queued", None, None))
+        self.assertIn("ended before it ran it, so the job is queued again", self.logged["b2"][-1])
+
+        # A handed job that fetched its bundle, sent a part of its log and then lost its task fails like any other.
+        b3 = self.render("b3", 5, 5)
+        a3 = self.running("a3", 6, 6)
+        self.m.jobs.pop("b2")
+        self.result(a3)
+        self.assertEqual(b3["nomad"]["follows"], "a3")
+        self.m.worker_bundle("b3", b3["nomad"]["key"], "laptop")
+        self.m.log_path(b3).parent.mkdir(parents=True, exist_ok=True)
+        self.assertEqual(self.m.worker_log("b3", b3["nomad"]["key"], "0", 0, b"[worker] step 1\n")["offset"], 16)
+        self.m._apply_poll(b3, ended, 4.0)
+        self.assertEqual(b3["status"], "running")
+        self.m._apply_poll(b3, {**ended, "tail": ""}, 4.0 + self.nomad.END_GRACE + 1)
+        self.assertEqual(b3["status"], "failed")
+
+        # A stop that came after the bundle was sent is not undone: the job is not queued again.
+        b4 = self.render("b4", 7, 7)
+        a4 = self.running("a4", 8, 8)
+        self.m.jobs.pop("b3")
+        self.result(a4)
+        self.m.worker_bundle("b4", b4["nomad"]["key"], "laptop")
+        self.m.cancel("b4")
+        self.assertTrue(b4["nomad"]["cancel"])
+        self.m._apply_poll(b4, ended, 5.0)
+        self.assertEqual(b4["status"], "running")
+        self.m._apply_poll(b4, {**ended, "tail": ""}, 5.0 + self.nomad.END_GRACE + 1)
+        self.assertEqual(b4["status"], "failed")
+
+    def test_a_handed_job_is_queued_again_when_nomad_forgot_its_task_and_past_its_first_stage(self):
+        gone = {"polled": 1.0, "error": self.nomad.NomadError(404, "job not found")}
+
+        # Nomad no longer knows the task, and the worker sent no log: the job is queued again.
+        a, b = self.running("a", 1, 1), self.render("b", 2, 2)
+        self.result(a)
+        self.m.worker_bundle("b", b["nomad"]["key"], "laptop")
+        self.m._apply_poll(b, gone, 1.0)
+        self.assertEqual((b["status"], b.get("nomad")), ("queued", None))
+        self.assertIn("Nomad no longer knows the task that was handed this job", self.logged["b"][-1])
+
+        # With a part of its log sent, it is lost like any other job whose task Nomad forgot.
+        self.m.jobs.pop("b")
+        a2, c = self.running("a2", 3, 3), self.render("c", 4, 4)
+        self.result(a2)
+        self.m.worker_bundle("c", c["nomad"]["key"], "laptop")
+        self.m.log_path(c).parent.mkdir(parents=True, exist_ok=True)
+        self.m.worker_log("c", c["nomad"]["key"], "0", 0, b"[worker] step 1\n")
+        self.m._apply_poll(c, gone, 2.0)
+        self.assertEqual(c["status"], "lost")
+
+        # A job past its first stage keeps its record. The worker's contact is gone from it, and its key is another,
+        # so the worker that never ran the stage can't send a result for the stage's next run.
+        self.m.jobs.pop("c")
+        a3, d = self.running("a3", 5, 5), self.render("d", 6, 6)
+        self.result(a3)
+        n = d["nomad"]
+        n.update({"stage": 1, "stages": [{"class": "llm", "args": d["args"]}, {"class": "breeze", "args": d["args"]}],
+                  "reports": {"0": {}}})
+        key = n["key"]
+        self.m.worker_bundle("d", key, "laptop")
+        ended = {"polled": 1.0, "allocs": [{"ID": "alloc-1", "NodeName": "laptop", "ClientStatus": "complete",
+                                            "CreateTime": 1}]}
+        self.m._apply_poll(d, ended, 3.0)
+        self.assertEqual((d["status"], n["stage"], n["contact"], n["follows"], d["taken_back"]),
+                         ("queued", 1, None, None, 1))
+        self.assertNotEqual(n["key"], key)
+        with self.assertRaises(self.nomad.WorkerError) as e:
+            self.m.worker_log("d", key, "1", 0, b"late\n")
+        self.assertEqual(e.exception.status, 403)
+
+    def test_a_handed_job_is_queued_again_twice_at_most(self):
+        ended = {"polled": 1.0, "allocs": [{"ID": "alloc-1", "NodeName": "laptop", "ClientStatus": "complete",
+                                            "CreateTime": 1}]}
+        b = self.render("b", 2, 2)
+        for n in range(self.nomad.TAKE_BACKS):
+            a = self.running(f"a{n}", 10 + n, 10 + n)
+            self.result(a)
+            self.assertEqual(b["nomad"]["follows"], a["id"])
+            self.m._apply_poll(b, ended, 1.0)
+            # It is as it was before it was handed over, but for the count.
+            self.assertEqual((b["status"], b.get("nomad"), b["started"], b["taken_back"]), ("queued", None, None, n + 1))
+
+        # The next worker that never runs it leaves it to fail, with what its task wrote.
+        a = self.running("a9", 20, 20)
+        self.result(a)
+        self.assertEqual(b["nomad"]["follows"], "a9")
+        self.m._apply_poll(b, ended, 2.0)
+        self.assertEqual(b["status"], "running")
+        self.m._apply_poll(b, {**ended, "tail": "the bundle could not be unpacked"}, 2.0 + self.nomad.END_GRACE + 1)
+        self.assertEqual(b["status"], "failed")
+        self.assertIn("the bundle could not be unpacked", "".join(self.logged["b"]))
+
+    def test_a_render_s_result_marks_the_counts_of_its_own_chapter_alone(self):
+        a, b, c = self.running("a", 1, 1), self.render("b", 2, 1), self.render("c", 3, 3)
+        self.m._work.update({"b": (5.0, 200, 0), "c": (5.0, 7, 0)})
+        self.result(a)
+
+        # The other render of chapter 1 is counted again, and it keeps its count until then.
+        self.assertEqual(self.m._work["b"], (0.0, 200, 0))
+        # The render of another chapter reads nothing that the result changed.
+        self.assertEqual(self.m._work["c"], (5.0, 7, 0))
+
+        # A job of another kind may change what any render of the serial reads.
+        d = self.running("d", 4, 4)
+        d["kind"] = "cast"
+        self.result(d)
+        self.assertEqual(self.m._work["c"], (0.0, 7, 0))
+
+    def test_a_bundle_is_built_again_when_a_result_changed_the_serial_during_its_build(self):
+        a = self.running("a", 1, 1)
+        x, other = self.running("x", 2, 2, "mac"), self.running("o", 3, 3, "mac")
+        other["slug"] = "elsewhere"
+        built = []
+
+        def build(lands):
+            def run(slug, info):
+                built.append(slug)
+                if len(built) == 1:
+                    self.result(lands)
+                return f"zip {len(built)}".encode()
+            return run
+
+        # A result of the serial lands while the bundle is built: the worker gets a bundle built after it.
+        with mock.patch.object(self.nomad.exchange, "build_bundle", build(x)):
+            self.assertEqual(self.m.worker_bundle("a", "key-a", "laptop"), b"zip 2")
+        self.assertEqual((x["status"], built), ("done", ["demo", "demo"]))
+
+        # A result of another serial changes nothing the bundle holds.
+        built.clear()
+        with mock.patch.object(self.nomad.exchange, "build_bundle", build(other)):
+            self.assertEqual(self.m.worker_bundle("a", "key-a", "laptop"), b"zip 1")
+        self.assertEqual((other["status"], built), ("done", ["demo"]))
+
+        # A result lands during every build: the worker gets no bundle and is told to fetch again.
+        built.clear()
+        a["nomad"]["contact"] = None
+        more = [self.running(f"m{i}", 10 + i, 10 + i, "mac") for i in range(self.nomad.BUNDLE_BUILDS)]
+
+        def always(slug, info):
+            built.append(slug)
+            self.result(more[len(built) - 1])
+            return b"zip"
+
+        with mock.patch.object(self.nomad.exchange, "build_bundle", always):
+            with self.assertRaises(self.nomad.WorkerError) as e:
+                self.m.worker_bundle("a", "key-a", "laptop")
+        self.assertEqual((e.exception.status, len(built), a["nomad"]["contact"]), (503, self.nomad.BUNDLE_BUILDS, None))
 
     def test_a_pass_counts_the_takes_of_a_render_only_when_nobody_has_counted_them(self):
         b = self.render("b", 2, 2)
@@ -805,6 +952,279 @@ class HandNextTest(unittest.TestCase):
             self.m._work["b"] = (0.0, 12, 0)
             self.assertEqual(self.m._takes_needed(b, 100), 12)
             self.assertEqual(count.call_count, 1)
+
+    def backlog(self, jid, seq, n, node_name):
+        """A running backlog render with an hour left, where any other running job has a minute."""
+        job = self.running(jid, seq, n, node_name)
+        job.update({"backlog": True, "long": True})
+        return job
+
+    def stopped(self, job):
+        data = json.dumps({"exit_code": 1, "cancelled": True, "node": job["nomad"]["target"]}).encode()
+        return self.m.worker_result(job["id"], job["nomad"]["key"], "0", data)
+
+    def test_a_backlog_render_gives_its_node_to_a_job_that_is_not_backlog_work(self):
+        v1, v2 = self.backlog("v1", 1, 1, "laptop"), self.backlog("v2", 2, 2, "mac")
+        p = self.render("p", 3, 9)
+        dispatch = []
+        self.m._schedule(time.time(), dispatch)
+
+        # Both nodes run backlog renders, so the one where the job ends first is asked to stop, and the job waits.
+        self.assertEqual((v1["nomad"]["cancel"], v1["nomad"]["evict"], v1["stopping"]), (True, "p", True))
+        self.assertEqual((p["status"], dispatch, v2["nomad"].get("cancel")), ("queued", [], None))
+        self.assertEqual(self.m.wait_reasons["p"], "waiting for Render · ch 1 to stop on laptop, which is backlog work")
+        self.assertIn("paused for Render · ch 9", self.logged["v1"][-1])
+
+        # While the worker stops, the job goes on waiting for that node and asks no other render.
+        self.m._schedule(time.time(), dispatch)
+        self.assertEqual((p["status"], v2["nomad"].get("cancel")), ("queued", None))
+        self.assertEqual(self.m.wait_reasons["p"], "waiting for Render · ch 1 to stop on laptop, which is backlog work")
+
+        # A second job counts the stopping render's node as free in seconds, so it waits there behind the first
+        # job and the other render goes on.
+        q = self.render("q", 4, 8)
+        self.m._schedule(time.time(), dispatch)
+        self.assertEqual((q["status"], v2["nomad"].get("cancel")), ("queued", None))
+        self.assertTrue(self.m.wait_reasons["q"].startswith("waiting for laptop, about"), self.m.wait_reasons["q"])
+        self.m.jobs.pop("q")
+
+        # The worker confirms: the render is queued again as backlog work, as it was before it started.
+        self.stopped(v1)
+        self.assertEqual((v1["status"], v1.get("nomad"), v1["started"], v1["backlog"], v1["evicted"]),
+                         ("queued", None, None, True, True))
+        self.assertEqual(v1["note"], "paused for Render · ch 9 and queued again")
+        self.assertNotIn("stopping", v1)
+
+        # The freed node goes to the job, which asks no second render, also when the estimates have changed and
+        # the other node would now end it far sooner. The paused render waits like any backlog work.
+        with mock.patch.object(self.m, "_duration", lambda job, node, *a, **k: 30.0 if node == "mac" else 200.0):
+            self.m._schedule(time.time(), dispatch)
+        self.assertEqual((p["status"], p["nomad"]["target"], dispatch, v2["nomad"].get("cancel")),
+                         ("running", "laptop", ["p"], None))
+        self.assertEqual(v1["status"], "queued")
+        self.assertIn("backlog work, waiting for", self.m.wait_reasons["v1"])
+
+        # A render that gave way once is not asked again, so the next job asks the other render.
+        p["nomad"]["contact"] = "t"
+        self.result(p)
+        self.m._schedule(time.time(), dispatch)
+        self.assertEqual((v1["status"], v1["nomad"]["target"]), ("running", "laptop"))
+        v1["nomad"]["contact"] = "t"
+        p2 = self.render("p2", 5, 10)
+        self.m._schedule(time.time(), dispatch)
+        self.assertEqual((v1["nomad"].get("cancel"), v2["nomad"].get("evict"), p2["status"]), (None, "p2", "queued"))
+
+    def test_nothing_is_stopped_to_gain_less_than_the_margin(self):
+        # The render has two minutes left: a stop would gain under WAIT_MARGIN, so the job waits for it.
+        v = self.backlog("v", 1, 1, "laptop")
+        self.m.workers = [node("laptop", ["breeze", "comfyui"])]
+        p = self.render("p", 2, 9)
+        left = self.nomad.EVICT_SECONDS + self.nomad.WAIT_MARGIN
+        with mock.patch.object(self.m, "_remaining", lambda j, count=True: left):
+            self.m._schedule(time.time(), [])
+        self.assertEqual((v["nomad"].get("cancel"), p["status"]), (None, "queued"))
+        self.assertTrue(self.m.wait_reasons["p"].startswith("waiting for laptop, about"), self.m.wait_reasons["p"])
+
+        # With a second more it gives way.
+        with mock.patch.object(self.m, "_remaining", lambda j, count=True: left + 1):
+            self.m._schedule(time.time(), [])
+        self.assertEqual(v["nomad"].get("evict"), "p")
+
+        # A node that frees by itself within the margin is worth the wait, and the render on the other goes on.
+        self.m.workers = [node("laptop", ["breeze", "comfyui"]), node("mac", ["breeze"], "metal")]
+        self.m.jobs.clear()
+        busy, v2 = self.running("busy", 1, 1, "laptop"), self.backlog("v2", 2, 2, "mac")
+        p2 = self.render("p2", 3, 9)
+        self.m._schedule(time.time(), [])
+        self.assertEqual((busy["nomad"].get("cancel"), v2["nomad"].get("cancel"), p2["status"]), (None, None, "queued"))
+        self.assertTrue(self.m.wait_reasons["p2"].startswith("waiting for laptop, about"), self.m.wait_reasons["p2"])
+
+    def test_a_job_s_own_time_of_asking_is_not_the_mark_that_it_asked_a_render(self):
+        # A render that stands in for a later request carries the time of that request. It can still ask a
+        # render to stop, and the time stays as it was.
+        v1 = self.backlog("v1", 1, 1, "laptop")
+        self.backlog("v2", 2, 2, "mac")
+        p = self.render("p", 3, 9)
+        p["asked"] = "2026-11-14T10:00:00-05:00"
+        self.m._schedule(time.time(), [])
+        self.assertEqual((v1["nomad"].get("evict"), p["asked"], p["asked_stop"]),
+                         ("p", "2026-11-14T10:00:00-05:00", "v1"))
+
+    def test_an_idle_node_within_the_margin_is_taken_before_a_wait_for_a_busy_one(self):
+        # Three nodes: a backlog render with an hour left, a job that ends in a minute, and a slow idle node.
+        self.m.workers = [node("laptop", ["breeze", "comfyui"]), node("mac", ["breeze"], "metal"),
+                          node("dev", ["breeze"], "none")]
+        v, busy = self.backlog("v", 1, 1, "laptop"), self.running("busy", 2, 2, "mac")
+        p = self.render("p", 3, 9)
+        took = {"laptop": 60.0, "mac": 120.0, "dev": 210.0}
+        dispatch = []
+        with mock.patch.object(self.m, "_duration", lambda job, name, *a, **k: took[name]):
+            self.m._schedule(time.time(), dispatch)
+
+        # The render's node would end the job first, and the busy node ends it within the margin of that, so
+        # nothing is stopped. The idle node ends it within the margin of the busy one, so the job starts there.
+        self.assertEqual((v["nomad"].get("cancel"), busy["nomad"].get("cancel")), (None, None))
+        self.assertEqual((p["status"], p["nomad"]["target"], dispatch), ("running", "dev", ["p"]))
+
+    def test_a_job_keeps_waiting_for_the_node_of_the_render_it_asked(self):
+        v1, v2 = self.backlog("v1", 1, 1, "laptop"), self.backlog("v2", 2, 2, "mac")
+        p = self.render("p", 3, 9)
+        dispatch = []
+        self.m._schedule(time.time(), dispatch)
+        self.assertEqual(v1["nomad"]["evict"], "p")
+
+        # The other render ends first. Its worker is not handed the job, or the stop would be for nothing.
+        report = self.result(v2)
+        self.assertNotIn("next", report)
+        self.assertEqual(p["status"], "queued")
+        self.assertEqual(self.m.wait_reasons["p"], "waiting for Render · ch 1 to stop on laptop, which is backlog work")
+
+        # The asked render stops, and the job gets its node.
+        self.stopped(v1)
+        self.m._schedule(time.time(), dispatch)
+        self.assertEqual((v1["status"], p["status"], p["nomad"]["target"]), ("queued", "running", "laptop"))
+
+    def test_a_job_that_needs_one_node_s_files_asks_the_render_there_to_stop(self):
+        v1, v2 = self.backlog("v1", 1, 1, "laptop"), self.backlog("v2", 2, 2, "mac")
+        p = self.render("p", 3, 9)
+        with mock.patch.object(self.m, "holder", lambda job: ("mac", True) if job is p else (None, False)):
+            self.m._schedule(time.time(), [])
+            self.assertEqual((v2["nomad"].get("evict"), v1["nomad"].get("cancel")), ("p", None))
+            self.assertEqual(self.m.wait_reasons["p"], "waiting for Render · ch 2 to stop on mac, which is backlog work")
+
+            # A second pass asks nothing more and gives the same reason.
+            self.m._schedule(time.time(), [])
+            self.assertEqual((v1["nomad"].get("cancel"), self.m.wait_reasons["p"]),
+                             (None, "waiting for Render · ch 2 to stop on mac, which is backlog work"))
+
+    def test_a_render_that_ends_or_dies_while_it_is_asked_to_give_way(self):
+        v1, v2 = self.backlog("v1", 1, 1, "laptop"), self.backlog("v2", 2, 2, "mac")
+        self.render("p", 3, 9)
+        self.m._schedule(time.time(), [])
+        self.assertEqual(v1["nomad"]["evict"], "p")
+
+        # It ended by itself before the stop reached it: it is done, and its result is taken whole.
+        self.result(v1)
+        self.assertEqual((v1["status"], v1.get("evicted")), ("done", None))
+
+        # Its task ended without a result: it is queued again, as backlog work that gave way.
+        v3 = self.backlog("v3", 4, 4, "laptop")
+        self.m.jobs.pop("p")
+        self.m.jobs.pop("v1")
+        self.render("p3", 5, 9)
+        self.m._schedule(time.time(), [])
+        self.assertEqual(v3["nomad"]["evict"], "p3")
+        ended = {"polled": 1.0, "allocs": [{"ID": "alloc-1", "NodeName": "laptop", "ClientStatus": "failed",
+                                            "CreateTime": 1}]}
+        self.m._apply_poll(v3, ended, 1.0)
+        self.assertEqual(v3["status"], "running")
+        self.m._apply_poll(v3, {**ended, "tail": "killed"}, 1.0 + self.nomad.END_GRACE + 1)
+        self.assertEqual((v3["status"], v3.get("nomad"), v3["evicted"]), ("queued", None, True))
+        self.assertIn("after its task ended without a result", self.logged["v3"][-1])
+        self.assertEqual(v2["nomad"].get("cancel"), None)
+
+    def test_a_repeated_upload_of_a_paused_render_s_result_gets_the_first_report(self):
+        v1 = self.backlog("v1", 1, 1, "laptop")
+        self.backlog("v2", 2, 2, "mac")
+        self.render("p", 3, 9)
+        self.m._schedule(time.time(), [])
+        key = v1["nomad"]["key"]
+        data = json.dumps({"exit_code": 1, "cancelled": True, "node": "laptop"}).encode()
+        first = self.m.worker_result("v1", key, "0", data)
+        self.assertEqual(v1["status"], "queued")
+
+        # The worker's retry of the same upload is acknowledged and changes nothing.
+        self.assertEqual(self.m.worker_result("v1", key, "0", data), first)
+        self.assertEqual((v1["status"], v1.get("nomad")), ("queued", None))
+        # The record of the paused attempt stays out of the queue's snapshot.
+        self.assertNotIn("gave_way", next(j for j in self.m.snapshot()["jobs"] if j["id"] == "v1"))
+        with self.assertRaises(self.nomad.WorkerError) as e:
+            self.m.worker_result("v1", "another key", "0", data)
+        self.assertEqual(e.exception.status, 403)
+
+    def test_the_forecast_follows_a_render_that_gives_way(self):
+        self.m.workers = [node("laptop", ["breeze", "comfyui"])]
+        v = self.backlog("v", 1, 1, "laptop")
+        p1, p2 = self.render("p1", 2, 8), self.render("p2", 3, 9)
+        for job in (v, p1, p2):
+            self.m._work[job["id"]] = (time.time(), 10, 0)
+
+        # The render ends sooner than a pause would free its node: the jobs follow it one after the other.
+        with mock.patch.object(self.m, "_remaining", lambda j, count=True: 10.0):
+            out = self.m._forecast(time.time())
+        self.assertEqual([(out[j]["start_in"], out[j]["end_in"]) for j in ("p1", "p2")], [(10.0, 70.0), (70.0, 130.0)])
+        self.assertEqual(out["v"]["end_in"], 10.0)
+
+        # The render has under EVICT_SECONDS and WAIT_MARGIN left, so a pause gains too little: the jobs wait.
+        with mock.patch.object(self.m, "_remaining", lambda j, count=True: 100.0):
+            out = self.m._forecast(time.time())
+        self.assertEqual([(out[j]["start_in"], out[j]["end_in"]) for j in ("p1", "p2")], [(100.0, 160.0), (160.0, 220.0)])
+        self.assertEqual(out["v"]["end_in"], 100.0)
+
+        # The render has an hour left: the first job gets its node after a pause, the second follows the first,
+        # and the render goes on when both have ended.
+        with mock.patch.object(self.m, "_remaining", lambda j, count=True: 3600.0):
+            out = self.m._forecast(time.time())
+        self.assertEqual([(out[j]["start_in"], out[j]["end_in"]) for j in ("p1", "p2")], [(20.0, 80.0), (80.0, 140.0)])
+        self.assertEqual(out["v"]["end_in"], 140.0 + self.nomad.EVICT_SECONDS + 3600.0)
+
+        # A job that the user asked to stop frees its node in seconds here too, as it does for the scheduler.
+        v["nomad"]["cancel"] = True
+        with mock.patch.object(self.m, "_remaining", lambda j, count=True: 3600.0):
+            out = self.m._forecast(time.time())
+        self.assertEqual([(out[j]["start_in"], out[j]["end_in"]) for j in ("p1", "p2")], [(20.0, 80.0), (80.0, 140.0)])
+        self.assertEqual(out["v"]["end_in"], self.nomad.EVICT_SECONDS)
+
+    def test_nothing_is_stopped_for_a_free_node_a_join_backlog_work_or_with_the_switch_off(self):
+        # A free node ends the job as soon, so the job takes it and the render goes on.
+        v = self.backlog("v", 1, 1, "laptop")
+        p = self.render("p", 2, 9)
+        dispatch = []
+        self.m._schedule(time.time(), dispatch)
+        self.assertEqual((p["nomad"]["target"], v["nomad"].get("cancel")), ("mac", None))
+
+        # A render that has started its join is left to end, and the job waits for its node.
+        v2 = self.backlog("v2", 3, 2, "mac")
+        self.m.jobs.pop("p")
+        v["nomad"]["marks"], v2["nomad"]["marks"] = {"join": 1.0}, {"join": 1.0}
+        p2 = self.render("p2", 4, 10)
+        self.m._schedule(time.time(), dispatch)
+        self.assertEqual((p2["status"], v["nomad"].get("cancel"), v2["nomad"].get("cancel")), ("queued", None, None))
+        self.assertTrue(self.m.wait_reasons["p2"].startswith("waiting for laptop, about"), self.m.wait_reasons["p2"])
+
+        # Backlog work stops no backlog work.
+        v["nomad"]["marks"], v2["nomad"]["marks"] = {}, {}
+        p2["backlog"] = True
+        self.m._schedule(time.time(), dispatch)
+        self.assertEqual((v["nomad"].get("cancel"), v2["nomad"].get("cancel")), (None, None))
+
+        # With EVICT off the job waits as it did before.
+        p2["backlog"] = False
+        with mock.patch.object(self.nomad, "EVICT", False):
+            self.m._schedule(time.time(), dispatch)
+        self.assertEqual((v["nomad"].get("cancel"), v2["nomad"].get("cancel")), (None, None))
+        self.assertTrue(self.m.wait_reasons["p2"].startswith("waiting for laptop, about"), self.m.wait_reasons["p2"])
+
+    def test_a_stop_asked_while_a_render_pauses_is_not_undone(self):
+        v1, v2 = self.backlog("v1", 1, 1, "laptop"), self.backlog("v2", 2, 2, "mac")
+        p = self.render("p", 3, 9)
+        dispatch = []
+        self.m._schedule(time.time(), dispatch)
+        self.assertEqual(v1["nomad"]["evict"], "p")
+
+        # The stop is the user's now. The job still waits for that node and asks no second render.
+        self.m.cancel("v1")
+        self.assertEqual((v1["nomad"]["evict"], v1["nomad"]["by_user"]), ("p", True))
+        self.assertIn("not queued again", self.logged["v1"][-1])
+        self.m._schedule(time.time(), dispatch)
+        self.assertEqual((v2["nomad"].get("cancel"), p["status"]), (None, "queued"))
+        self.assertEqual(self.m.wait_reasons["p"], "waiting for Render · ch 1 to stop on laptop, which is backlog work")
+
+        # The worker's answer ends the render as stopped, and its node goes to the job.
+        self.stopped(v1)
+        self.assertEqual((v1["status"], v1["note"], v1.get("evicted")), ("stopped", "stopped from the web app", None))
+        self.m._schedule(time.time(), dispatch)
+        self.assertEqual((p["status"], p["nomad"]["target"], v2["nomad"].get("cancel")), ("running", "laptop", None))
 
     def test_a_handed_job_stopped_before_its_bundle_is_fetched_is_cancelled(self):
         a, b = self.running("a", 1, 1), self.render("b", 2, 2)
