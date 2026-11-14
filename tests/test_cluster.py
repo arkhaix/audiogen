@@ -65,6 +65,57 @@ class ExchangeTest(unittest.TestCase):
         self.assertFalse(self.info["manifest"]["audio/ch0001.opus"]["shipped"])
         self.assertEqual(self.info["steps"], [["chapters", "demo"]])
 
+    def test_a_file_replaced_while_the_bundle_is_built_ships_with_its_own_hash(self):
+        # A result lands between the listing of the serial's files and the read of one of them. The manifest names
+        # the bytes that were shipped, so the worker doesn't report the file as changed, and its own change to
+        # another file is still written back.
+        from unittest import mock
+        rel = "chapters/0001/chapter.yaml"
+        target = self.root / "library" / "demo" / rel
+        listed = exchange.manifest
+
+        def then_replaced(folder):
+            files = listed(folder)
+            target.write_bytes(b"status: scripted\n")
+            return files
+
+        with mock.patch.object(exchange, "manifest", then_replaced):
+            data = exchange.build_bundle("demo", {"job": "j2", "stage": 0, "steps": []}, self.root)
+        z = zipfile.ZipFile(io.BytesIO(data))
+        info = json.loads(z.read(exchange.BUNDLE_FILE).decode("utf-8"))
+        self.assertEqual(z.read(f"library/demo/{rel}"), b"status: scripted\n")
+        self.assertEqual(info["manifest"][rel]["sha256"], hashlib.sha256(b"status: scripted\n").hexdigest())
+        folder = Path(self.tmp.name) / "work2" / "library" / "demo"
+        z.extractall(folder.parent.parent)
+        self.assertEqual(exchange.changes(folder, info["manifest"]), {})
+        (folder / "serial.yaml").write_bytes(b"title: Demo, again\n")
+        changed = exchange.changes(folder, info["manifest"])
+        result, archive = exchange.read_result(exchange.build_result(folder, {"job": "j2", "exit_code": 0}, changed))
+        report = exchange.apply_result("demo", result, archive, success=True, conflicts_dir=self.conflicts,
+                                       root=self.root)
+        self.assertEqual((report["applied"], report["conflicts"]), (["serial.yaml"], []))
+
+    def test_a_file_gone_while_the_bundle_is_built_is_left_out(self):
+        # A result's temporary file is listed and then renamed before it is read. The bundle is built without it.
+        from unittest import mock
+        rel = "chapters/0001/chapter.yaml.incoming"
+        temporary = self.root / "library" / "demo" / rel
+        temporary.write_bytes(b"status: scripted\n")
+        listed = exchange.manifest
+
+        def then_renamed(folder):
+            files = listed(folder)
+            temporary.unlink()
+            return files
+
+        with mock.patch.object(exchange, "manifest", then_renamed):
+            data = exchange.build_bundle("demo", {"job": "j3", "stage": 0, "steps": []}, self.root)
+        z = zipfile.ZipFile(io.BytesIO(data))
+        info = json.loads(z.read(exchange.BUNDLE_FILE).decode("utf-8"))
+        self.assertNotIn(rel, info["manifest"])
+        self.assertNotIn(f"library/demo/{rel}", z.namelist())
+        self.assertIn("library/demo/chapters/0001/chapter.yaml", z.namelist())
+
     def test_changed_and_new_files_are_written_back(self):
         (self.folder / "chapters/0001/chapter.yaml").write_text("status: rendered\n", encoding="utf-8")
         (self.folder / "audio").mkdir()
@@ -198,13 +249,20 @@ class SchedulingTest(unittest.TestCase):
     def test_conflicts(self):
         self.assertFalse(conflicts(job("render", chapters=[7]), job("render", chapters=[8])))
         self.assertTrue(conflicts(job("render", chapters=[7]), job("screenplay", chapters=[7])))
-        self.assertTrue(conflicts(job("render", chapters=[7]), job("character-pass", chapters=[1])))
+        self.assertTrue(conflicts(job("render", chapters=[7]), job("character-pass", chapters=[7])))
+        self.assertFalse(conflicts(job("render", chapters=[7]), job("character-pass", chapters=[1])))
         self.assertFalse(conflicts(job("render", chapters=[7]), job("cast", slug="other")))
         self.assertFalse(conflicts(job("add-epub", slug=None), job("add-epub", slug=None)))
         # A render waits for a cast, a pick, a say-as or a voice effect on its serial, which change what it reads.
         # None of them waits for a render, a screenplay or a take check, and they still wait for each other and for
-        # a character pass.
+        # a character pass. A screenplay reads nothing that a cast, casting bios, a pick or a voice effect writes,
+        # so of these it waits only for a say-as.
         self.assertTrue(conflicts(job("render", chapters=[7]), job("cast")))
+        self.assertTrue(conflicts(job("check-takes", chapters=[7]), job("cast")))
+        for kind in ("cast", "bios", "pick-voice", "voice-effect"):
+            self.assertFalse(conflicts(job("screenplay", chapters=[7]), job(kind)), kind)
+            self.assertTrue(conflicts(job("render", chapters=[7]), job(kind)), kind)
+        self.assertTrue(conflicts(job("screenplay", chapters=[7]), job("say-as")))
         self.assertTrue(conflicts(job("render", chapters=[7]), job("pick-voice")))
         self.assertFalse(conflicts(job("cast"), job("render", chapters=[7])))
         self.assertFalse(conflicts(job("pick-voice"), job("screenplay", chapters=[7])))
@@ -350,6 +408,23 @@ class NodeChoiceTest(unittest.TestCase):
         self.assertEqual(self.m._blocker_for(self.m.jobs["r"], "breeze", []),
                          "waiting for Cast · eole, queued ahead of it on the same serial")
 
+    def test_an_options_job_does_not_wait_for_a_chapter_job_to_fetch_its_bundle(self):
+        # A screenplay that was just dispatched has no bundle yet. A cast waits for it, because the bundle takes
+        # the voices a cast writes. An options job writes only the options of a term, which no chapter job reads,
+        # so it doesn't wait, and a render behind it in the queue can't take the node it was first for.
+        self.m.workers.append(worker("dev", ["llm"], "linux"))
+        self.m.nomad_state["up"] = True
+        fresh = {"kind": "screenplay", "slug": "demo", "meta": {"chapters": [12]}, "args": ["screenplay", "demo", "12"],
+                 "title": "Screenplay · ch 12",
+                 "nomad": {"target": "dev", "stage": 0, "stages": [{"class": "llm", "args": []}], "contact": None}}
+        cast = {"kind": "cast", "slug": "demo", "meta": {"characters": ["eole"]}, "args": ["cast", "demo"],
+                "title": "Cast · eole"}
+        options = {"kind": "say-options", "slug": "demo", "meta": {"term": "Eole"},
+                   "args": ["say-options", "demo", "--", "Eole"], "title": "Options for Eole"}
+        self.assertEqual(self.m._blocker_for(cast, "llm", [fresh]),
+                         "waiting for Screenplay · ch 12 to fetch its bundle")
+        self.assertIsNone(self.m._blocker_for(options, "llm", [fresh]))
+
     def test_a_cast_passes_a_chapter_job_that_waits_ahead_of_it_in_its_lane(self):
         self.m.nomad_state["up"] = True
         stage = {"class": "breeze", "args": []}
@@ -466,20 +541,31 @@ class NodeChoiceTest(unittest.TestCase):
         self.assertEqual(self.m.wait_reasons["i38"], "waiting for Render · ch 38, which works on the same chapter")
 
     def test_a_character_pass_starts_beside_a_render_of_another_chapter(self):
-        # A character pass waits for a chapter job only on its own chapter. A chapter job reads the bible, so it
-        # waits for a character pass of any chapter, and character passes wait for each other.
+        # A character pass and a chapter job wait for each other only on a chapter that both work on. Character
+        # passes wait for each other and for a cast.
         self.assertFalse(conflicts(job("character-pass", chapters=[39]), job("render", chapters=[38])))
         self.assertFalse(conflicts(job("character-pass", chapters=[39]), job("screenplay", chapters=[38])))
         self.assertFalse(conflicts(job("character-pass", chapters=[39]), job("check-takes", chapters=[38])))
         self.assertTrue(conflicts(job("character-pass", chapters=[38]), job("render", chapters=[38])))
         self.assertTrue(conflicts(job("character-pass", chapters=[37, 38]), job("screenplay", chapters=[38])))
-        self.assertTrue(conflicts(job("render", chapters=[38]), job("character-pass", chapters=[39])))
-        self.assertTrue(conflicts(job("screenplay", chapters=[40]), job("character-pass", chapters=[39])))
+        self.assertFalse(conflicts(job("render", chapters=[38]), job("character-pass", chapters=[39])))
+        self.assertFalse(conflicts(job("screenplay", chapters=[40]), job("character-pass", chapters=[39])))
+        self.assertFalse(conflicts(job("check-takes", chapters=[38]), job("character-pass", chapters=[39])))
+        self.assertTrue(conflicts(job("render", chapters=[38]), job("character-pass", chapters=[38])))
+        self.assertTrue(conflicts(job("screenplay", chapters=[38]), job("character-pass", chapters=[37, 38])))
+        self.assertTrue(conflicts(job("check-takes", chapters=[38]), job("character-pass", chapters=[38])))
         self.assertTrue(conflicts(job("character-pass", chapters=[40]), job("character-pass", chapters=[39])))
         self.assertTrue(conflicts(job("character-pass", chapters=[39]), job("cast")))
+        # A job whose record names no chapter, because its chapter was not on disk when it was queued, may work on
+        # any chapter, so it and a character pass wait for each other.
+        self.assertTrue(conflicts(job("screenplay"), job("character-pass", chapters=[39])))
+        self.assertTrue(conflicts(job("screenplay", chapters=[39]), job("character-pass")))
+        self.assertTrue(conflicts(job("character-pass"), job("render", chapters=[38])))
+        self.assertTrue(conflicts(job("character-pass", chapters=[39]), job("screenplay")))
 
         # Scheduling: a batch queued behind another batch's running render. Its first character pass starts beside
-        # the render, and the rest of the batch waits for the character pass.
+        # the render. The next pass and chapter 39's screenplay wait for that pass, and the render waits for the
+        # cast, which gives its speakers their voices.
         self.m.workers.append(worker("dev", ["llm"], "linux"))
         self.m.nomad_state["up"] = True
 
@@ -501,10 +587,19 @@ class NodeChoiceTest(unittest.TestCase):
         self.m._schedule(0.0, dispatch)
         self.assertEqual(dispatch, ["c39"])
         self.assertEqual(self.m.wait_reasons["c40"], "waiting for Character pass · ch 39, which changes the whole serial")
+        self.assertEqual(self.m.wait_reasons["s39"], "waiting for Character pass · ch 39, which works on the same chapter")
         self.assertEqual(self.m.wait_reasons["r39"],
-                         "waiting for Character pass · ch 40, queued ahead of it on the same serial")
+                         "waiting for Cast · everyone who needs a voice, queued ahead of it on the same serial")
         self.assertEqual({j["id"]: j["status"] for j in batch},
                          {"c39": "running", "c40": "queued", "cast": "queued", "s39": "queued", "r39": "queued"})
+        # Once chapter 39's pass is done, its screenplay starts beside chapter 40's pass and passes the cast, which
+        # waits for that pass. The render still waits for the cast.
+        batch[0]["status"] = "done"
+        self.m._schedule(0.0, dispatch)
+        self.assertEqual(dispatch, ["c39", "c40", "s39"])
+        self.assertEqual(self.m.wait_reasons["cast"], "waiting for Character pass · ch 40, which changes the whole serial")
+        self.assertEqual(self.m.wait_reasons["r39"],
+                         "waiting for Cast · everyone who needs a voice, queued ahead of it on the same serial")
 
         # Bundles and its own chapter: a character pass waits until a running render has fetched its bundle, and a
         # character pass on the render's chapter waits for the render.
@@ -513,7 +608,7 @@ class NodeChoiceTest(unittest.TestCase):
         self.assertEqual(self.m._blocker_for(queued("c41", 9, "character-pass", 41), "llm", [unfetched]),
                          "waiting for Render · ch 38 to fetch its bundle")
         self.assertEqual(self.m._blocker_for(queued("c38", 9, "character-pass", 38), "llm", [render]),
-                         "waiting for Render · ch 38, which changes the whole serial")
+                         "waiting for Render · ch 38, which works on the same chapter")
 
     def test_a_batch_job_waits_only_for_the_jobs_it_needs(self):
         self.m.workers.append(worker("dev", ["llm"], "linux"))
@@ -599,6 +694,8 @@ class NodeChoiceTest(unittest.TestCase):
             patch.start()
             self.addCleanup(patch.stop)
         lib.save_serial("demo", {"title": "Demo"})
+        ann = {"name": "Ann", "importance": "major", "speaks": True}
+        lib.save_bible("demo", {"characters": {"ann": ann}, "pronunciations": {}})
         lib.chapter_dir("demo", 1).mkdir(parents=True)
         (base / "incoming" / "demo").mkdir(parents=True)
         for n in (7, 8):
@@ -609,9 +706,12 @@ class NodeChoiceTest(unittest.TestCase):
         def requests(*numbers):
             def each(kind, params):
                 return [{"kind": kind, "params": {"slug": "demo", **params(n)}} for n in numbers]
-            return (each("fetch", lambda n: {"chapter": n, "html": f"ch{n}.html"})
-                    + each("character-pass", lambda n: {"chapters": str(n)})
-                    + [{"kind": "cast", "params": {"slug": "demo"}}]
+            # as the app queues them: a cast after each character pass, the first one for everyone
+            chain = []
+            for i, n in enumerate(numbers):
+                chain += [{"kind": "character-pass", "params": {"slug": "demo", "chapters": str(n)}},
+                          {"kind": "cast", "params": {"slug": "demo", **({"from_chapter": n} if i else {})}}]
+            return (each("fetch", lambda n: {"chapter": n, "html": f"ch{n}.html"}) + chain
                     + each("screenplay", lambda n: {"chapters": str(n)})
                     + each("render", lambda n: {"chapter": n}))
 
@@ -637,27 +737,163 @@ class NodeChoiceTest(unittest.TestCase):
         self.assertIn("Import saved page · ch 7", self.m.wait_reasons[chars["id"]])
         self.assertEqual(self.m.wait_reasons[render["id"]],
                          "waiting for Character pass · ch 7, queued ahead of it on the same serial")
-        # The character pass follows the import, and the cast follows the character pass.
+        # The character pass follows the import. The cast and the chapter's screenplay follow the character pass
+        # together, because a screenplay doesn't wait for a cast.
         imp["status"] = "done"
         self.assertEqual(schedule(), [chars["id"]])
         chars["status"] = "done"
-        self.assertEqual(schedule(), [cast["id"]])
+        self.assertEqual(schedule(), [cast["id"], script["id"]])
         self.assertEqual(self.m.wait_reasons[render["id"]],
-                         "waiting for Screenplay · ch 7, queued ahead of it on the same serial")
-        # The render waits for its chapter's screenplay, which follows the cast.
+                         "waiting for Cast · everyone who needs a voice, which changes the whole serial")
+        # The render waits for the cast and for its chapter's screenplay.
         cast["status"] = "done"
-        self.assertEqual(schedule(), [script["id"]])
+        self.assertEqual(schedule(), [])
         self.assertEqual(self.m.wait_reasons[render["id"]],
                          "waiting for Screenplay · ch 7, which works on the same chapter")
 
-        # A failed import skips its chapter's character pass and the jobs that wait for that one: the cast, and
-        # with it every screenplay and render. The other import and the earlier chapter's character pass go on.
+        # A cast that has nobody to cast when its turn comes is skipped, and the render then waits only for its
+        # chapter's screenplay.
+        lib.save_bible("demo", {"characters": {"ann": {**ann, "voice_id": "ann"}}, "pronunciations": {}})
+        self.m.jobs = {}
+        imp, chars, cast, script, render = self.m.submit(requests(7))
+        imp["status"] = chars["status"] = "done"
+        self.assertEqual(schedule(), [script["id"]])
+        self.assertEqual((cast["status"], cast["note"]), ("skipped", "nobody needs a voice, so there is nothing to cast"))
+        self.assertEqual(self.m.wait_reasons[render["id"]],
+                         "waiting for Screenplay · ch 7, which works on the same chapter")
+
+        # A failed import skips its chapter's character pass and the jobs that wait for that one: its chapter's
+        # cast, screenplay and render. The other import goes on, and so does every job of the earlier chapter,
+        # which waits for none of them.
         self.m.jobs = {}
         batch = self.m.submit(requests(7, 8))
         self.m._finish(batch[1], "failed", "exit 1", 1)
-        self.assertEqual([j["status"] for j in batch], ["queued", "failed", "queued"] + ["skipped"] * 6)
-        self.assertEqual([j["title"] for j in batch[:4]], ["Import saved page · ch 7", "Import saved page · ch 8",
-                                                           "Character pass · ch 7", "Character pass · ch 8"])
+        self.assertEqual([j["title"] for j in batch[:6]], ["Import saved page · ch 7", "Import saved page · ch 8",
+                                                           "Character pass · ch 7", "Cast · everyone who needs a voice",
+                                                           "Character pass · ch 8", "Cast · ch 8"])
+        self.assertEqual([j["status"] for j in batch], ["queued", "failed", "queued", "queued", "skipped", "skipped",
+                                                        "queued", "skipped", "queued", "skipped"])
+
+    def test_a_batch_casts_after_each_character_pass(self):
+        from unittest import mock
+        from serial_audio import library as lib
+        from serial_audio.web import jobs
+
+        patch = mock.patch.object(lib, "LIBRARY", Path(self.tmp.name) / "library")
+        patch.start()
+        self.addCleanup(patch.stop)
+        lib.save_serial("demo", {"title": "Demo"})
+        ann = {"name": "Ann", "importance": "major", "speaks": True}
+        lib.save_bible("demo", {"characters": {"ann": ann}, "pronunciations": {}})
+
+        # The cast that follows a chapter's character pass names the chapter. A render or a take check of earlier
+        # chapters only doesn't wait for it. Every other job waits for it as for any cast.
+        built = jobs.build("cast", {"slug": "demo", "from_chapter": 55})
+        self.assertEqual((built["title"], built["meta"]["from_chapter"]), ("Cast · ch 55", 55))
+        self.assertNotIn("from_chapter", jobs.build("cast", {"slug": "demo"})["meta"])
+        with self.assertRaises(ValueError):
+            jobs.build("cast", {"slug": "demo", "from_chapter": 55, "characters": ["ann"]})
+        late = {**job("cast"), "meta": {"characters": [], "from_chapter": 55}}
+        self.assertFalse(conflicts(job("render", chapters=[54]), late))
+        self.assertFalse(conflicts(job("check-takes", chapters=[54]), late))
+        self.assertTrue(conflicts(job("render", chapters=[55]), late))
+        self.assertTrue(conflicts(job("render", chapters=[60]), late))
+        self.assertTrue(conflicts(job("render", chapters=[54, 55]), late))
+        self.assertTrue(conflicts(job("render"), late))
+        self.assertTrue(conflicts(job("render", chapters=[54]), job("cast")))
+        self.assertTrue(conflicts(job("character-pass", chapters=[54]), late))
+        self.assertTrue(conflicts(late, job("character-pass", chapters=[54])))
+        self.assertTrue(conflicts(job("pick-voice"), late))
+
+        # A cast is skipped only when it is for everyone and nobody needs a voice.
+        everyone = {"kind": "cast", "slug": "demo", "args": ["cast", "demo"], "meta": {"characters": []}}
+        self.assertIsNone(self.m._already_done(everyone))
+        self.assertIsNone(self.m._already_done({**everyone, "slug": "missing"}))
+        lib.save_bible("demo", {"characters": {"ann": {**ann, "voice_id": "ann"}}, "pronunciations": {}})
+        self.assertEqual(self.m._already_done(everyone), "nobody needs a voice, so there is nothing to cast")
+        self.assertIsNone(self.m._already_done({**everyone, "meta": {"characters": ["ann"]}}))
+        self.assertIsNone(self.m._already_done({**everyone, "meta": {"characters": [], "dry_run": True}}))
+        lib.save_bible("demo", {"characters": {"ann": ann}, "pronunciations": {}})
+
+        # Scheduling: the batch of chapters 54 and 55. Chapter 54's pass starts alone.
+        self.m.workers.append(worker("dev", ["llm"], "linux"))
+        self.m.nomad_state["up"] = True
+
+        def queued(jid, seq, kind, n=None, first=None):
+            titles = {"character-pass": "Character pass", "screenplay": "Screenplay", "render": "Render", "cast": "Cast"}
+            meta = {"characters": [], **({"from_chapter": first} if first else {})} if kind == "cast" else {"chapters": [n]}
+            who = f"ch {n or first}" if n or first else "everyone who needs a voice"
+            return {"id": jid, "seq": seq, "status": "queued", "kind": kind, "slug": "demo", "heavy": True,
+                    "batch": "b1", "created": "2026-11-13T22:30:00", "meta": meta, "title": f"{titles[kind]} · {who}",
+                    "args": [kind, "demo"] + ([str(n)] if n else [])}
+
+        def batch():
+            jobs_ = [queued("c54", 1, "character-pass", 54), queued("k54", 2, "cast"),
+                     queued("c55", 3, "character-pass", 55), queued("k55", 4, "cast", first=55),
+                     queued("s54", 5, "screenplay", 54), queued("s55", 6, "screenplay", 55),
+                     queued("r54", 7, "render", 54), queued("r55", 8, "render", 55)]
+            self.m.jobs = {j["id"]: j for j in jobs_}
+            return self.m.jobs
+
+        b = batch()
+        dispatch = []
+        self.m._schedule(0.0, dispatch)
+        self.assertEqual(dispatch, ["c54"])
+        self.assertEqual(self.m.wait_reasons["k54"], "waiting for Character pass · ch 54, which changes the whole serial")
+        self.assertEqual(self.m.wait_reasons["r54"],
+                         "waiting for Cast · everyone who needs a voice, queued ahead of it on the same serial")
+        # After the pass, the first cast and chapter 54's screenplay start together, and chapter 55's pass waits
+        # for the cast.
+        b["c54"]["status"] = "done"
+        self.m._schedule(0.0, dispatch)
+        self.assertEqual(dispatch, ["c54", "k54", "s54"])
+        self.assertEqual(self.m.wait_reasons["c55"],
+                         "waiting for Cast · everyone who needs a voice, which changes the whole serial")
+        # After the cast, chapter 55's pass starts once the running screenplay has fetched its bundle. Chapter
+        # 54's render waits only for its screenplay.
+        b["k54"]["status"] = "done"
+        self.m._schedule(0.0, dispatch)
+        self.assertEqual(self.m.wait_reasons["c55"], "waiting for Screenplay · ch 54 to fetch its bundle")
+        b["s54"]["nomad"]["contact"] = "t"
+        self.m._schedule(0.0, dispatch)
+        self.assertEqual(dispatch, ["c54", "k54", "s54", "c55"])
+        self.assertEqual(self.m.wait_reasons["r54"], "waiting for Screenplay · ch 54, which works on the same chapter")
+        # Chapter 55's cast starts when its pass ends. Once chapter 54's screenplay ends, chapter 54 renders beside
+        # that cast, and chapter 55's render waits for it.
+        b["c55"]["status"] = "done"
+        self.m._schedule(0.0, dispatch)
+        self.assertEqual(dispatch, ["c54", "k54", "s54", "c55", "k55", "s55"])
+        b["s54"]["status"] = "done"
+        b["k55"]["nomad"]["contact"] = b["s55"]["nomad"]["contact"] = "t"
+        self.m._schedule(0.0, dispatch)
+        self.assertEqual(dispatch, ["c54", "k54", "s54", "c55", "k55", "s55", "r54"])
+        self.assertEqual(b["k55"]["status"], "running")
+        self.assertEqual(self.m.wait_reasons["r55"], "waiting for Cast · ch 55, which changes the whole serial")
+
+        # A failed cast skips the casts after it and the renders from its chapter on. The next chapter's pass
+        # goes on, because it reads nothing a cast files, and so do the screenplays and the render of the chapter
+        # before.
+        b = batch()
+        b["c56"] = queued("c56", 4.5, "character-pass", 56)
+        b["k56"] = queued("k56", 4.7, "cast", first=56)
+        b["s56"] = queued("s56", 6.5, "screenplay", 56)
+        b["r56"] = queued("r56", 9, "render", 56)
+        for jid in ("c54", "k54", "c55"):
+            b[jid]["status"] = "done"
+        self.m._finish(b["k55"], "failed", "exit 1 on laptop", 1)
+        self.assertEqual({jid: j["status"] for jid, j in b.items() if j["status"] != "done"},
+                         {"k55": "failed", "c56": "queued", "k56": "skipped", "s54": "queued", "s55": "queued",
+                          "s56": "queued", "r54": "queued", "r55": "skipped", "r56": "skipped"})
+        # A failed pass still skips the cast that follows it.
+        b = batch()
+        self.m._finish(b["c54"], "failed", "exit 1 on dev", 1)
+        self.assertEqual((b["k54"]["status"], b["c55"]["status"], b["s55"]["status"]), ("skipped",) * 3)
+
+        # A cast for everyone is costed at three characters, and one that follows a chapter's pass at one.
+        from serial_audio.web.nomad import _cast_units
+        self.assertEqual(_cast_units({"candidates": 3, "characters": []}), 9)
+        self.assertEqual(_cast_units({"candidates": 3, "characters": [], "from_chapter": 55}), 3)
+        self.assertEqual(_cast_units({"candidates": 4, "characters": ["ann", "bob"], "from_chapter": None}), 8)
 
     def test_a_failed_batch_job_skips_only_the_jobs_that_wait_for_it(self):
         def queued(jid, seq, kind, n=None, batch="b1"):
@@ -690,20 +926,31 @@ class NodeChoiceTest(unittest.TestCase):
         jobs["r20"]["seq"] = 0.5
         self.m._finish(jobs["s20"], "failed", "exit 1 on dev", 1)
         self.assertEqual(jobs["r20"]["status"], "skipped")
-        # A failed job that changes the whole serial skips every queued job of the batch.
+        # A failed job that changes the whole serial skips every queued job of the batch that waits for it. A fetch
+        # from the site skips them all. A cast skips the renders and not the screenplays, which don't wait for it.
+        jobs = batch()
+        jobs["fetch"] = queued("fetch", 0.5, "fetch")
+        self.m._finish(jobs["fetch"], "failed", "exit 1", 1)
+        self.assertEqual(statuses(), {"s20": "skipped", "s21": "skipped", "r18": "skipped", "r20": "skipped",
+                                      "r21": "skipped", "other": "queued", "fetch": "failed"})
         jobs = batch()
         jobs["cast"] = queued("cast", 0.5, "cast")
         self.m._finish(jobs["cast"], "failed", "exit 1 on laptop", 1)
-        self.assertEqual(statuses(), {"s20": "skipped", "s21": "skipped", "r18": "skipped", "r20": "skipped",
+        self.assertEqual(statuses(), {"s20": "queued", "s21": "queued", "r18": "skipped", "r20": "skipped",
                                       "r21": "skipped", "other": "queued", "cast": "failed"})
         # A job skipped with the failed one skips the later jobs that wait for it, and not the earlier ones. The
         # character pass is on the failed render's chapter, because one on another chapter doesn't wait for a render.
+        # The passes of chapters 19 and 22 wait for it as any two passes do. Chapter 21's render doesn't, because it
+        # waits for a character pass only on its own chapter.
         jobs = batch()
         jobs["s20"]["status"] = "done"
+        jobs["c19"] = queued("c19", 2.5, "character-pass", 19)
         jobs["c20"] = queued("c20", 4.5, "character-pass", 20)
+        jobs["c22"] = queued("c22", 4.7, "character-pass", 22)
         self.m._finish(jobs["r20"], "failed", "exit 1 on laptop", 1)
         self.assertEqual(statuses(), {"s20": "done", "s21": "queued", "r18": "queued", "r20": "failed",
-                                      "r21": "skipped", "other": "queued", "c20": "skipped"})
+                                      "r21": "queued", "other": "queued", "c19": "queued", "c20": "skipped",
+                                      "c22": "skipped"})
         # A stopped job still skips every queued job of the batch.
         jobs = batch()
         self.m._finish(jobs["r18"], "stopped", "stopped from the web app")
@@ -856,7 +1103,7 @@ class NodeChoiceTest(unittest.TestCase):
         self.assertEqual(dispatch, ["r2"])
         self.assertEqual(self.m.jobs["r2"]["nomad"]["target"], "mac")
 
-    def test_backlog_work_starts_only_when_nothing_else_runs_or_waits(self):
+    def test_backlog_work_starts_only_when_no_other_work_runs_or_waits(self):
         from unittest import mock
         from serial_audio.web.jobs import start_order
         self.m.nomad_state["up"] = True
@@ -883,10 +1130,38 @@ class NodeChoiceTest(unittest.TestCase):
                          ("running", {"b5": "backlog work, waiting for Render · ch 5 to finish",
                                       "b6": "backlog work, waiting for Render · ch 5 to finish"}))
 
-        # With the render done, one backlog job starts and the other waits for it, though the Mac is free.
+        # With the render done, one backlog job starts on the laptop. The other doesn't wait for it as backlog work:
+        # it is placed by the usual rules, and a render of 100 takes ends sooner behind it on the laptop than on
+        # the free Mac.
         self.m.jobs["r5"]["status"] = "done"
         self.assertEqual(schedule(), ["b5"])
-        self.assertEqual(self.m.wait_reasons, {"b6": "backlog work, waiting for Render · ch 5 to finish"})
+        self.assertEqual((self.m.jobs["b5"]["nomad"]["target"], list(self.m.wait_reasons)), ("laptop", ["b6"]))
+        self.assertRegex(self.m.wait_reasons["b6"],
+                         r"^waiting for laptop, about \d+ min, instead of about \d+ min on mac now$")
+
+        # A backlog Breeze render that makes two takes, with its saved takes in the app's mirror, ends sooner on the
+        # free Mac, so two backlog renders run at once.
+        self.m.jobs["b6"]["meta"]["engine"] = "breeze"
+        self.m.placement = {"chapters": {"demo": {"6": "laptop"}}}
+        self.m._takes_cache.clear()
+        with mock.patch("serial_audio.web.nomad.reusable_takes", return_value=(98, 100)), \
+                mock.patch.object(self.m, "_mirrored", return_value=True):
+            dispatch: list[str] = []
+            self.m._schedule(0.0, dispatch)
+        self.assertEqual((dispatch, self.m.jobs["b6"]["status"], self.m.jobs["b6"]["nomad"]["target"]),
+                         (["b6"], "running", "mac"))
+        self.assertEqual((self.m.jobs["b5"]["status"], self.m.wait_reasons), ("running", {}))
+
+        # With backlog renders on both nodes, a render that is not backlog work has no free node. It waits for the
+        # node where it ends soonest, and no more backlog work starts while it waits.
+        self.m.jobs["r9"] = queued("r9", 9, 9)
+        self.m.jobs["b10"] = queued("b10", 10, 10, True)
+        self.assertEqual(schedule(), [])
+        self.assertRegex(self.m.wait_reasons["r9"], r"^waiting for (laptop|mac), about \d+ min \((laptop|mac) busy too\)$")
+        self.assertEqual(self.m.wait_reasons["b10"], "backlog work, waiting for the queue to empty")
+        del self.m.jobs["r9"], self.m.jobs["b10"]
+        self.m.jobs["b6"] = queued("b6", 2, 6, True)
+        self.m.placement = {}
 
         # A render queued while backlog work runs is placed by the usual rules, and the backlog work keeps running.
         self.m.jobs["r7"] = queued("r7", 4, 7)
@@ -941,7 +1216,7 @@ class NodeChoiceTest(unittest.TestCase):
             self.assertAlmostEqual(self.m._rate("mac"), 4468 / 255, places=2)
             self.assertAlmostEqual(self.m._rate("laptop"), 689 / 246, places=2)
             self.m.workers.append(worker("box", ["breeze"], "linux", "none"))
-            self.assertEqual(self.m._rate("box"), 60.0)
+            self.assertEqual(self.m._rate("box"), 25.0)
             # Only the last three records of a node count.
             for n in (5, 6, 7):
                 finish(n, "laptop", 100, 100 * n)
@@ -1070,6 +1345,545 @@ class NodeChoiceTest(unittest.TestCase):
         again.tick()
         self.assertEqual(Client.calls, [("serial-audio-llm", f"{j['id']}-0")])
         self.assertEqual(again.jobs[j["id"]]["nomad"]["dispatched"], "serial-audio-llm/dispatch-1")
+
+
+class EstimateTest(unittest.TestCase):
+    """How long jobs take: what a node's own jobs teach, the cost of a render, and the forecast of the queue."""
+
+    def setUp(self):
+        from unittest import mock
+        from serial_audio import library as lib
+        from serial_audio.web.nomad import NomadClient, NomadJobManager
+        self.tmp = tempfile.TemporaryDirectory()
+        patch = mock.patch.object(lib, "LIBRARY", Path(self.tmp.name) / "library")
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.m = NomadJobManager(NomadClient("http://127.0.0.1:9", "token"), state_dir=Path(self.tmp.name) / "state",
+                                 autostart=False)
+        self.m.workers = [worker("laptop", ["breeze", "comfyui"], "windows", "nvidia"),
+                          worker("mac", ["breeze"], "darwin", "metal"), worker("dev", ["llm"], "linux")]
+        self.m.nomad_state["up"] = True
+
+    def tearDown(self):
+        self.m._lock_file.close()
+        self.tmp.cleanup()
+
+    def queued(self, jid, seq, kind, n, **more):
+        title = {"render": "Render", "screenplay": "Screenplay", "check-takes": "Check takes"}.get(kind, kind)
+        job = {"id": jid, "seq": seq, "status": "queued", "kind": kind, "slug": "demo", "heavy": True, "backlog": False,
+               "batch": None, "created": "2026-11-13T19:00:00", "started": None, "finished": None,
+               "title": f"{title} · ch {n}", "args": [kind, "demo", str(n)], "meta": {"chapters": [n]}, **more}
+        self.m.jobs[jid] = job
+        return job
+
+    def render(self, jid, seq, n, takes=None, lines=200, unheard=0, **more):
+        """A queued Breeze render of chapter n.
+
+        takes is what the app last counted it would make, or None when nobody counted. unheard is the saved takes
+        it would only hear.
+        """
+        job = self.queued(jid, seq, "render", n, **more)
+        job["meta"].update({"lines": lines, "engine": "breeze", "runner": "cpp"})
+        if takes is not None:
+            self.m._work[jid] = (0.0, takes, unheard)
+        return job
+
+    def order(self):
+        from serial_audio.web.jobs import start_order
+        return [j["id"] for j in sorted((j for j in self.m.jobs.values() if j["status"] == "queued"), key=start_order)]
+
+    def test_a_node_s_timings_scale_the_default(self):
+        from serial_audio.web.nomad import TIMING_MIN, expected
+        self.assertEqual(TIMING_MIN, 3)
+
+        # Two timings are too few, so the default line stands: 20 s and 2 s a unit.
+        self.assertEqual(expected([[10, 80], [20, 120]], 30, 20.0, 2.0), 80.0)
+        # Three scale it by their median ratio to it. This node is twice as slow as the default, and the one job
+        # that ran fast doesn't count.
+        self.assertEqual(expected([[10, 80], [20, 120], [30, 40]], 30, 20.0, 2.0), 160.0)
+        # Neither does one job that ran long among five that took one and a half times the default.
+        many = [[10, 60], [20, 90], [30, 120], [40, 150], [50, 180], [60, 2000]]
+        self.assertAlmostEqual(expected(many, 100, 20.0, 2.0), 330.0)
+
+        # Work without a size keeps its usual time, and what is not a timing is passed over.
+        mixed = [[0, 18], [0, 21], [0, 18], "x", [1], [0, -5], None, [True, 5]]
+        self.assertEqual(expected(mixed, 0, 20.0, 0.0), 18.0)
+        # A timing of a size that the default costs at nothing teaches nothing.
+        self.assertEqual(expected([[0, 5], [0, 6], [0, 7]], 10, 0.0, 4.0), 40.0)
+        # Whatever a hand edit of placement.json leaves there, the default stands and nothing is raised.
+        for odd in (None, 5, 2.5, "x", {"a": 1}, [[1, float("inf")]] * 3, [[float("nan"), 1]] * 3):
+            self.assertEqual(expected(odd, 10, 20.0, 2.0), 40.0)
+
+    def test_a_breeze_render_is_costed_part_by_part(self):
+        from serial_audio.web import nomad
+        from serial_audio.web.jobs import QUICK_SETUP_SECONDS, RENDER_COST, WORDS_PER_LINE
+
+        def default(part, units=0.0):
+            return RENDER_COST[part][0] + RENDER_COST[part][1] * units
+
+        job = self.render("r1", 1, 1, lines=200)
+        words, rate = 200 * WORDS_PER_LINE, self.m._rate("laptop")
+        around = nomad.PRE_STEP + default("setup") + default("join", words)
+
+        # A touch-up makes under half of its chapter's lines, and its takes run longer than a whole chapter's.
+        # The setup runs to the end of the first take, so the takes after it are costed.
+        self.assertAlmostEqual(self.m._duration(job, "laptop", "laptop", 20),
+                               around + 19 * rate * nomad.TOUCH_RATIO + default("check", 20) + default("finish", 20))
+        # A whole chapter is costed at the node's take rate, with the check of a whole chapter.
+        check = nomad.WHOLE_CHECK[0] + nomad.WHOLE_CHECK[1] * 200
+        self.assertAlmostEqual(self.m._duration(job, "laptop", "laptop", 200),
+                               around + 199 * rate + check + default("finish", 200))
+        # A render that makes no take joins and sends back, with no breeze-server to start.
+        nothing = nomad.PRE_STEP + QUICK_SETUP_SECONDS + default("join", words) + default("finish")
+        self.assertAlmostEqual(self.m._duration(job, "laptop", "laptop", 0), nothing)
+        # On another node than the one that holds the takes, it also fetches them from the app.
+        self.assertAlmostEqual(self.m._duration(job, "mac", "laptop", 0), nothing + nomad.MOVE_PER_TAKE * 200)
+        # A render that makes nothing and hears 150 saved takes again, as after a new version of the check, is
+        # no quick join: breeze-server starts and the check hears them, at the cost of a whole chapter's check.
+        self.m._work["r1"] = (0.0, 0, 150)
+        heard = nomad.WHOLE_CHECK[0] + nomad.WHOLE_CHECK[1] * 150
+        self.assertAlmostEqual(self.m._duration(job, "laptop", "laptop", 0), around + heard + default("finish"))
+        # One that makes 20 takes and hears 30 more checks all 50.
+        self.m._work["r1"] = (0.0, 20, 30)
+        self.assertAlmostEqual(self.m._duration(job, "laptop", "laptop", 20),
+                               around + 19 * rate * nomad.TOUCH_RATIO + default("check", 50) + default("finish", 20))
+        del self.m._work["r1"]
+        # A render that makes exactly half of its lines is a whole chapter, for its takes as for its timings.
+        self.assertAlmostEqual(self.m._duration(job, "laptop", "laptop", 100),
+                               around + 99 * rate + nomad.WHOLE_CHECK[0] + nomad.WHOLE_CHECK[1] * 100
+                               + default("finish", 100))
+
+        # The laptop's own timings scale each default: 30 s to set up, 10 s a touch-up take, and a check, a
+        # join and a send-back that each take twice the default. The Mac has none and keeps the defaults.
+        before = self.m._duration(job, "mac", "mac", 20)
+        self.m.placement["timing"] = {"laptop": {
+            "setup": [[0, 30]] * 3, "touch": [[10, 100]] * 3, "check": [[10, 2 * default("check", 10)]] * 3,
+            "join": [[words, 96]] * 3, "finish": [[10, 2 * default("finish", 10)]] * 3}}
+        self.assertAlmostEqual(self.m._duration(job, "laptop", "laptop", 20),
+                               nomad.PRE_STEP + 30 + 190 + 2 * default("check", 20) + 96 + 2 * default("finish", 20))
+        self.assertEqual(self.m._duration(job, "mac", "mac", 20), before)
+        # Timings that a hand edit of placement.json broke count as none, and the next result starts them again.
+        for broken in ({"laptop": {"setup": 5}}, {"laptop": []}, 7):
+            self.m.placement["timing"] = broken
+            self.assertAlmostEqual(self.m._duration(job, "laptop", "laptop", 20),
+                                   around + 19 * rate * nomad.TOUCH_RATIO + default("check", 20) + default("finish", 20))
+        self.m.placement.pop("timing")
+
+        # The chapter list's figure for a chapter without audio is a whole chapter on the fastest breeze node.
+        probe = {"kind": "render", "meta": {"engine": "breeze", "lines": nomad.DEFAULT_LINES}}
+        self.assertAlmostEqual(self.m.minutes_per_line() * 60 * nomad.DEFAULT_LINES,
+                               self.m._render_seconds(probe, "laptop", nomad.DEFAULT_LINES))
+
+    def test_the_app_times_each_part_of_a_job_as_its_log_arrives(self):
+        from unittest import mock
+        from serial_audio.web import nomad
+        clock = [0.0]
+
+        def start(job, node, cls):
+            job.update({"status": "running", "started": "2026-11-13T19:00:00"})
+            job.pop("nomad", None)
+            self.m._mark_dispatch(job, node, cls)
+            job["nomad"]["node"] = node
+            return [0]
+
+        def say(job, sent, at, text):
+            clock[0] = at
+            sent[0] = self.m.worker_log(job["id"], job["nomad"]["key"], "0", sent[0], text.encode())["offset"]
+
+        def run(job, make, first=1000.0):
+            sent = start(job, "laptop", "breeze")
+            say(job, sent, first + 6, "[worker] Render on laptop, stage 0\n$ python -m serial_audio.cli render demo 1\n")
+            say(job, sent, first + 9, "render: demo chapter 1: 100 lines, 1 voices {0: 'narrator'} with Breeze TTS 2 via cpp\n")
+            say(job, sent, first + 26, "   breeze-server started at http://127.0.0.1:8137\n   generating takes with Breeze "
+                f"TTS 2 via breeze-server (this is the slow part): {make} of 100 lines, {100 - make} reused\n")
+            say(job, sent, first + 31, "   first take done in 5 s\n")
+            # the worker's log arrives in pieces, and this line is cut in two
+            say(job, sent, first + 66, f"   checking the {make} takes with Parakeet bef")
+            say(job, sent, first + 68, "ore the join...\n")
+            say(job, sent, first + 90, "   joining takes...\n")
+            say(job, sent, first + 140, "   joined 100 takes into 600.0 s at 24000 Hz\n   checking 0 takes with Parakeet, "
+                "100 already checked...\n   take check: no takes flagged in 100\n   audio: x.opus\n")
+            self.m._record_timing(job, "laptop", first + 146)
+
+        with mock.patch.object(nomad.time, "time", lambda: clock[0]):
+            # A touch-up of 10 takes: each part's first line is timed when it arrives, also the line that came in
+            # two pieces.
+            job = self.render("r1", 1, 1, lines=100)
+            run(job, 10)
+            self.assertEqual(job["nomad"]["marks"], {"step": 1006.0, "takes": 1026.0, "first": 1031.0, "check": 1068.0,
+                                                     "join": 1090.0, "joined": 1140.0, "audio": 1140.0})
+            # Its result adds one timing to each part of the node: seconds against takes, takes heard or words.
+            # The setup runs to the end of the first take, and the takes are the nine after it.
+            self.assertEqual(self.m.placement["timing"], {"laptop": {
+                "setup": [[0, 25.0]], "touch": [[9, 37.0]], "check": [[10, 22.0]], "join": [[1600, 50.0]],
+                "finish": [[10, 6.0]]}})
+
+            # A whole chapter's check is kept apart, and its takes are left to the node's take rate.
+            run(self.render("r2", 2, 1, lines=100), 80, first=2000.0)
+            kept = self.m.placement["timing"]["laptop"]
+            self.assertEqual((kept["check-whole"], kept["touch"]), ([[80, 22.0]], [[9, 37.0]]))
+            self.assertEqual(len(kept["setup"]), 2)
+
+            # A stage of another kind adds one timing, from its step to its result, by the words of its chapters.
+            script = self.queued("s1", 3, "screenplay", 5)
+            sent = start(script, "dev", None)
+            say(script, sent, 3010.0, "$ python -m serial_audio.cli screenplay demo 5\n")
+            self.m._record_timing(script, "dev", 3130.0)
+            self.assertEqual(self.m.placement["timing"]["dev"], {"screenplay/llm": [[3200, 120.0]]})
+
+            # A stage whose step the app did not see start teaches nothing.
+            late = self.queued("s2", 4, "screenplay", 6)
+            start(late, "dev", None)
+            self.m._record_timing(late, "dev", 4000.0)
+            self.assertEqual(len(self.m.placement["timing"]["dev"]["screenplay/llm"]), 1)
+
+            # Only the last TIMING_KEEP timings of a kind stay.
+            for i in range(nomad.TIMING_KEEP + 3):
+                self.m._record_timing(script, "dev", 3130.0 + i)
+            got = self.m.placement["timing"]["dev"]["screenplay/llm"]
+            self.assertEqual((len(got), got[-1]), (nomad.TIMING_KEEP, [3200, 120.0 + nomad.TIMING_KEEP + 2]))
+            # A step whose result came with its first log line took no time. Its mark is rounded to a tenth of
+            # a second, which can put it just after the result.
+            self.m._record_timing(script, "dev", 3009.96)
+            self.assertEqual(self.m.placement["timing"]["dev"]["screenplay/llm"][-1], [3200, 0.0])
+            # Timings that a hand edit of placement.json broke are started again.
+            for broken in ({"dev": {"screenplay/llm": 5}}, {"dev": []}, 7):
+                self.m.placement["timing"] = broken
+                self.m._record_timing(script, "dev", 3130.0)
+                self.assertEqual(self.m.placement["timing"]["dev"]["screenplay/llm"], [[3200, 120.0]])
+
+    def test_the_forecast_places_each_queued_job_as_the_scheduler_would(self):
+        from unittest import mock
+        seconds = {"laptop": 200.0, "mac": 300.0, "dev": 60.0}
+
+        def forecast():
+            with mock.patch.object(self.m, "_stage_seconds", lambda job, st, node: seconds[node]), \
+                    mock.patch.object(self.m, "_remaining", lambda job, count=True: 100.0):
+                got = self.m._forecast(0.0)
+            return {jid: (o.get("on"), o.get("start_in"), o.get("end_in")) for jid, o in got.items()}
+
+        # The laptop has 100 s left of chapter 9. A queued render takes 200 s there and 300 s on the Mac.
+        stage = {"class": "breeze", "args": []}
+        running = self.render("r0", 0, 9, takes=10, nomad={"target": "laptop", "node": "laptop", "stage": 0,
+                                                           "stages": [stage]})
+        running["status"] = "running"
+        for i in (1, 2, 3):
+            self.render(f"r{i}", i, i, takes=10)
+        self.render("b1", 4, 11, takes=10, backlog=True)
+        self.render("b2", 5, 12, takes=10, backlog=True)
+        got = forecast()
+        # Each render goes where it ends first: the first waits for the laptop, the second takes the idle Mac,
+        # and the third waits for the laptop again.
+        self.assertEqual((got["r0"], got["r1"], got["r2"], got["r3"]),
+                         (("laptop", None, 100.0), ("laptop", 100.0, 300.0), ("mac", 0.0, 300.0),
+                          ("laptop", 300.0, 500.0)))
+        # Backlog work starts when the last other job has ended, and two backlog renders run on two nodes.
+        self.assertEqual((got["b1"], got["b2"]), (("laptop", 500.0, 700.0), ("mac", 500.0, 800.0)))
+
+        # A running cast has 100 s left of its briefs on the Claude node. Its voices follow on a GPU node, so it
+        # ends after both, and a render of its serial waits for that.
+        briefs = {"class": "llm", "args": [], "label": "casting briefs"}
+        cast = self.queued("c0", 0, "cast", 0, meta={"characters": ["eole"]},
+                           nomad={"node": "dev", "stage": 0, "stages": [briefs, dict(stage, label="voices")]})
+        cast["status"] = "running"
+        self.m.jobs = {"c0": cast}
+        self.render("r1", 1, 1, takes=10)
+        got = forecast()
+        self.assertEqual((got["c0"], got["r1"]), (("dev", None, 300.0), ("laptop", 300.0, 500.0)))
+
+        # A render waits for the screenplay of its chapter that is queued ahead of it, and no other render does.
+        # A cast is its briefs on the Claude node and then its voices on a GPU node, and the renders queued after
+        # it wait for it.
+        self.m.jobs = {"r0": running}
+        self.queued("s5", 1, "screenplay", 5)
+        self.render("r5", 2, 5, takes=10)
+        self.render("r6", 3, 6, takes=10)
+        cast = self.queued("c", 4, "cast", 0, meta={"characters": ["eole"]})
+        cast["args"] = ["cast", "demo", "--engine", "breeze"]
+        self.render("r7", 5, 7, takes=10)
+        got = forecast()
+        self.assertEqual((got["s5"], got["r5"], got["r6"]),
+                         ((None, 0.0, 60.0), ("laptop", 100.0, 300.0), ("mac", 0.0, 300.0)))
+        self.assertEqual((got["c"], got["r7"]), (("laptop", 0.0, 500.0), ("laptop", 500.0, 700.0)))
+
+        # A render whose takes nobody has counted has no times yet, and neither has backlog work, which waits
+        # for it. The next render is placed as if it were not there.
+        self.m.jobs = {"r0": running}
+        self.render("r1", 1, 1)
+        del self.m._work["r1"]
+        self.render("r2", 2, 2, takes=10)
+        self.render("b1", 3, 11, takes=10, backlog=True)
+        got = forecast()
+        self.assertEqual((got["r1"], got["r2"], got["b1"]),
+                         ((None, None, None), ("laptop", 100.0, 300.0), (None, None, None)))
+        # With the queue on hold no job has a time, and each keeps its length.
+        self.m.paused = True
+        with mock.patch.object(self.m, "_stage_seconds", lambda job, st, node: seconds[node]), \
+                mock.patch.object(self.m, "_remaining", lambda job, count=True: 100.0):
+            held = self.m._forecast(0.0)
+        self.assertEqual((held["r2"].get("start_in"), held["r2"].get("end_in"), held["r2"]["estimate"]),
+                         (None, None, 200.0))
+
+        # The forecast counts no take itself. A running render that nobody has counted and whose log gives no
+        # time yet has no end, and neither has the render that would wait for its node.
+        self.m.paused = False
+        del self.m._work["r0"]
+        running.update({"started": "2026-11-13T19:00:00"})
+        running["nomad"].update({"contact": "t", "marks": {}})
+        self.m.jobs = {"r0": running}
+        self.m.workers = [w for w in self.m.workers if w["name"] != "mac"]
+        self.render("r2", 2, 2, takes=10)
+        with mock.patch("serial_audio.web.nomad.reusable_takes") as reuse, \
+                mock.patch("serial_audio.web.nomad.render_changes") as changes:
+            got = self.m._forecast(0.0)
+        self.assertEqual((reuse.call_count, changes.call_count), (0, 0))
+        self.assertEqual((got["r0"].get("end_in"), got["r2"].get("end_in")), (None, None))
+
+    def test_the_snapshot_gives_each_waiting_job_its_place_in_the_forecast(self):
+        import time
+        self.render("r1", 1, 1, takes=10)
+        staged = self.render("r2", 2, 2, takes=10)
+        staged["nomad"] = {"key": "secret", "stage": 0, "stages": [{"class": "breeze", "args": []}], "marks": {"step": 1.0}}
+        self.m._outlook = {"r1": {"estimate": 200.0, "start_in": 100.0, "end_in": 300.0, "on": "laptop"},
+                           "r2": {"estimate": 200.0, "start_in": 300.0, "end_in": 500.0, "on": "laptop"}}
+
+        # The forecast is 40 s old, so its times are 40 s nearer. The length and the node stand.
+        self.m._outlook_at = time.time() - 40
+        snap = self.m.snapshot()
+        r1, r2 = (next(j for j in snap["jobs"] if j["id"] == jid) for jid in ("r1", "r2"))
+        self.assertEqual((r1["estimate"], r1["on"]), (200.0, "laptop"))
+        self.assertAlmostEqual(r1["start_in"], 60.0, delta=2)
+        self.assertAlmostEqual(r1["end_in"], 260.0, delta=2)
+        # The queue ends when its last job does.
+        self.assertAlmostEqual(snap["queue_end_in"], 460.0, delta=2)
+        # A job's key and the times of its log lines stay in the app.
+        self.assertEqual(sorted(r2["nomad"]), ["stage", "stages"])
+
+        # A job the forecast could not place has a length and no times, and then the queue has no end either.
+        self.m._outlook["r2"] = {"estimate": 200.0, "start_in": None, "end_in": None, "on": None}
+        snap = self.m.snapshot()
+        r2 = next(j for j in snap["jobs"] if j["id"] == "r2")
+        self.assertEqual((r2["estimate"], "start_in" in r2, "end_in" in r2, snap["queue_end_in"]),
+                         (200.0, False, False, None))
+        # A job the forecast has not seen yet shows no figure of any kind.
+        self.render("r3", 3, 3)
+        r3 = next(j for j in self.m.snapshot()["jobs"] if j["id"] == "r3")
+        self.assertFalse({"estimate", "start_in", "end_in"} & set(r3))
+
+    def test_a_running_job_shows_the_time_to_the_end_of_its_last_stage(self):
+        import datetime
+        from unittest import mock
+        from serial_audio.web import nomad
+
+        T0 = 1_800_000_000.0
+
+        def iso(t):
+            return datetime.datetime.fromtimestamp(t).astimezone().isoformat(timespec="seconds")
+
+        # A cast writes its briefs on the Claude node, 20 s into its step here, and designs its voices after that.
+        cast = self.queued("c", 1, "cast", 0, meta={"characters": ["eole"], "candidates": 3})
+        cast.update({"status": "running", "started": iso(T0 - 10)})
+        cast["nomad"] = {"key": "k", "stage": 0, "node": "dev", "contact": "t", "marks": {"step": T0},
+                         "stages": [{"class": "llm", "args": [], "label": "casting briefs"},
+                                    {"class": "breeze", "args": [], "label": "voices"}]}
+        briefs = nomad.LLM_STAGE
+        voices = 60 + 3 * nomad.CAST_TAKES * self.m._rate("laptop")
+        p = self.m.progress(cast, T0 + 20)
+        # The time left is the rest of the briefs and the voices on the fastest node, and the bar is the share
+        # of the whole job since it started. The way to the node is behind a step that has begun.
+        self.assertAlmostEqual(p["eta"], briefs - 20 + voices)
+        self.assertAlmostEqual(p["fraction"], 30 / (30 + briefs - 20 + voices))
+        # The scheduler asks how long the job keeps its node, which is the rest of the briefs alone.
+        with mock.patch.object(nomad.time, "time", lambda: T0 + 20):
+            self.assertAlmostEqual(self.m._remaining(cast), briefs - 20)
+        # A stage that outlasts its estimate keeps a share of it, so the time left stays above the stages to come.
+        p = self.m.progress(cast, T0 + 4000)
+        self.assertAlmostEqual(p["eta"], nomad.OVERRUN_SHARE * briefs + voices)
+
+        # While the worker waits for the machine there is no time left to show.
+        self.m.log_path(cast).write_text("[worker] waiting: ComfyUI is running a prompt\n", encoding="utf-8")
+        p = self.m.progress(cast, T0 + 20)
+        self.assertEqual((p["phase"], p["eta"], p["fraction"]), ("waiting", None, None))
+
+        # A Breeze render shows no time left until its takes are counted, and then the whole job.
+        render = self.render("r1", 2, 1)
+        render.update({"status": "running", "started": iso(T0)})
+        render["nomad"] = {"key": "k", "stage": 0, "node": "laptop", "contact": "t", "marks": {},
+                           "stages": [{"class": "breeze", "args": []}]}
+        self.assertIsNone(self.m.progress(render, T0 + 1)["eta"])
+        self.m._work["r1"] = (0.0, 10, 0)
+        self.assertAlmostEqual(self.m.progress(render, T0 + 1)["eta"],
+                               self.m._render_seconds(render, "laptop", 10) - nomad.PRE_STEP)
+        # The saved takes it only hears are in its time left from the start, as in its estimate.
+        self.m._work["r1"] = (0.0, 10, 40)
+        self.assertAlmostEqual(self.m.progress(render, T0 + 1)["eta"],
+                               self.m._render_seconds(render, "laptop", 10, 40) - nomad.PRE_STEP)
+        # A render that makes nothing and hears nothing is a join, before the join and during it.
+        self.m._work["r1"] = (0.0, 0, 0)
+        before = self.m.progress(render, T0 + 1)["eta"]
+        self.assertAlmostEqual(before, self.m._render_seconds(render, "laptop", 0) - nomad.PRE_STEP)
+        self.m.log_path(render).write_text(
+            "$ python -m serial_audio.cli render demo 1\nrender: demo chapter 1: 200 lines, 1 voices {0: 'narrator'} "
+            "with Breeze TTS 2 via cpp\n   joining takes...\n", encoding="utf-8")
+        render["nomad"]["marks"] = {"step": T0, "join": T0 + 1}
+        self.assertLessEqual(self.m.progress(render, T0 + 2)["eta"], before)
+
+        # The newest count of a render's takes is the one that stands: a count that was marked for another loses
+        # to the scheduler's own, and a later recount wins over it.
+        self.m._work["r1"] = (0.0, 7, 0)
+        self.m._takes_cache["r1"] = (T0, 9)
+        self.assertEqual(self.m._known_takes(render), 9)
+        self.m._work["r1"] = (T0 + 5, 11, 0)
+        self.assertEqual(self.m._known_takes(render), 11)
+
+    def test_the_takes_of_queued_renders_are_counted_a_few_at_a_time(self):
+        import time
+        from unittest import mock
+        from serial_audio.web import nomad
+        for i in range(1, 6):
+            self.render(f"r{i}", i, i)
+        counts = {"spoken": 200, "make": 8, "retake": 2, "unheard": 5, "join": False, "engine": "breeze"}
+        with mock.patch("serial_audio.web.nomad.render_changes", return_value=counts) as count:
+            # One pass counts WORK_PER_TICK renders, the first of the queue first, from the stored verdicts.
+            self.m._poll_work(time.time())
+            self.assertEqual((count.call_count, sorted(self.m._work)), (nomad.WORK_PER_TICK, ["r1", "r2"]))
+            count.assert_called_with("demo", 2, None, "cpp", stored=True)
+            self.m._poll_work(time.time())
+            self.m._poll_work(time.time())
+            # A render's takes are the ones it makes and the flagged ones it takes again. The saved takes it only
+            # hears are counted beside them.
+            self.assertEqual({jid: got[1:] for jid, got in self.m._work.items()},
+                             {f"r{i}": (10, 5) for i in range(1, 6)})
+            self.assertEqual((self.m._known_takes(self.m.jobs["r3"]), self.m._known_unheard(self.m.jobs["r3"])),
+                             (10, 5))
+            # A counted render is left alone.
+            count.reset_mock()
+            self.m._poll_work(time.time())
+            count.assert_not_called()
+
+            # A job that changes what the serial's renders read marks them for another count, and each keeps its
+            # count until then.
+            count.return_value = {**counts, "make": 48}
+            self.m._stale_work("demo")
+            self.assertEqual(self.m._known_takes(self.m.jobs["r5"]), 10)
+            self.m._poll_work(time.time())
+            self.assertEqual((count.call_count, self.m._known_takes(self.m.jobs["r1"]),
+                              self.m._known_takes(self.m.jobs["r5"])), (nomad.WORK_PER_TICK, 50, 10))
+
+            # A count that is marked while it is read stays marked, so the next pass reads it again.
+            count.reset_mock()
+            count.side_effect = lambda *a, **k: self.m._stale_work("demo") or counts
+            self.m._poll_work(time.time())
+            self.assertEqual([jid for jid, got in sorted(self.m._work.items()) if got[0] == 0.0],
+                             ["r1", "r2", "r3", "r4", "r5"])
+            count.side_effect = None
+
+            # The count of a job that left the queue is forgotten.
+            self.m.jobs["r1"]["status"] = "done"
+            self.m._poll_work(time.time())
+            self.assertNotIn("r1", self.m._work)
+        # A chapter that can't be planned yet counts as all its lines.
+        self.render("r9", 9, 9, lines=120)
+        self.m._work = {}
+        with mock.patch("serial_audio.web.nomad.render_changes", side_effect=FileNotFoundError("no script")):
+            for _ in range(4):
+                self.m._poll_work(time.time())
+        self.assertEqual((self.m._known_takes(self.m.jobs["r9"]), self.m._known_unheard(self.m.jobs["r9"])), (120, 0))
+
+    def test_queued_jobs_move_to_the_top_the_bottom_or_ahead_of_another(self):
+        for i, jid in enumerate("abcd", 1):
+            self.render(jid, i, i)
+        for i, jid in enumerate("xyz", 5):
+            self.render(jid, i, i, backlog=True)
+        start = {jid: j["seq"] for jid, j in self.m.jobs.items()}
+
+        def moved(ids, to, before=None):
+            for jid, seq in start.items():
+                self.m.jobs[jid]["seq"] = seq
+            self.m.reorder(list(ids), to, before)
+            return "".join(self.order())
+
+        # One job or several go to the top or the bottom, and several keep the order they had.
+        self.assertEqual((moved("c", "top"), moved("b", "bottom")), ("cabdxyz", "acdbxyz"))
+        self.assertEqual((moved("db", "top"), moved("ca", "bottom")), ("bdacxyz", "bdacxyz"))
+        # Up and down move by one place and stop at the ends.
+        self.assertEqual((moved("c", "up"), moved("a", "up"), moved("b", "down"), moved("d", "down")),
+                         ("acbdxyz", "abcdxyz", "acbdxyz", "abcdxyz"))
+        self.assertEqual((moved("ab", "down"), moved("cd", "up")), ("cabdxyz", "acdbxyz"))
+        # A job goes ahead of the job it is dropped on.
+        self.assertEqual((moved("d", "before", "b"), moved("a", "before", "d"), moved("ac", "before", "c")),
+                         ("adbcxyz", "bcadxyz", "bacdxyz"))
+
+        # Backlog work stays behind every other job, so each job moves among its own kind of work.
+        self.assertEqual((moved("z", "top"), moved("az", "bottom")), ("abcdzxy", "bcdaxyz"))
+        self.assertEqual((moved("y", "before", "a"), moved("b", "before", "y")), ("abcdyxz", "acdbxyz"))
+        # The queue keeps the numbers it had, so a job queued later still goes behind every one of them.
+        self.assertEqual(sorted(j["seq"] for j in self.m.jobs.values()), sorted(start.values()))
+
+        # A job that is not queued can't be moved, and neither can a job be moved an unknown way.
+        self.assertRaises(KeyError, self.m.reorder, ["nope"], "top")
+        self.assertRaises(KeyError, self.m.reorder, ["a"], "before", "nope")
+        self.assertRaises(ValueError, self.m.reorder, ["a"], "sideways")
+        self.m.jobs["a"]["status"] = "running"
+        self.assertRaises(KeyError, self.m.reorder, ["a"], "top")
+        # A selection in which one job has started meanwhile still moves the others. The queue stood at c, d, b.
+        self.m.reorder(["a", "d"], "top")
+        self.assertEqual("".join(self.order()), "dcbxyz")
+
+    def test_a_selection_is_cancelled_in_one_go(self):
+        from unittest import mock
+        for i, jid in enumerate("abc", 1):
+            self.render(jid, i, i)
+        self.m.jobs["b"]["status"] = "running"
+        # The queued jobs are cancelled, the one that started meanwhile keeps running, an id nobody knows is
+        # passed over, and the job list is written once.
+        with mock.patch.object(self.m, "_save") as save:
+            self.assertEqual(self.m.cancel_queued(["a", "b", "c", "nope"]), 2)
+        self.assertEqual([self.m.jobs[j]["status"] for j in "abc"], ["cancelled", "running", "cancelled"])
+        self.assertTrue(self.m.jobs["a"]["finished"])
+        save.assert_called_once_with()
+        # Nothing to cancel writes nothing.
+        with mock.patch.object(self.m, "_save") as save:
+            self.assertEqual(self.m.cancel_queued(["b", "nope"]), 0)
+        save.assert_not_called()
+
+    def test_a_moved_job_stays_behind_the_jobs_of_its_batch_it_waits_for(self):
+        from serial_audio.web.jobs import JobManager
+
+        def batch():
+            self.m.jobs = {}
+            self.render("a", 1, 1)
+            self.queued("s2", 2, "screenplay", 2, batch="B")
+            self.render("r2", 3, 2, batch="B")
+            self.render("r9", 4, 9, batch="B")
+
+        # Chapter 2's render was queued with its screenplay. Moved to the top it stops behind the screenplay,
+        # and chapter 9's render, which waits for neither, goes all the way.
+        batch()
+        self.m.reorder(["r2", "r9"], "top")
+        self.assertEqual(self.order(), ["r9", "a", "s2", "r2"])
+        # The screenplay moved to the bottom takes its render with it.
+        batch()
+        self.m.reorder(["s2"], "bottom")
+        self.assertEqual(self.order(), ["a", "r9", "s2", "r2"])
+        # Two jobs that were not queued together move past each other freely.
+        batch()
+        self.m.jobs["r2"]["batch"] = None
+        self.m.reorder(["r2"], "top")
+        self.assertEqual(self.order(), ["r2", "a", "s2", "r9"])
+
+        # On one machine every job of a batch keeps its place among them.
+        one = JobManager(state_dir=Path(self.tmp.name) / "one", autostart=False)
+        try:
+            batch()
+            one.jobs = self.m.jobs
+            one.reorder(["r9"], "top")
+            self.assertEqual(self.order(), ["a", "s2", "r2", "r9"])
+            # The old way to move one job by one place still works.
+            one.move("a", "down")
+            self.assertEqual(self.order(), ["s2", "a", "r2", "r9"])
+        finally:
+            one._lock_file.close()
 
 
 def wav_bytes(samples: bytes) -> bytes:
@@ -1664,14 +2478,40 @@ class BacklogTest(unittest.TestCase):
         self.assertEqual((marked["backlog"], plain["backlog"], odd["backlog"]), (True, False, False))
         self.assertTrue(self.m.retry(marked["id"])["backlog"])
 
-        # It waits for any running job and for a queued job that is not backlog work, and for nothing else.
-        def job(status, backlog=False):
-            return {"status": status, "backlog": backlog, "title": "Render · ch 9"}
+        # A job of a kind that changes more than its chapter waits for any running job and for a queued job that
+        # is not backlog work, and for nothing else.
+        def job(status, backlog=False, kind="cast", **extra):
+            return {"status": status, "backlog": backlog, "kind": kind, "title": "Render · ch 9", **extra}
         mine = job("queued", True)
         self.assertIsNone(backlog_wait(mine, [mine, job("queued", True), job("done"), job("failed")]))
         self.assertEqual(backlog_wait(mine, [mine, job("queued")]), "backlog work, waiting for the queue to empty")
         self.assertEqual(backlog_wait(mine, [mine, job("running", True)]),
                          "backlog work, waiting for Render · ch 9 to finish")
+
+        # A backlog render or take check doesn't wait for a running backlog render or take check, so two of them
+        # run on two nodes. It waits for running backlog work of any other kind, and that waits for it.
+        held = "backlog work, waiting for Render · ch 9 to finish"
+        for mine_kind, other_kind, reason in (("render", "render", None), ("check-takes", "render", None),
+                                              ("render", "check-takes", None), ("render", "cast", held),
+                                              ("cast", "render", held)):
+            mine = job("queued", True, mine_kind)
+            self.assertEqual(backlog_wait(mine, [mine, job("running", True, other_kind)]), reason, (mine_kind, other_kind))
+
+        # It still waits for a job that is not backlog work, running or queued, and for a backlog job that is
+        # between two stages on the cluster.
+        mine = job("queued", True, "render")
+        self.assertEqual(backlog_wait(mine, [mine, job("running", False, "render")]), held)
+        self.assertEqual(backlog_wait(mine, [mine, job("running", True, "render"), job("queued", False, "render")]),
+                         "backlog work, waiting for the queue to empty")
+        self.assertEqual(backlog_wait(mine, [mine, job("queued", True, "render", nomad={"stage": 1})]), held)
+
+        # It doesn't start beside a running backlog render while a backlog job of another kind is queued ahead of
+        # it, or that job would wait for as long as renders keep coming. One queued after it doesn't hold it.
+        mine = job("queued", True, "render", seq=5)
+        running = job("running", True, "render", seq=1)
+        self.assertEqual(backlog_wait(mine, [running, job("queued", True, "cast", seq=3), mine]), held)
+        self.assertIsNone(backlog_wait(mine, [running, mine, job("queued", True, "cast", seq=7)]))
+        self.assertIsNone(backlog_wait(mine, [running, job("queued", True, "check-takes", seq=3), mine]))
 
     def test_one_machine_runs_backlog_work_after_everything_else(self):
         # Two backlog jobs are queued ahead of a job that is not backlog work.
@@ -1685,11 +2525,13 @@ class BacklogTest(unittest.TestCase):
         self.assertEqual(self.started, [plain["id"]])
         self.assertEqual(self.m.wait_reasons[first["id"]], f"backlog work, waiting for {plain['title']} to finish")
 
-        # Then the backlog jobs run one at a time, in the order they were queued.
+        # Then the backlog jobs run one at a time, in the order they were queued. The second one doesn't wait as
+        # backlog work, since two take checks may run beside each other: it waits because one machine runs one
+        # heavy job at a time.
         plain["status"] = "done"
         self.m.tick()
         self.assertEqual(self.started, [plain["id"], first["id"]])
-        self.assertEqual(self.m.wait_reasons[second["id"]], f"backlog work, waiting for {first['title']} to finish")
+        self.assertEqual(self.m.wait_reasons[second["id"]], f"waiting for {first['title']}")
         first["status"] = "done"
         self.m.tick()
         self.assertEqual(self.started, [plain["id"], first["id"], second["id"]])

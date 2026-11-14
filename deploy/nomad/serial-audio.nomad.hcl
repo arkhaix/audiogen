@@ -39,9 +39,16 @@ variable "node" {
   description = "A node name pins the job to that node and appends -<node> to its id."
 }
 
+variable "user" {
+  type        = string
+  default     = ""
+  description = "The user the task runs as. Empty means aj for llm and the Nomad client's own user for the other classes."
+}
+
 locals {
   gpu    = var.class != "llm"
   job_id = var.node == "" ? "${var.prefix}-${var.class}" : "${var.prefix}-${var.class}-${var.node}"
+  user   = var.user != "" ? var.user : (var.class == "llm" ? "aj" : "")
 }
 
 job "serial-audio" {
@@ -122,7 +129,7 @@ job "serial-audio" {
 
     task "work" {
       driver = "raw_exec"
-      user   = var.class == "llm" ? "aj" : ""
+      user   = local.user
 
       config {
         command = "${meta.serial_audio_python}"
@@ -158,10 +165,12 @@ job "serial-audio" {
         SERIAL_AUDIO_CONFIG = "${meta.serial_audio_config}"
         PYTHONUNBUFFERED    = "1"
         PYTHONIOENCODING    = "utf-8"
+      }, local.user == "" ? {} : {
+        # A task under a named user would otherwise keep the home of the Nomad client's user.
+        HOME = "/home/${local.user}"
+        USER = local.user
+        PATH = "/home/${local.user}/.local/bin:/home/${local.user}/bin:/usr/local/bin:/usr/bin:/bin"
       }, var.class != "llm" ? {} : {
-        HOME = "/home/aj"
-        USER = "aj"
-        PATH = "/home/aj/.local/bin:/home/aj/bin:/usr/local/bin:/usr/bin:/bin"
         # The worker refuses the job when the token did not arrive.
         SERIAL_AUDIO_CLAUDE_AUTH = "token"
       })

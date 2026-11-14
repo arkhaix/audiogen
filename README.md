@@ -91,7 +91,7 @@ disk is mounted. `--publish-skip <slug>` keeps a serial out. The header says "au
 Every change goes through `python -m serial_audio.cli` as a background job, under `serial_audio/web/runjob.py`,
 so a job keeps running when the server stops and is picked up again when it starts. Job records and logs live in
 `.webapp/`. The rest of this paragraph is the one-machine executor (`--executor local`), and `deploy/README.md` has
-the cluster's rules, with the media mirror that lets a Breeze job run on either GPU node. Heavy jobs (character pass, screenplay, cast, casting bios, render) run one at a time, in order, and wait while
+the cluster's rules, with the media mirror that lets a Breeze job run on any `breeze` node. Heavy jobs (character pass, screenplay, cast, casting bios, render) run one at a time, in order, and wait while
 any pipeline process the app did not start is running, including a PowerShell script that calls the CLI, or
 while ComfyUI is busy with a prompt the app did not queue. A render or cast that queues ComfyUI prompts also waits
 for ComfyUI to answer. A Breeze render under `breeze-server` does not, so it runs with ComfyUI down. A render job is
@@ -100,8 +100,8 @@ Quick jobs (pick a voice, import a saved page, add a serial) run straight away, 
 the bible. A batch from the Process dialog skips its
 remaining jobs when one fails. A queued render is skipped when the chapter was rendered after it was queued.
 A job whose request has `"backlog": true` in its params is backlog work, and the job list marks it. It starts only
-when no other job is running and no job that is not backlog work is queued, on either executor, so backlog jobs run one
-at a time. A job that is not backlog work never waits for queued backlog work, and a backlog job that is already
+when no job that is not backlog work is running or queued, on either executor. Backlog renders and take checks run
+beside each other, one on each `breeze` node, each on the node where it ends soonest, and a backlog job of any other kind runs alone. A job that is not backlog work never waits for queued backlog work, and a backlog job that is already
 running is left to finish. A backlog render isn't queued while a backlog render with the same arguments waits, because
 the one that waits reads every change made before it starts, and a queued one is skipped when a render with the same
 arguments has left it nothing to do. `backlog <slug>` lists the chapters a render would change: the takes it would make, the
@@ -111,14 +111,27 @@ join made, so a join counts as due when the cuts a join would make now differ, s
 render from before it recorded the hash counts as having made every cut but one that ends a take.
 Stopping a running render or cast also cancels its ComfyUI prompt by id. Nothing else in ComfyUI is touched.
 Stopping a Breeze render under `breeze-server` stops that server too, and its finished takes stay for the next render.
+
+The Jobs page shows the time left for each running job. A Breeze render counts its setup, its takes, the check
+before the join, the join and the sending back, and its time left runs down between the lines of its log. On the
+cluster each queued job shows how long it takes, on which node, and when it is expected to end, and the queue's
+heading says when the last job ends. Each node's own jobs give its timings, so the figures follow a change to the
+pipeline within a few jobs (`deploy/README.md`, How a job runs). A queued job has no time until the app has counted
+its takes, while the queue is on hold, and while no ready node offers its class.
+
+A queued job has buttons that move it to the top, up, down and to the bottom, and a handle to drag it. Select several
+jobs to move or cancel them together, and drag one of them to move them all. Backlog work stays behind every other
+job, so a job moves among its own kind of work. A job stays behind the jobs of its batch that it waits for, so a
+render moved to the top stops behind its screenplay.
+
 The chapter page shows the take check, with each flagged or out-of-range take's script line, transcript and a
 player, and a Check takes button that runs it as a job.
 Every chapter with audio has a download button on the serial page and the chapter page. `GET /download/<slug>/<n>`
 sends the file as an attachment named `<serial> - <NNN> - <chapter title>.opus`, so an audiobook reader on a phone
 sorts the chapters in order.
 On a Royal Road serial, Import saved pages has a box named process the chapters after import. With it ticked, the
-import queues one batch: the imports, then each imported chapter's character pass, a cast of new voices, its
-screenplay and its render, with the Process dialog's defaults and the LLM settings last chosen in a dialog. Only a
+import queues one batch: the imports, then each imported chapter's character pass with a cast of new voices after
+it, then the screenplays and the renders, with the Process dialog's defaults and the LLM settings last chosen in a dialog. Only a
 chapter that nothing has been made from yet is processed: a new chapter, or one on disk at status `fetched` whose text
 is replaced. A replaced chapter that has a character pass, a script or audio from its old text is left for the Process
 dialog and its redo boxes. The browser remembers the box.
@@ -136,16 +149,24 @@ the seed the chapter's render uses for the line. Each option has a play button, 
 it, and Use this, which queues the `say-as` job for it. On a node with the phone model the job also screens each
 option (`pronounce.SCREENS`): it says the option in seven other lines that have the name, each in its own speaker's
 voice, and counts how many of the eight takes say the name without an added sound, by the take check's `name` rule
-against the option's own spelling. A take in which the name can't be placed counts as one that doesn't. Each option
-has a play button, how the recognizer wrote the name in it, its count, and Use this, which queues the `say-as` job
-for it. An option is shown without Use this when under 85% of its takes are clean, which is fewer than seven of
-eight, or when the clip itself is not one of those takes. The name as written shows no count and keeps Use this,
+against the option's own spelling. A take in which the name can't be placed counts as one that doesn't. A render
+takes a take that adds a sound again, up to five times, so this count says about how many first takes a render will
+make twice. The screen also finds the option's usual
+saying by its vowels (`phones.usual`) and counts the takes that are clean and say the vowels as it does, by both
+recognizers (`phones.compared`). That second count says how many takes sound alike. It can't say that they sound
+right. The clip has to be one of them, so that what AJ hears is how the option is mostly said. While it is not, the
+job says the clip's line from another seed and the option in seven more lines, for three rounds at most
+(`pronounce.unsure`), which is 24 takes. Each option
+has a play button, how the recognizer wrote the name in it, its two counts, and Use this, which queues the `say-as`
+job for it. An option is shown without Use this only when its clip is still not said the usual way after the last
+round (`pronounce.offered`). Neither count holds an option back. The name as written shows no count and keeps Use this,
 because the rule doesn't judge a name as written. The job never files an option itself. Screen them, or
 Screen again, says every option again in its line and in the seven others with new seeds, and counts the new takes
-with the earlier ones. A count from a screen before 2026-11-13 is not shown, and its option is screened again. Eight
-takes are a coarse measure: a spelling that six takes in ten say clean passes a screen of eight about one time in
-ten, and one that nine in ten say clean passes about four times in five, so screen again before you drop a spelling
-you like. The screen doesn't hear a vowel that only sounds different, so listen to the clip too. Say them makes the
+with the earlier ones. A count from an older version of the screen (`pronounce.SCREEN_V`) is not shown, and its
+option is screened again. Eight
+takes are a coarse measure, and even 30 can't rank two spellings that are 20 points apart, so screen again before you
+drop a spelling you like. Neither count can tell a right vowel from a wrong one, so listen to the clip, which is how
+the option is mostly said. Say them makes the
 takes again for options that don't have any. The tab also has a box for a spelling of your own. Hear it adds the
 spelling to the options and has the voice say it, without a Claude pass, and Save files it as the say-as. New options
 replaces the options, the typed ones too. After a change it
@@ -210,7 +231,9 @@ checks it again.
    `serial.yaml` names no engine, `render` instead makes one Breeze TTS 2 take per line. Each take clones the
    speaker's cast clip, and a line with a direction gets it as the instruction. The default runner, `cpp`,
    starts Breeze-TTS-2.cpp's `breeze-server` (Vulkan build in `D:\comfy\breeze-cpp\bin`, Q8_0 weights in
-   `D:\comfy\breeze-cpp\models`) on 127.0.0.1:8137 for the render and stops it after. `--runner comfyui`,
+   `D:\comfy\breeze-cpp\models`) on 127.0.0.1:8137 for the render and stops it after. On the cluster the server
+   stays up for the next job of the same worker instead, and so does the Parakeet process (`deploy/README.md`, How a
+   job runs). `--runner comfyui`,
    or `breeze_runner: comfyui` in `serial.yaml`, queues the ComfyUI-Breeze-TTS-2 nodes instead, one prompt per
    line. The `cpp` runner refuses to start while any other breeze-server runs, and a take whose length
    does not fit its line is taken again with new seeds, up to twice. `breeze_takes.json` in the chapter folder lists the
@@ -218,7 +241,7 @@ checks it again.
    without `--seed` uses the seed of the chapter's last Breeze render, so it reuses those takes, and 1 for a chapter
    that has none.
    Before the join, when the recognizer is Parakeet, `render` hears the new takes while breeze-server is still
-   up. It takes a flagged line again with new seeds, in up to two rounds, and keeps a new take only when it ranks
+   up. It takes a flagged line again with new seeds, in up to two rounds, or five while its take is flagged for a name, and keeps a new take only when it ranks
    above the old one. `breeze_takes.json` marks a replaced take with `retaken`, and `render.check` lists those lines.
    A saved take that an earlier check flagged goes through the same check and rounds, and it stays unless a new take
    ranks above it. `retake_rounds` on a take records the last round its line went through. A later render goes on
@@ -227,7 +250,8 @@ checks it again.
    take with 0.25 s between them, and the take records the count under `pieces`. A saved take that doesn't have
    evidence from the current check is heard before the join too, so a finding costs one retake while the server is
    up. Three limits bound the retakes. A line gets three rounds of three tries at most, over every render of its take,
-   which is nine generations. A line in pieces is taken in the two retake rounds, with three tries for each piece
+   which is nine generations. A line whose take is flagged for a name gets five retake rounds where another
+   gets two, so 18 generations at most. A line in pieces is taken in its retake rounds, with three tries for each piece
    in a round. A
    render takes lines again 8 times or for an eighth of its takes, whichever is more, the worst lines first, and
    leaves the rest for a later render. When one reason flags four or more takes

@@ -2,13 +2,18 @@
 
 Two recognizers. "qwen3" is Qwen3-ASR in ComfyUI, one prompt per file, so the files must lie under ComfyUI's output
 folder. "parakeet" is NVIDIA Parakeet TDT 0.6B v2 through sherpa-onnx, which parakeet_asr.py runs on the CPU under
-the audio Python, with no ComfyUI.
+the audio Python, with no ComfyUI. A process that hears with Parakeet starts one parakeet_asr.py that serves all its
+jobs, so the models load once. Under a worker that keeps processes up between jobs (kept.py), that process outlives
+this one and serves the next job's steps too.
 """
 from __future__ import annotations
 
+import atexit
 import json
 import queue
 import re
+import secrets
+import socket
 import subprocess
 import tempfile
 import threading
@@ -16,9 +21,9 @@ import unicodedata
 from pathlib import Path
 from typing import Iterator
 
-from . import machine
+from . import kept, machine
 from .comfy import ComfyClient, ComfyError, transcribe_graph
-from .parakeet_asr import ASR2_FILES, MODEL_FILES, PHONE_FILES, SPEAKER_FILES, VAD_FILES
+from .parakeet_asr import ASR2_FILES, MODEL_FILES, PHONE_FILES, SERVE_FLAG, SPEAKER_FILES, VAD_FILES
 
 ENGINES = ("qwen3", "parakeet")
 # the evidence blocks Parakeet's child gathers beside its own, with the model folder and the files each needs
@@ -35,6 +40,149 @@ FILE_TIMEOUT = 300
 LOAD_TIMEOUT = 600
 IMPORT_TIMEOUT = 120
 EXIT_TIMEOUT = 30
+# whether a process keeps one parakeet_asr.py up for all its jobs
+SERVE = True
+SERVE_STARTS = 3
+CONNECT_TIMEOUT = 10
+KEPT_NAME = "asr"
+
+
+class _Served:
+    """A parakeet_asr.py that serves jobs on a port of this machine."""
+
+    def __init__(self, port: int, token: str, pid: int, proc: subprocess.Popen | None = None, err=None):
+        self.port, self.token, self.pid, self.proc, self.err = port, token, pid, proc, err
+
+    def alive(self) -> bool:
+        return self.proc.poll() is None if self.proc is not None else kept.alive(self.pid)
+
+    def answers(self, job: dict, first: float, each: float) -> Iterator[dict]:
+        """Sends one job and yields each JSON object of the answer until the process closes the connection.
+
+        job: the job, as parakeet_asr describes it, without the token.
+        first, each: seconds to wait for the first object, and for each one after it.
+        Raises OSError when the connection fails or an object does not arrive in time.
+        """
+        with socket.create_connection(("127.0.0.1", self.port), timeout=CONNECT_TIMEOUT) as conn:
+            conn.sendall((json.dumps({**job, "token": self.token}) + "\n").encode("utf-8"))
+            conn.settimeout(first)
+            with conn.makefile("rb") as reader:
+                for raw in reader:
+                    try:
+                        record = json.loads(raw.decode("utf-8"))
+                    except ValueError:
+                        continue
+                    if isinstance(record, dict):
+                        yield record
+                        conn.settimeout(each)
+
+    def kill(self) -> None:
+        """Ends the process and drops it from the worker's registry. Never raises."""
+        try:
+            found = kept.recorded(KEPT_NAME)
+            if found is not None and found.get("pid") == self.pid:
+                kept.forget(KEPT_NAME)
+                kept.end(self.pid)
+            if self.proc is not None:
+                try:
+                    self.proc.stdin.close()
+                except OSError:
+                    pass
+                if self.proc.poll() is None:
+                    self.proc.kill()
+                    self.proc.wait(timeout=EXIT_TIMEOUT)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        finally:
+            if self.err is not None:
+                try:
+                    self.err.close()
+                except OSError:
+                    pass
+                self.err = None
+
+
+_served: _Served | None = None
+_serve_starts = 0
+
+
+def serving() -> _Served | None:
+    """The parakeet_asr.py that serves this process's jobs, found or started when none runs.
+
+    Returns None when SERVE is off, when the process cannot start, and after SERVE_STARTS starts in this process.
+    The caller then runs each job in a process of its own. Under a worker's registry the process is the one an
+    earlier step left up, and one started here stays up after this process. Never raises.
+    """
+    global _served, _serve_starts
+    if not SERVE:
+        return None
+    if _served is not None and _served.alive():
+        return _served
+    if _served is not None:
+        _served.kill()
+    _served = None
+    found = kept.entry(KEPT_NAME)
+    if found:
+        _served = _Served(found["port"], str(found.get("token") or ""), found["pid"])
+        return _served
+    if _serve_starts >= SERVE_STARTS:
+        return None
+    _serve_starts += 1
+    try:
+        _served = _start_serving()
+    except (OSError, subprocess.SubprocessError, ValueError):
+        _served = None
+        _serve_starts = SERVE_STARTS
+    return _served
+
+
+def _start_serving() -> _Served:
+    """Starts a serving parakeet_asr.py. Raises OSError or ValueError when it does not start or name its port."""
+    stay = kept.registry() is not None
+    token = secrets.token_hex(16)
+    err = open(kept.registry().with_suffix(".asr.log"), "ab") if stay else tempfile.TemporaryFile()
+    kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW} if machine.WINDOWS else {}
+    try:
+        proc = subprocess.Popen([str(machine.AUDIO_PYTHON), "-I", str(PARAKEET_SCRIPT), SERVE_FLAG],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=err, **kwargs)
+    except OSError:
+        err.close()
+        raise
+    served = _Served(0, token, proc.pid, proc, err)
+    lines: queue.Queue = queue.Queue()
+
+    def read():
+        for raw in proc.stdout:
+            lines.put(raw)
+        lines.put(None)
+
+    threading.Thread(target=read, name="parakeet-serving", daemon=True).start()
+    try:
+        proc.stdin.write((json.dumps({"token": token, "stay": stay}) + "\n").encode("utf-8"))
+        proc.stdin.flush()
+        while not served.port:
+            try:
+                raw = lines.get(timeout=IMPORT_TIMEOUT)
+            except queue.Empty:
+                raise ValueError("the serving Parakeet process did not name its port") from None
+            if raw is None:
+                raise ValueError("the serving Parakeet process ended while it started")
+            try:
+                said = json.loads(raw.decode("utf-8"))
+            except ValueError:
+                continue
+            if isinstance(said, dict) and isinstance(said.get("port"), int):
+                served.port = said["port"]
+    except BaseException:
+        served.kill()
+        raise
+    if stay and kept.record(KEPT_NAME, proc.pid, port=served.port, token=token):
+        # the worker ends it, so this process only forgets it
+        served.proc = None
+        proc.stdin.close()
+    else:
+        atexit.register(served.kill)
+    return served
 
 
 def choose(engine: str | None = None) -> str:
@@ -76,12 +224,15 @@ def _present() -> dict[str, str]:
 
 def _load(folders: dict[str, str]) -> tuple[set[str], dict[str, str]]:
     """(the blocks whose models loaded, {block: error} for the others), from the child's check of the folders."""
-    job = {"check": True, "blocks": sorted(folders), "model": str(machine.PARAKEET_MODEL), **folders}
+    job = {"check": True, "blocks": sorted(folders), "model": str(machine.PARAKEET_MODEL),
+           "threads": PARAKEET_THREADS, **folders}
     kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW} if machine.WINDOWS else {}
     try:
-        done = subprocess.run([str(machine.AUDIO_PYTHON), "-I", str(PARAKEET_SCRIPT)], input=json.dumps(job),
-                              capture_output=True, text=True, timeout=LOAD_TIMEOUT, **kwargs)
-        got = json.loads((done.stdout or "").strip().splitlines()[-1])
+        got = _served_check(job)
+        if got is None:
+            done = subprocess.run([str(machine.AUDIO_PYTHON), "-I", str(PARAKEET_SCRIPT)], input=json.dumps(job),
+                                  capture_output=True, text=True, timeout=LOAD_TIMEOUT, **kwargs)
+            got = json.loads((done.stdout or "").strip().splitlines()[-1])
         listed, failed = got.get("loaded"), got.get("errors")
         loaded = {b for b in (listed if isinstance(listed, list) else []) if isinstance(b, str) and b in folders}
         errors = {b: str(e) for b, e in (failed.items() if isinstance(failed, dict) else ()) if b in folders}
@@ -89,6 +240,20 @@ def _load(folders: dict[str, str]) -> tuple[set[str], dict[str, str]]:
             RecursionError) as e:
         return set(), {b: f"the audio Python could not load it: {type(e).__name__}: {e}" for b in folders}
     return loaded, {**{b: "it did not load" for b in folders if b not in loaded and b not in errors}, **errors}
+
+
+def _served_check(job: dict) -> dict | None:
+    """The serving process's answer to a check job, or None when no process serves or it gave no answer."""
+    served = serving()
+    if served is None:
+        return None
+    try:
+        for record in served.answers(job, LOAD_TIMEOUT, LOAD_TIMEOUT):
+            if "loaded" in record:
+                return record
+    except OSError:
+        served.kill()
+    return None
 
 
 def _folder_exists(block: str) -> bool:
@@ -145,6 +310,9 @@ def check_ready(engine: str, comfy_url: str) -> None:
     missing = [str(folder / name) for name in MODEL_FILES if not (folder / name).is_file()]
     if missing:
         raise ComfyError(f"Parakeet needs {', '.join(missing)}; see SERIAL_AUDIO_PARAKEET_MODEL")
+    # a serving process imported the packages when it started
+    if serving() is not None:
+        return
     kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW} if machine.WINDOWS else {}
     try:
         done = subprocess.run([str(machine.AUDIO_PYTHON), "-I", "-c",
@@ -203,10 +371,61 @@ def _qwen3(files: list[Path], comfy_url: str) -> Iterator[tuple[int, dict]]:
 
 
 def _parakeet(files: list[Path], blocks: tuple[str, ...]) -> Iterator[tuple[int, dict]]:
+    """records() for Parakeet. The serving process hears the files, and a process of its own hears the ones that
+    are left when none serves or the serving process ends early."""
     extras = extra_blocks() if set(blocks) & set(EXTRA_MODELS) else set()
     job = {"model": str(machine.PARAKEET_MODEL), "files": [str(f) for f in files], "threads": PARAKEET_THREADS,
            "blocks": [b for b in blocks if b not in EXTRA_MODELS or b in extras],
            **{b: str(getattr(machine, EXTRA_MODELS[b][0])) for b in sorted(extras)}}
+    heard = 0
+    served = serving()
+    if served is not None:
+        for i, record in _parakeet_served(served, job, files):
+            heard = i + 1
+            yield i, record
+    if heard < len(files):
+        rest = {**job, "files": job["files"][heard:]}
+        for i, record in _parakeet_once(files[heard:], rest):
+            yield heard + i, record
+
+
+def _shaped(record: dict, job: dict) -> dict:
+    """A file's record as records() yields it: without its index, and with its text when the job asked for it."""
+    return {**{k: v for k, v in record.items() if k != "index"},
+            **({"text": str(record.get("text") or "")} if "asr" in job["blocks"] else {})}
+
+
+def _parakeet_served(served: _Served, job: dict, files: list[Path]) -> Iterator[tuple[int, dict]]:
+    """Hears files with the serving process.
+
+    Yields (index, record) for each file it heard, in order. Returns early, having ended the process, when the
+    process stops answering before the last file, so the caller hears the rest another way. Raises ComfyError
+    when a file cannot be transcribed, when the job cannot run, or when a record does not arrive in time.
+    """
+    expected = 0
+    try:
+        for record in served.answers(job, LOAD_TIMEOUT, FILE_TIMEOUT):
+            if "fatal" in record:
+                raise ComfyError(f"Parakeet stopped after {expected} of {len(files)} files: {record['fatal']}")
+            if "done" in record:
+                return
+            if record.get("index") != expected:
+                continue
+            if "error" in record:
+                raise ComfyError(f"Parakeet could not transcribe {files[expected]}: {record['error']}")
+            yield expected, _shaped(record, job)
+            expected += 1
+    except socket.timeout:
+        served.kill()
+        wait = FILE_TIMEOUT if expected else LOAD_TIMEOUT
+        raise ComfyError(f"Parakeet gave no transcript for {files[expected]} within {wait} s") from None
+    except OSError:
+        pass
+    served.kill()
+
+
+def _parakeet_once(files: list[Path], job: dict) -> Iterator[tuple[int, dict]]:
+    """Hears files with a parakeet_asr.py that does this one job, as records() describes."""
     kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW} if machine.WINDOWS else {}
     with tempfile.TemporaryFile() as err:
         try:
@@ -249,8 +468,7 @@ def _parakeet(files: list[Path], blocks: tuple[str, ...]) -> Iterator[tuple[int,
                     continue
                 if "error" in record:
                     raise ComfyError(f"Parakeet could not transcribe {files[expected]}: {record['error']}")
-                yield expected, {**{k: v for k, v in record.items() if k != "index"},
-                                 **({"text": str(record.get("text") or "")} if "asr" in job["blocks"] else {})}
+                yield expected, _shaped(record, job)
                 expected, wait = expected + 1, FILE_TIMEOUT
             try:
                 proc.wait(timeout=EXIT_TIMEOUT)

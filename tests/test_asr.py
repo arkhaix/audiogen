@@ -33,6 +33,10 @@ def setUpModule():
         patcher = mock.patch.object(target, "extra_blocks", lambda: set())
         patcher.start()
         unittest.addModuleCleanup(patcher.stop)
+    # The stand-in children here do one job each, so no process serves. tests/test_kept.py tests the serving.
+    patcher = mock.patch.object(asr, "SERVE", False)
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
 
 
 class WordsTest(unittest.TestCase):
@@ -1935,20 +1939,23 @@ class NamesHeardTest(unittest.TestCase):
         self.assertEqual((eole["adds"], eole["unsteady"], eole["waiting"]), ([0, 0], False, 1))
         lib.save_bible("s", bible)
 
-        # A candidate that was screened shows its count, and one that is not steady is not offered. A count from
-        # an older screen is not shown, and its candidate is offered as an unscreened one is. So is the name as
-        # written, whatever its count, because the rule doesn't judge a name as written.
+        # A candidate that was screened shows its count, and one whose clip is not said the usual way is not
+        # offered, whatever its count. A count from an older screen is not shown, and its candidate is offered as
+        # an unscreened one is. So is the name as written, whatever a screen says of it, because the rule doesn't
+        # judge a name as written.
         screen = pronounce.SCREEN_V
         bible["pronunciations"]["Eole"]["options"] = {"line": {"chapter": 1}, "candidates": [
             {"say": "Eole", "said": "iol", "steady": [2, 8], "typical": False, "screen": screen},
-            {"say": "Cazvol", "said": "kæzvɔl", "steady": [8, 8], "typical": True, "screen": screen},
-            {"say": "Ay-ole", "said": "eɪoʊl", "steady": [5, 8], "typical": True, "screen": screen},
-            {"say": "Ay-ohl", "said": "eɪoʊl", "steady": [3, 8], "typical": True}]}
+            {"say": "Cazvol", "said": "kæzvɔl", "steady": [3, 8], "alike": [3, 8], "typical": True, "screen": screen},
+            {"say": "Ay-ole", "said": "eɪoʊl", "steady": [8, 8], "typical": False, "screen": screen},
+            {"say": "Ay-ohl", "said": "eɪoʊl", "steady": [3, 8], "alike": [3, 8], "typical": True}]}
         lib.save_bible("s", bible)
         shown = views.names_heard("s")["terms"][0]["options"]["candidates"]
         self.assertEqual([(c["say"], c["steady"], c["offered"]) for c in shown],
-                         [("Eole", None, True), ("Cazvol", [8, 8], True), ("Ay-ole", [5, 8], False),
+                         [("Eole", None, True), ("Cazvol", [3, 8], True), ("Ay-ole", [8, 8], False),
                           ("Ay-ohl", None, True)])
+        # The takes that say an option the usual way are shown beside its count, under the same conditions.
+        self.assertEqual([c["alike"] for c in shown], [None, [3, 8], None, None])
         self.assertTrue(views.names_heard("s")["screens"])
 
         # While the rule and the screen are off, no name is held, no count is shown and every option is offered.
@@ -1993,14 +2000,17 @@ class RenderProgressTest(unittest.TestCase):
             "   [1 min] take 10/10, 3000 ms/take, ~0 min left\n")
 
     def test_the_check_before_the_join_is_its_own_phase(self):
+        from serial_audio.web.jobs import WORDS_PER_LINE, render_cost
+        join = render_cost("join", 10 * WORDS_PER_LINE)
+
         # While the new takes are checked, the estimate is the rest of the check and the join.
         text = self.HEAD + "   checking the 10 new takes with Parakeet before the join...\n"
         p = render_progress(text, None, 0.0, None)
-        self.assertEqual((p["phase"], p["prechecked"], p["eta"]), ("checking", True, 10 * 0.5 + 60))
+        self.assertEqual((p["phase"], p["prechecked"], p["eta"]), ("checking", True, render_cost("check", 10) + join))
 
         # The join after it still says the takes were checked, so no check time is added to its estimate.
         p = render_progress(text + "   joining takes...\n", None, 0.0, None)
-        self.assertEqual((p["phase"], p.get("prechecked")), ("joining", True))
+        self.assertEqual((p["phase"], p.get("prechecked"), p["eta"]), ("joining", True, join))
 
         # A render that made one take words its line in the singular, and it reads the same way.
         p = render_progress(self.HEAD + "   checking the 1 new take with Parakeet before the join...\n", None, 0.0, None)
@@ -2008,7 +2018,7 @@ class RenderProgressTest(unittest.TestCase):
 
         # The line of a render that also hears saved takes doesn't say "new", and it reads the same way.
         p = render_progress(self.HEAD + "   checking the 189 takes with Parakeet before the join...\n", None, 0.0, None)
-        self.assertEqual((p["phase"], p["prechecked"], p["eta"]), ("checking", True, 189 * 0.5 + 60))
+        self.assertEqual((p["phase"], p["prechecked"], p["eta"]), ("checking", True, render_cost("check", 189) + join))
 
         # The check after the join and the end of the render read as before.
         p = render_progress(text + "   joining takes...\n   checking 0 takes with Parakeet, 10 already checked...\n",
@@ -2023,12 +2033,128 @@ class RenderProgressTest(unittest.TestCase):
         self.assertEqual((p["phase"], p.get("prechecked")), ("generating", None))
 
     def test_a_check_that_failed_before_the_join_does_not_count(self):
+        from serial_audio.web.jobs import WORDS_PER_LINE, render_cost
+
         # The check after the join then transcribes every take, so its time stays in the estimate.
         text = (self.HEAD + "   checking the 10 new takes with Parakeet before the join...\n"
                 "   could not check the new takes before the join, so the join uses them as they are: ComfyError: x\n")
         self.assertEqual(render_progress(text, None, 0.0, None).get("prechecked"), None)
         p = render_progress(text + "   joining takes...\n", None, 0.0, None)
         self.assertEqual((p["phase"], p.get("prechecked")), ("joining", None))
+        self.assertEqual(p["eta"], render_cost("join", 10 * WORDS_PER_LINE) + render_cost("check", 10))
+
+    def test_a_timed_render_counts_down_to_the_end_of_the_job(self):
+        from serial_audio.web.jobs import OVERRUN_SHARE, RETAKE_SECONDS, RETAKE_TRIES
+
+        # Each part costs a round figure here: 20 s to set up, which runs to the end of the first take, 4 s for
+        # each take after it, 10 s and 1 s a take to check, 50 s to join and 5 s to send the audio back.
+        cost = {"setup": lambda n: 20.0, "takes": lambda n: 4.0 * n, "check": lambda n: 10.0 + n,
+                "join": lambda n: 50.0, "finish": lambda n: 5.0}
+        head = "render: s chapter 1: 100 lines, 1 voices {0: 'narrator'} with Breeze TTS 2 via cpp\n"
+        takes = head + ("   generating takes with Breeze TTS 2 via breeze-server (this is the slow part): "
+                        "10 of 100 lines, 90 reused\n")
+        first = takes + "   first take done in 5 s\n"
+        check = first + "   checking the 10 takes with Parakeet before the join...\n"
+        join = check + "   joining takes...\n"
+
+        def at(text, now, changed=None, **marks):
+            return render_progress(text, changed, now, 1000.0, marks=marks, cost=lambda part, n=0.0: cost[part](n),
+                                   make=10)
+
+        # Before its log says anything, a render that will make 10 takes has every part ahead of it.
+        p = at("", 1000.0)
+        self.assertEqual((p["phase"], p["eta"], p["fraction"]), ("starting", 20 + 36 + 20 + 50 + 5, 0.0))
+        # Ten seconds into its step, ten seconds of the setup are gone, and the bar shows the share of the time.
+        p = at(head, 1016.0, step=1006.0)
+        self.assertEqual((p["phase"], p["eta"]), ("starting", 121.0))
+        self.assertAlmostEqual(p["fraction"], 10 / 131)
+
+        # Until the first take is done the model is still loading, which is the rest of the setup.
+        p = at(takes, 1021.0, step=1006.0, takes=1020.0)
+        self.assertEqual((p["phase"], p["eta"], p["detail"]),
+                         ("generating", 5 + 36 + 20 + 50 + 5, "loading Breeze TTS 2"))
+        # While it makes its other takes, the time left runs down between the lines of its log.
+        p = at(first, 1036.0, step=1006.0, takes=1020.0, first=1026.0)
+        self.assertEqual((p["phase"], p["eta"], p["detail"]), ("generating", 26 + 20 + 50 + 5, "making 10 takes"))
+        # Takes that outlast their estimate keep a share of it, so the time left never reaches the parts behind.
+        p = at(first, 1126.0, step=1006.0, takes=1020.0, first=1026.0)
+        self.assertEqual(p["eta"], OVERRUN_SHARE * 36 + 20 + 50 + 5)
+
+        # The check, the join and the sending each count down from the moment their first line arrived.
+        p = at(check, 1070.0, step=1006.0, takes=1026.0, check=1066.0)
+        self.assertEqual((p["phase"], p["eta"]), ("checking", 16 + 50 + 5))
+        # Once the check says how many takes it flagged, the time left is that round of retakes: the recognizer's
+        # start and two takes' time for each, counted from the line that named them.
+        again = check + "   taking 3 of them again, because the check flagged them: 4, 8, 15\n"
+        p = at(again, 1090.0, changed=1080.0, step=1006.0, takes=1026.0, check=1066.0)
+        self.assertEqual((p["phase"], p["eta"], p["detail"]),
+                         ("checking", RETAKE_SECONDS + RETAKE_TRIES * 12 - 10 + 50 + 5, "taking 3 flagged takes again"))
+        p = at(join, 1106.0, step=1006.0, takes=1026.0, check=1066.0, join=1086.0)
+        self.assertEqual((p["phase"], p["eta"]), ("joining", 30 + 5))
+        self.assertAlmostEqual(p["fraction"], 100 / 135)
+        done = join + "   joined 100 takes into 600.0 s at 24000 Hz\n   audio: x.opus\n"
+        p = at(done, 1138.0, step=1006.0, takes=1026.0, check=1066.0, join=1086.0, joined=1136.0, audio=1137.0)
+        self.assertEqual((p["phase"], p["eta"]), ("done", 3.0))
+
+        # A render that makes no take starts no breeze-server: a short setup, the join and the sending.
+        p = render_progress("", None, 1000.0, 1000.0, marks={}, cost=lambda part, n=0.0: cost[part](n), make=0)
+        self.assertEqual(p["eta"], 5 + 50 + 5)
+
+    def test_the_first_take_s_warm_up_stays_out_of_the_take_rate(self):
+        # The log's rate is a mean from the first take on: three takes in 120 s, of which the first took 73 s.
+        # The 29 takes to come are costed at the pace of the two after it.
+        text = ("render: s chapter 1: 100 lines, 1 voices {0: 'narrator'} with Breeze TTS 2 via cpp\n"
+                "   generating takes with Breeze TTS 2 via breeze-server (this is the slow part): 32 of 100 lines, "
+                "68 reused\n   first take done in 73 s\n   [2 min] take 3/32, 40000 ms/take, ~19 min left\n")
+        p = render_progress(text, None, 0.0, None, cost=lambda part, n=0.0: 0.0)
+        self.assertEqual((p["phase"], p["steps"], p["detail"]), ("generating", [3, 32], "take 3 of 32 at 23.5 s/take"))
+        self.assertAlmostEqual(p["eta"], 29 * 23.5)
+
+    def test_time_left_is_unknown_until_the_takes_are_counted(self):
+        # Nobody has counted the takes and the log has not said, so the render shows no time left and no share.
+        p = render_progress("[worker] Render on node, stage 0\n", None, 1010.0, 1000.0, marks={"step": 1005.0})
+        self.assertEqual((p["phase"], p["eta"], p["fraction"]), ("starting", None, None))
+        # A render on one machine sends nothing back, so the end of its audio is the end of the job.
+        p = render_progress(self.HEAD + "   joining takes...\n   audio: x.opus\n", None, 1010.0, 1000.0)
+        self.assertEqual((p["phase"], p["eta"], p["fraction"]), ("done", 0.0, 1.0))
+
+    def test_a_render_that_makes_no_take_has_no_check_in_its_time_left(self):
+        cost = {"setup": 20.0, "takes": 0.0, "check": 300.0, "join": 50.0, "finish": 5.0}
+        head = "render: s chapter 1: 200 lines, 1 voices {0: 'narrator'} with Breeze TTS 2 via cpp\n"
+
+        def at(text, now, hear=None, **marks):
+            return render_progress(text, None, now, 1000.0, marks=marks, cost=lambda part, n=0.0: cost[part], make=0,
+                                   hear=hear)
+
+        # A join of saved takes: a short setup, the join and the sending, and the join's first line adds nothing.
+        self.assertEqual(at(head, 1001.0, step=1000.0)["eta"], 4 + 50 + 5)
+        p = at(head + "   joining takes...\n", 1006.0, step=1000.0, join=1005.0)
+        self.assertEqual((p["phase"], p["eta"]), ("joining", 49 + 5))
+
+        # A render that only hears saved takes again starts breeze-server and checks them before the join.
+        self.assertEqual(at(head, 1001.0, hear=150, step=1000.0)["eta"], 19 + 300 + 50 + 5)
+        heard = head + "   checking the 150 takes with Parakeet before the join...\n"
+        p = at(heard + "   joining takes...\n", 1400.0, hear=150, step=1000.0, check=1020.0, join=1399.0)
+        self.assertEqual((p["phase"], p["eta"]), ("joining", 49 + 5))
+        # Had that check failed, the takes would be heard after the join.
+        failed = heard + "   could not check the new takes before the join, so the join uses them as they are: x\n"
+        p = at(failed + "   joining takes...\n", 1400.0, hear=150, step=1000.0, check=1020.0, join=1399.0)
+        self.assertEqual(p["eta"], 49 + 300 + 5)
+
+    def test_a_check_nobody_timed_counts_down_by_its_log(self):
+        from serial_audio.web.jobs import WORDS_PER_LINE, render_cost
+        join = render_cost("join", 10 * WORDS_PER_LINE)
+        text = self.HEAD + "   checking the 200 takes with Parakeet before the join...\n"
+        # On one machine the check's own lines say how far it is: 190 takes to go, and then one.
+        p = render_progress(text + "   [1 min] checked 10/200, 0.4 s/take, ~1 min left\n", None, 0.0, None)
+        self.assertAlmostEqual(p["eta"], 190 * 0.4 + join)
+        p = render_progress(text + "   [2 min] checked 199/200, 0.4 s/take, ~0 min left\n", None, 0.0, None)
+        self.assertAlmostEqual(p["eta"], 1 * 0.4 + join)
+        # A check that the app timed never shows less than the rest of its expected time, which has the retakes
+        # in it.
+        timed = render_progress(text + "   [2 min] checked 199/200, 0.4 s/take, ~0 min left\n", None, 1010.0, 1000.0,
+                                marks={"step": 1000.0, "check": 1005.0})
+        self.assertGreater(timed["eta"], 100)
 
 
 def timed(said: str, start: float = 0.0) -> dict:
@@ -2556,7 +2682,7 @@ class PhonesTest(unittest.TestCase):
         # A record's mark is y for a name he hears as picked, n for one he hears another way, and u for one he
         # couldn't judge. Its phones are those within half a second of the saying's span, t0 to t1.
         marks = [json.loads(raw) for raw in MARKS.read_text(encoding="utf-8").splitlines()]
-        self.assertEqual([sum(1 for m in marks if m["mark"] == mark) for mark in "ynu"], [95, 72, 2])
+        self.assertEqual([sum(1 for m in marks if m["mark"] == mark) for mark in "ynu"], [116, 106, 2])
         self.assertTrue(all(len(m["phones"]) == len(m["starts"]) for m in marks))
 
         def flagged(m: dict) -> bool:
@@ -2564,17 +2690,122 @@ class PhonesTest(unittest.TestCase):
                            if m["t0"] - takecheck.NAME_NEAR <= s < m["t1"] + takecheck.NAME_NEAR)
             return bool(phones.adds(m["said"], m["heard"], near, m["after"], m["before"]))
 
-        # The rule agrees with him on 129 of the 167 he judged. It flags two sayings he hears as picked, and it
-        # passes 36 he hears another way, each named by its page and clip. On pages 1 and 2 those are nine.
+        # The rule agrees with him on 150 of the 222 he judged. It flags two sayings he hears as picked, and it
+        # passes 70 he hears another way, each named by its page and clip. On pages 1 and 2 those are nine.
         apart = {mark: [f'{m["page"]}.{m["clip"]}' for m in marks if m["mark"] == mark and flagged(m) != (mark == "n")]
                  for mark in "ny"}
         self.assertEqual(apart["y"], ["2.E04", "2.V11"])
         self.assertEqual(apart["n"][:9], ["1.E02", "2.E03", "2.E09", "2.E35", "2.V02", "2.V03", "2.V05", "2.V08", "2.V09"])
-        # Of the others, 26 are every take of "Ay-ohl" on page 3 that he rejected. They add no sound and say the
-        # name with the first vowel of "eye", which the rule doesn't hear. The last is the one take of "Éole" he
-        # rejected on page 5, of 30 the rule passes.
+        # Of the next ones, 26 are every take of "Ay-ohl" on page 3 that he rejected. They add no sound and say
+        # the name with the first vowel of "eye", which the rule doesn't hear. Then comes the one take of "Éole"
+        # he rejected on page 5, of 30 the rule passes.
         eye = [1, 2, 3, 5, 6, 7, 8, 9, 10, 13, 14, 15, 16, 17, 18, 19, 20, 21, 23, 24, 25, 26, 27, 28, 29, 30]
-        self.assertEqual(apart["n"][9:], [f"3.E{n:02d}" for n in eye] + ["5.E17"])
+        self.assertEqual(apart["n"][9:36], [f"3.E{n:02d}" for n in eye] + ["5.E17"])
+        # Page 6 was drawn from sayings the rule passes, for the vowels, so every one of the 34 he rejected there
+        # is a saying it passes.
+        self.assertEqual(apart["n"][36:], [f'6.{m["clip"]}' for m in marks if m["page"] == 6 and m["mark"] == "n"])
+        self.assertEqual(len(apart["n"]), 70)
+
+    def test_the_vowels_are_scored_on_the_sayings_aj_marked(self):
+        # The screen holds a saying to the usual saying of its spelling. Here that is the usual one among the
+        # sayings AJ accepted of each spelling in use, and every marked saying of the name that the name rule
+        # passes is held to it, whatever spelling it was made with.
+        marks = [json.loads(raw) for raw in MARKS.read_text(encoding="utf-8").splitlines()]
+
+        def near(m: dict) -> str:
+            return "".join(p for p, s in zip(m["phones"], m["starts"])
+                           if m["t0"] - takecheck.NAME_NEAR <= s < m["t1"] + takecheck.NAME_NEAR)
+
+        def said(m: dict) -> tuple:
+            return phones.vowels(m["said"], m["heard"], near(m), m["after"]), phones.leads(m["said"], m["before"])
+
+        passed = [m for m in marks if m["mark"] != "u"
+                  and not phones.adds(m["said"], m["heard"], near(m), m["after"], m["before"])]
+        found = {}
+        for term, spelling, usual in (("Eole", "eole", [(["eɪ", "oʊ"], "ao")]),
+                                      ("Vouivre", "vweevra", [(["i"], "i"), (["ə"], "a")])):
+            accepted = [m for m in passed if m["mark"] == "y" and m["said"].removesuffix("'s") == spelling]
+            self.assertEqual(phones.usual([said(m) for m in accepted]), usual)
+            other = [m for m in passed if m["term"] == term and phones.compared(usual, *said(m))[0]]
+            found[term] = ([f'{m["page"]}.{m["clip"]}' for m in other if m["mark"] == "y"],
+                           sum(1 for m in other if m["mark"] == "n"),
+                           sum(1 for m in passed if m["term"] == term and m not in other and m["mark"] == "n"))
+
+        # Both recognizers find a vowel said another way in 56 sayings, and he rejects 49 of them. The seven he
+        # accepts are named. They pass 104 sayings, and he rejects 21 of those.
+        self.assertEqual(found["Eole"], (["6.E15"], 35, 17))
+        self.assertEqual(found["Vouivre"], (["3.V05", "6.V01", "6.V09", "6.V10", "6.V16", "6.V17"], 14, 4))
+
+        # Within one spelling the usual saying is the way most of its takes say it, right or wrong. Most takes of
+        # "Ay-ohl" say "eye-ohl", and four of the five he accepts are found to say it another way.
+        ayohl = [m for m in passed if m["said"].removesuffix("'s") == "ay ohl"]
+        usual = phones.usual([said(m) for m in ayohl])
+        self.assertEqual(usual, [(["aɪ", "ɔ"], "ayo")])
+        other = [m["mark"] for m in ayohl if phones.compared(usual, *said(m))[0]]
+        self.assertEqual((other.count("y"), other.count("n"), sum(1 for m in ayohl if m["mark"] == "y")), (4, 9, 5))
+
+    def test_a_vowel_is_read_at_its_place_in_the_name(self):
+        # A run of vowel phones is one nucleus for each syllable: a vowel with its offglide, a doubled vowel once,
+        # and a glide parts two of them.
+        self.assertEqual(phones.nuclei("aaɪjoʊ"), ["aɪ", "oʊ"])
+        self.assertEqual(phones.nuclei("ueɪoʊ"), ["u", "eɪ", "oʊ"])
+        self.assertEqual(phones.nuclei("iɔʊ"), ["i", "ɔʊ"])
+        self.assertEqual(phones.nuclei(""), [])
+        # A skeleton's symbols come with what they are read from, and they are the symbols spelled() and
+        # sounded() give.
+        self.assertEqual(phones.lettered("they all"), [("θ", "th", 0), ("V", "eya", 0), ("l", "l", 1)])
+        self.assertEqual(phones.lettered("Vouivre's knight")[1:3] + phones.lettered("Vouivre's knight")[-3:],
+                         [("V", "oui", 0), ("v", "v", 0), ("n", "kn", 1), ("V", "igh", 1), ("t", "t", 1)])
+        self.assertEqual(phones.sounds("vwivɹəʔeɪjoʊl"),
+                         [("v", "v"), ("w", "w"), ("V", "i"), ("v", "v"), ("ɹ", "ɹ"), ("V", "əeɪjoʊ"), ("l", "l")])
+        for text in ("they all", "Vouivre's knight", "aeole's", "why whole wren"):
+            self.assertEqual([symbol for symbol, _, _ in phones.lettered(text)], phones.spelled(text)[0], text)
+        self.assertEqual([symbol for symbol, _ in phones.sounds("vwivɹəʔeɪjoʊl")], phones.sounded("vwivɹəʔeɪjoʊl"))
+
+        # A name's vowel is the one beside the consonant that stands for its neighbour, and not the last vowel of
+        # the word before, which the name rule's alignment would take.
+        self.assertEqual(phones.vowels("eh ole", "aol", "tɪdeɪɔl", "in"), [(["eɪ", "ɔ"], "ao")])
+        self.assertEqual(phones.vowels("vwee vruh", "vouivreux", "ɛntfwivɹufɹəmɛ", "from"),
+                         [(["i"], "oui"), (["u"], "eu")])
+        self.assertEqual(phones.vowels("eh ole's", "aeol's", "təveɪlɛzmoʊ", "mother"), [(["eɪ"], "aeo")])
+        # A heard vowel is the place of one vowel of the name, so a take that lost the name's end has no second one.
+        self.assertEqual(phones.vowels("vwee vruh", "vouivre", "vwiə"), [(["i", "ə"], "oui"), ([], "e")])
+        # A recognizer that has no vowel there gives none, and a name without a sound has no vowels.
+        self.assertEqual(phones.vowels("eh ole", "", "eɪoʊl", "in"), [(["eɪ", "oʊ"], "")])
+        self.assertEqual(phones.vowels("eh ole", "aol", "", "in"), [([], "ao")])
+        self.assertEqual(phones.vowels("", "aol", "eɪoʊl"), [])
+
+    def test_a_vowel_is_another_way_when_both_recognizers_have_it_so(self):
+        usual = [(["eɪ", "oʊ"], "ao")]
+        # "eye-ohl" for "ay-ohl": the nucleus is far and the letters are others.
+        self.assertEqual(phones.compared(usual, [(["aɪ", "ɔ"], "aio")])[0], [0])
+        # One witness is not enough: the same letters, or a nucleus near the usual one.
+        self.assertEqual(phones.compared(usual, [(["aɪ", "oʊ"], "ao")])[0], [])
+        self.assertEqual(phones.compared(usual, [(["i", "ɔ"], "eo")])[0], [])
+        # A nucleus that the saying lacks is not another vowel, and neither is one the usual saying lacks.
+        self.assertEqual(phones.compared(usual, [(["oʊ"], "o")])[0], [])
+        self.assertEqual(phones.compared(usual, [(["eɪ", "oʊ", "ə"], "aoe")])[0], [])
+        self.assertEqual(phones.compared(usual, [([], "")]), ([], 2.0))
+        # After a word that ends in a vowel, the saying's first nucleus may be that word's.
+        self.assertTrue(phones.leads("eh ole", "to"))
+        self.assertFalse(phones.leads("eh ole", "and"))
+        self.assertFalse(phones.leads("vwee vruh", "to"))
+        self.assertEqual(phones.compared(usual, [(["u", "eɪ"], "ayo")], True)[0], [])
+        self.assertEqual(phones.compared(usual, [(["u", "eɪ"], "ayo")], False)[0], [0])
+        # The second vowel of a name is held to its own usual one.
+        both = [(["i"], "i"), (["ə"], "a")]
+        self.assertEqual(phones.compared(both, [(["i"], "oui"), (["u"], "eu")])[0], [1])
+        self.assertEqual(phones.compared(both, [(["ɔɪ"], "oi"), (["ə"], "a")])[0], [0])
+
+        # The usual saying has the nuclei of the saying the others are nearest, with the letters most of those
+        # near it have, whatever letters that saying has itself. A saying without a vowel is not a candidate.
+        eye = ([(["aɪ", "oʊ"], "aio")], False)
+        found = [([(["aɪ", "ɔ"], "ayo")], False), eye, eye, ([(["eɪ", "ɔ"], "ao")], False), ([(["ɪ"], "io")], False),
+                 ([([], "aio")], False)]
+        self.assertEqual(phones.usual(found), [(["aɪ", "oʊ"], "aio")])
+        self.assertEqual(phones.usual([([(["aɪ", "ɔ"], "ao")], False), eye, eye]), [(["aɪ", "oʊ"], "aio")])
+        self.assertIsNone(phones.usual([([([], "aio")], False), ([(["eɪ"], "")], False)]))
+        self.assertIsNone(phones.usual([]))
 
     def test_the_child_gives_a_takes_phones_as_one_string_with_their_seconds(self):
         # sherpa-onnx times ZIPA's tokens at twice their seconds. The word boundary and a token that is not one
@@ -2716,11 +2947,11 @@ class NameRetakeTest(unittest.TestCase):
             saved[str(i)] = {"key": f"k{i}", "file": str(file), "voice": "narrator", "seed": 5, "audio": f"a{i}"}
         return saved
 
-    def retake(self, saved: dict) -> dict:
+    def retake(self, saved: dict, says=lambda k, round_: "eɪoʊl") -> dict:
         def again(k: str, round_: int) -> dict:
             self.asked.append((k, round_))
             file = self.folder / f"l{int(k):04d}.retake.wav"
-            file.write_text("eɪoʊl", encoding="utf-8")
+            file.write_text(says(k, round_), encoding="utf-8")
             return {"key": f"k{k}", "file": str(file), "seed": 90 + round_, "audio": f"b{k}"}
 
         return breeze.retake_flagged(self.folder, [NAME_LINE] * len(saved), NAME_BIBLE, saved, list(saved), again,
@@ -2763,9 +2994,33 @@ class NameRetakeTest(unittest.TestCase):
         # A take whose retake_held names the reason "name" counts as flagged, so a render takes it again.
         saved = self.takes(["jol", "eɪoʊl"])
         breeze.retake_flagged(self.folder, [NAME_LINE] * 2, NAME_BIBLE, saved, list(saved), None, comfy_url="",
-                              log=self.logs.append, save=lambda: None, rounds=0)
+                              log=self.logs.append, save=lambda: None, rounds=0, name_rounds=0)
         saved["0"]["retake_held"] = ["name"]
         self.assertEqual(breeze.flagged_before(self.folder, saved), {"0"})
+
+    def test_a_take_flagged_for_a_name_gets_more_rounds_than_any_other(self):
+        # One take adds a sound to the name and every new take of its line does too. Another is clipped and
+        # stays clipped. The clipped line gets CHECK_RETAKES rounds, and the line with the name NAME_RETAKES.
+        self.assertEqual((breeze.CHECK_RETAKES, breeze.NAME_RETAKES), (2, 5))
+        saved = self.takes(["jol", "#clipped eɪoʊl"])
+        got = self.retake(saved, lambda k, round_: "jol" if k == "0" else "#clipped eɪoʊl")
+        self.assertEqual(self.asked, [("0", 1), ("1", 1), ("0", 2), ("1", 2), ("0", 3), ("0", 4), ("0", 5)])
+        self.assertEqual((got["replaced"], got["left"]), ([], []))
+        self.assertEqual([saved[k]["retake_rounds"] for k in saved], [5, 2])
+        self.assertTrue(any("still flagged after every round" in line for line in self.logs), self.logs)
+        # Both have been through their rounds, so a later render leaves them. With a round to go, the take
+        # flagged for the name is due again, at a count of rounds that ends any other line.
+        self.assertEqual(breeze.flagged_before(self.folder, saved), set())
+        saved["0"]["retake_rounds"] = breeze.CHECK_RETAKES
+        self.assertEqual(breeze.flagged_before(self.folder, saved), {"0"})
+
+    def test_a_new_take_that_says_the_name_right_ends_its_rounds(self):
+        # The fourth new take of the line says the name without the added sound. It is kept, and no fifth is made.
+        saved = self.takes(["jol", "eɪoʊl"])
+        got = self.retake(saved, lambda k, round_: "eɪoʊl" if round_ == 4 else "jol")
+        self.assertEqual((self.asked, got["replaced"]), ([("0", 1), ("0", 2), ("0", 3), ("0", 4)], [0]))
+        self.assertEqual((saved["0"]["retake_rounds"], saved["0"]["audio"]), (4, "b0"))
+        self.assertEqual(breeze.flagged_before(self.folder, saved), set())
 
     def test_a_spelling_that_comes_after_the_check_gets_the_saved_takes_judged_again(self):
         # The chapter is checked while the name is not held to a spelling, so no take is flagged for it.

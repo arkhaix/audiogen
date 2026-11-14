@@ -63,6 +63,14 @@ function elapsed(fromIso, toIso) {
   return isNaN(a) || isNaN(b) ? null : (b - a) / 1000;
 }
 
+// The clock time `sec` seconds from now, with the weekday when that is another day.
+function clockIn(sec) {
+  if (sec == null || !isFinite(sec)) return "";
+  const d = new Date(Date.now() + sec * 1000);
+  const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return d.toDateString() === new Date().toDateString() ? time : `${d.toLocaleDateString([], { weekday: "short" })} ${time}`;
+}
+
 const gb = (n) => (n ? `${(n / 2 ** 30).toFixed(1)} GB` : "?");
 
 function hue(id) {
@@ -223,6 +231,7 @@ const S = {
   data: {},
   sel: {},
   usel: {},
+  qsel: new Set(),
   filter: {},
   imports: {},
   chTab: store.get("chTab", "script"),
@@ -347,7 +356,8 @@ async function poll() {
       if (S.route.view !== "jobs") show();
     }
   }
-  if (S.route.view === "jobs") paint();
+  // a repaint would take the dragged rows from under the pointer
+  if (S.route.view === "jobs") { if (!DRAG.ids) paint(); else renderHeader(); }
   else updateLive();
 }
 
@@ -394,7 +404,9 @@ function liveHTML(slug, n) {
       + `<div class="bar${pct == null ? " indet" : ""}"><i style="width:${pct ?? 0}%"></i></div>`;
   }
   if (queued.length) {
-    html += `<small class="muted">queued: ${esc(queued.map((j) => j.title.split(" · ")[0].toLowerCase()).join(", "))}</small>`;
+    const end = queued.every((j) => j.end_in != null) ? Math.max(...queued.map((j) => j.end_in)) : null;
+    html += `<small class="muted">queued: ${esc(queued.map((j) => j.title.split(" · ")[0].toLowerCase()).join(", "))}`
+      + `${end != null ? `, done about ${esc(clockIn(end))}` : ""}</small>`;
   }
   return html;
 }
@@ -853,11 +865,11 @@ async function openProcess(slug) {
       <div class="why">${why}</div>${opts ? `<div class="opts">${opts}</div>` : ""}</div>`;
   const body = `
     <p class="small muted">Chapters ${esc(rangeText(sel))}. ${S.state?.executor === "nomad"
-      ? "Each chapter's jobs run in this order. A job waits only for the jobs it needs, so a chapter renders once its screenplay is written. If a job fails, only the jobs that need it are skipped."
+      ? "Each chapter's jobs run in this order. A job waits only for the jobs it needs, so a chapter renders once its voices are cast and its screenplay is written. If a job fails, only the jobs that need it are skipped."
       : "The jobs run one at a time, in this order. If one fails, the rest of the batch is skipped."}</p>
     ${stage("characters", "Character pass", needChars.length, `${plural(needChars.length, "chapter")} still need it. It updates the bible with who appears.`,
       `<label class="inline"><input type="checkbox" name="redo_characters"> redo chapters that have one</label>`)}
-    ${stage("cast", "Cast new voices", castLikely, "Designs a voice for each major or recurring character who has spoken and has none. Runs on a GPU node.",
+    ${stage("cast", "Cast new voices", castLikely, "Designs a voice for each major or recurring character who has spoken and has none, after each chapter's character pass. Runs on a GPU node.",
       `<label class="inline">candidates <input type="number" name="candidates" value="3" min="1" max="12"></label>
        <label class="inline">first seed <input type="number" name="cast_seed" value="${nextSeed}" min="0"></label>`)}
     ${stage("script", "Screenplay", needScript.length, `${plural(needScript.length, "chapter")} still need one.`,
@@ -916,18 +928,24 @@ function buildProcess(form, rows, slug) {
   });
 }
 
-// The jobs that take the chapters in rows through the stages switched on in o, in the order they run.
+// The jobs that take the chapters in rows through the stages switched on in o, in the order they run. A cast follows
+// each character pass, and each is for everyone who needs a voice by then. A cast after the first names the chapter
+// whose pass it follows, so the renders of earlier chapters don't wait for it.
 function processJobs(slug, rows, o) {
   const jobs = [];
-  if (o.characters) {
-    for (const c of rows) {
-      if (c.status === "fetched" || o.redoCharacters) {
-        jobs.push({ kind: "character-pass", params: { slug, chapters: String(c.number), redo: c.status !== "fetched", ...o.llm } });
-      }
+  let casts = 0;
+  const cast = (n) => {
+    if (!o.cast) return;
+    jobs.push({ kind: "cast", params: { slug, candidates: o.candidates, seed: o.castSeed, ...o.llm, ...(casts ? { from_chapter: n } : {}) } });
+    casts += 1;
+  };
+  const passes = (c) => o.characters && (c.status === "fetched" || o.redoCharacters);
+  if (!rows.length || !passes(rows[0])) cast(null);
+  for (const c of rows) {
+    if (passes(c)) {
+      jobs.push({ kind: "character-pass", params: { slug, chapters: String(c.number), redo: c.status !== "fetched", ...o.llm } });
+      cast(c.number);
     }
-  }
-  if (o.cast) {
-    jobs.push({ kind: "cast", params: { slug, candidates: o.candidates, seed: o.castSeed, ...o.llm } });
   }
   if (o.script) {
     for (const c of rows) {
@@ -1390,7 +1408,7 @@ function nameOptions(t, slug, busy, screens) {
   const unscreened = o && !silent && o.candidates.some((c) => !c.steady && c.say !== t.term);
   const get = busy ? `<span class="small muted nowrap">working…</span>`
     : (silent ? `<button class="sm" data-act="name-options" data-term="${esc(t.term)}" data-again="1">Say them</button>`
-      : !screens ? "" : `<button class="sm" data-act="name-options" data-term="${esc(t.term)}" data-again="1" title="Say every option again in eight lines with new seeds. The takes count with the earlier ones, so the count gets surer.">${unscreened ? "Screen them" : "Screen again"}</button>`)
+      : !screens || !o ? "" : `<button class="sm" data-act="name-options" data-term="${esc(t.term)}" data-again="1" title="Say every option again in eight lines with new seeds. The takes count with the earlier ones, so the count gets surer.">${unscreened ? "Screen them" : "Screen again"}</button>`)
       + `<button class="sm" data-act="name-options" data-term="${esc(t.term)}">${o ? "New options" : "Get options"}</button>`;
   if (!o) return `<div class="row tight"><span class="small muted grow">No options yet. A Claude pass proposes respellings, and the voice says each one in a line of the script.</span>${get}</div>`;
   const current = t.say || t.term;
@@ -1398,9 +1416,11 @@ function nameOptions(t, slug, busy, screens) {
     const isCurrent = c.say === current;
     const use = isCurrent ? `<span class="small muted nowrap">in use</span>`
       : c.offered ? `<button class="sm" data-act="name-use" data-term="${esc(t.term)}" data-say="${esc(c.say)}">Use this</button>`
-        : `<span class="small muted nowrap">not steady</span>`;
+        : `<span class="small muted nowrap">clip not usual</span>`;
     const screened = (!c.steady ? ""
-      : `<div class="tr">${c.steady[0]} of ${c.steady[1]} takes say it without an added sound${c.typical ? "" : ", and this clip is not one of them"}</div>`)
+      : `<div class="tr" title="A render takes a take that adds a sound again, up to five times, so this is about how many first takes it will make twice.">${c.steady[0]} of ${c.steady[1]} takes say it without an added sound</div>`
+        + (!c.alike ? "" : `<div class="tr${10 * c.alike[0] < 6 * c.steady[0] ? " off" : ""}" title="By both recognizers. This counts takes that sound alike. It can't tell whether they sound right, so listen to the clip.">${c.alike[0]} of those ${c.steady[0]} say it the same way as most${c.typical ? ", and this clip is one of them" : ""}</div>`)
+        + (c.typical ? "" : `<div class="tr off">This clip is not how it is usually said</div>`))
       + (isCurrent && t.held && t.adds && t.adds[1]
         ? `<div class="tr${t.unsteady ? " off" : ""}">In the chapters, ${t.adds[1] - t.adds[0]} of ${t.adds[1]} takes say it without an added sound</div>` : "");
     return `<div class="cand${isCurrent ? " chosen" : ""}">
@@ -1508,6 +1528,22 @@ VIEWS.jobs = () => {
   const done = st.jobs.filter((j) => FINISHED.has(j.status));
   const c = st.comfy || {};
   const est = queued.reduce((t, j) => t + (j.estimate || 0), 0);
+  const ids = new Set(queued.map((j) => j.id));
+  for (const id of [...S.qsel]) if (!ids.has(id)) S.qsel.delete(id);
+  const picked = S.qsel.size;
+  // the cluster says when the queue ends, and one machine only how long its renders take
+  const outlook = !queued.length ? ""
+    : st.queue_end_in != null ? `, all done about ${clockIn(st.queue_end_in)}, in ${span(st.queue_end_in)}`
+      : st.executor !== "nomad" && est ? `, renders about ${span(est)}` : "";
+  const late = queued.findIndex(lateJob);
+  const rows = queued.map((j, i) => (i === late && i > 0
+    ? `<div class="qsplit">Backlog work, which starts when no job that is not backlog work runs or waits</div>` : "") + jobRow(j));
+  const bar = queued.length < 2 ? "" : `<div class="qbar">
+      <label class="inline"><input type="checkbox" data-change="qsel-all" ${picked === queued.length ? "checked" : ""} aria-label="Select every queued job"> <span class="small">${picked ? `${picked} selected` : "Select"}</span></label>
+      ${picked ? `<button class="sm" data-act="queue-move" data-to="top">Move to top</button>
+        <button class="sm" data-act="queue-move" data-to="bottom">Move to bottom</button>
+        <button class="sm danger" data-act="queue-cancel">Cancel ${picked}</button>` : `<span class="small muted">Drag a job by its handle, or select several and move them together.</span>`}
+    </div>`;
   return `<div class="page-head"><div><h1>Jobs</h1>
       <div class="sub">${st.executor === "nomad"
         ? "Renders, casting and the Claude passes run on the Nomad cluster, on whichever worker offers them. Jobs on different chapters or workers run side by side, and a worker runs one GPU job at a time. Quick library jobs run here."
@@ -1521,10 +1557,10 @@ VIEWS.jobs = () => {
     </div>`}
     <div class="section-head"><h2>Now</h2></div>
     <div class="panel">${[...run.map(jobRow), ...st.external.map(externalRow)].join("") || `<div class="empty">Nothing is running.</div>`}</div>
-    <div class="section-head"><h2>Queue <span class="muted small">${queued.length ? `${plural(queued.length, "job")}${est ? `, renders about ${span(est)}` : ""}` : ""}</span></h2>
+    <div class="section-head"><h2>Queue <span class="muted small">${queued.length ? `${plural(queued.length, "job")}${esc(outlook)}` : ""}</span></h2>
       <button class="sm" data-act="queue-hold" data-paused="${st.paused ? 0 : 1}">${st.paused ? "Resume the queue" : "Hold the queue"}</button></div>
     ${st.paused ? `<div class="notice warn" style="margin-bottom:10px">The queue is on hold. Heavy jobs wait until you resume it. Quick jobs still run.</div>` : ""}
-    <div class="panel">${queued.map(jobRow).join("") || `<div class="empty">The queue is empty.</div>`}</div>
+    <div class="panel" id="queue">${bar}${rows.join("") || `<div class="empty">The queue is empty.</div>`}</div>
     <div class="section-head"><h2>Finished</h2>
       <div class="row tight">
         ${st.finished_total > done.length ? `<button class="sm ghost" data-act="history-all">Show all ${st.finished_total}</button>` : ""}
@@ -1551,22 +1587,31 @@ function workersPanel(st) {
   });
   if (n.up === false) cells.unshift(`<div class="stat"><b><span class="pill down">down</span></b><span>Nomad: ${esc(n.error || "not reachable")}</span></div>`);
   else if (!cells.length) cells.push(`<div class="stat"><b>none</b><span>No Nomad worker offers serial_audio jobs yet</span></div>`);
-  cells.push(`<div class="stat"><b>${st.minutes_per_line} min</b><span>render time per script line</span></div>`);
+  cells.push(`<div class="stat"><b>${span(st.minutes_per_line * 200 * 60)}</b><span>to render a new chapter of 200 lines</span></div>`);
   return `<div class="panel pad machine">${cells.join("")}</div>`;
 }
+
+// Whether a queued job is backlog work that has not started, which the queue lists after every other job.
+const lateJob = (j) => !!j.backlog && !j.nomad;
+
+const TOP_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path fill="currentColor" d="M3 2h10v1.8H3zM8 5.2l5 6.3H3z"/></svg>`;
+const BOTTOM_ICON = `<svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path fill="currentColor" d="M3 12.2h10V14H3zM8 10.8L3 4.5h10z"/></svg>`;
+const GRIP_ICON = `<svg viewBox="0 0 10 16" width="10" height="16" aria-hidden="true" fill="currentColor">${[3, 8, 13].map((y) => `<circle cx="2.5" cy="${y}" r="1.4"/><circle cx="7.5" cy="${y}" r="1.4"/>`).join("")}</svg>`;
 
 function jobRow(j) {
   const meta = [];
   if (j.slug) meta.push(esc(j.slug));
   if (j.status === "queued") {
     meta.push(`queued ${esc(when(j.created))}`);
-    if (j.estimate) meta.push(`about ${span(j.estimate)}`);
+    if (j.estimate) meta.push(`about ${span(j.estimate)}${j.on ? ` on ${esc(j.on)}` : ""}`);
+    if (j.end_in != null) meta.push(`done about ${esc(clockIn(j.end_in))}`);
     if (j.wait) meta.push(`<span class="wait">${esc(j.wait)}</span>`);
   } else if (j.status === "running" && !j.started) {
     meta.push(j.nomad?.dispatched_at ? `sent to the cluster ${esc(when(j.nomad.dispatched_at))}` : "sending to the cluster");
   } else if (j.status === "running") {
     meta.push(`started ${esc(when(j.started))}, running ${span(elapsed(j.started))}`
       + (j.nomad?.node ? ` on ${esc(j.nomad.node)}` : ""));
+    if (j.progress?.eta) meta.push(`done about ${esc(clockIn(j.progress.eta))}`);
   } else {
     meta.push(esc(when(j.finished || j.created)));
     if (j.started && j.finished) meta.push(`took ${span(elapsed(j.started, j.finished))}`);
@@ -1578,12 +1623,16 @@ function jobRow(j) {
   let btns = "";
   if (j.status === "running") btns = log + `<button class="sm danger" data-act="job-stop" data-id="${id}" data-kind="${esc(j.kind)}" data-comfy="${j.comfy ? 1 : 0}" data-engine="${esc(j.meta?.engine || "")}">Stop</button>`;
   else if (j.status === "queued") {
-    btns = `<button class="icon" data-act="job-move" data-dir="up" data-id="${id}" title="Move up" aria-label="Move up">▲</button>`
-      + `<button class="icon" data-act="job-move" data-dir="down" data-id="${id}" title="Move down" aria-label="Move down">▼</button>`
+    const move = (to, label, icon) => `<button class="icon" data-act="queue-move" data-to="${to}" data-id="${id}" title="${label}" aria-label="${label}">${icon}</button>`;
+    btns = move("top", "Move to the top", TOP_ICON) + move("up", "Move up", "▲") + move("down", "Move down", "▼")
+      + move("bottom", "Move to the bottom", BOTTOM_ICON)
       + `<button class="sm" data-act="job-cancel" data-id="${id}">Cancel</button>`;
   } else btns = (j.started ? log : "") + `<button class="sm" data-act="job-retry" data-id="${id}">Run again</button>`;
-  return `<div class="job">
-      <div><div class="row tight"><span class="pill ${esc(j.status)}">${esc(j.status)}</span><span class="title">${esc(j.title)}</span>${j.backlog ? `<span class="tag" title="Backlog work starts only when no other job runs or waits.">backlog</span>` : ""}</div>
+  const pick = j.status !== "queued" ? "" : `<div class="pick"><span class="grip" data-grip title="Drag to move">${GRIP_ICON}</span>`
+    + `<input type="checkbox" data-change="qsel" data-id="${id}" ${S.qsel.has(j.id) ? "checked" : ""} aria-label="Select ${esc(j.title)}"></div>`;
+  return `<div class="job${pick ? ` queued${S.qsel.has(j.id) ? " sel" : ""}` : ""}" data-id="${id}" data-late="${lateJob(j) ? 1 : 0}">
+      ${pick}
+      <div><div class="row tight"><span class="pill ${esc(j.status)}">${esc(j.status)}</span><span class="title">${esc(j.title)}</span>${j.backlog ? `<span class="tag" title="Backlog work starts only when no job that is not backlog work runs or waits.">backlog</span>` : ""}</div>
         <div class="meta">${meta.join(" · ")}</div></div>
       <div class="btns">${btns}</div>
       ${j.status === "running" && j.progress ? progressRow(j.progress) : ""}
@@ -1797,7 +1846,21 @@ const ACT = {
     await poll();
   },
   "job-cancel": async (el) => { await post(`/api/jobs/${el.dataset.id}/cancel`); await poll(); },
-  "job-move": async (el) => { await post(`/api/jobs/${el.dataset.id}/move`, { direction: el.dataset.dir }); await poll(); },
+  // A row's button moves that job, and a button of the selection bar moves every selected job.
+  "queue-move": async (el) => {
+    const ids = el.dataset.id ? [el.dataset.id] : [...S.qsel];
+    if (!ids.length) return;
+    await post("/api/queue/order", { ids, to: el.dataset.to });
+    await poll();
+  },
+  "queue-cancel": async () => {
+    const ids = [...S.qsel];
+    if (!ids.length || !confirm(`Cancel the ${plural(ids.length, "selected job")}?`)) return;
+    const res = await post("/api/queue/cancel", { ids });
+    S.qsel.clear();
+    toast(`Cancelled ${plural(res.cancelled, "job")}`);
+    await poll();
+  },
   "job-retry": async (el) => {
     const res = await post(`/api/jobs/${el.dataset.id}/retry`);
     const had = (S.state?.jobs || []).some((j) => j.id === res.job.id);
@@ -1832,6 +1895,15 @@ const CHANGE = {
     const sel = uselFor(S.route.slug);
     if (el.checked) sel.add(el.dataset.id);
     else sel.delete(el.dataset.id);
+    paint();
+  },
+  qsel: (el) => {
+    if (el.checked) S.qsel.add(el.dataset.id);
+    else S.qsel.delete(el.dataset.id);
+    paint();
+  },
+  "qsel-all": (el) => {
+    S.qsel = new Set(el.checked ? (S.state?.jobs || []).filter((j) => j.status === "queued").map((j) => j.id) : []);
     paint();
   },
   "import-pick": async (el) => {
@@ -1888,6 +1960,97 @@ document.addEventListener("input", (e) => {
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) poll();
   schedulePoll();
+});
+
+// Dragging queued jobs
+
+const DRAG = { ids: null, late: "0", before: undefined, y: 0, from: 0, moved: false, line: null, frame: 0 };
+const DRAG_EDGE = 70;
+const DRAG_SCROLL = 14;
+// a press that moves less than this many pixels is a tap, which moves nothing
+const DRAG_SLOP = 6;
+
+// Puts the drop line where the dragged jobs would land: ahead of the first row whose middle is under the pointer.
+function dragOver() {
+  const rows = $$("#queue .job.queued").filter((r) => !DRAG.ids.includes(r.dataset.id) && r.dataset.late === DRAG.late);
+  if (!rows.length) return;
+  const next = rows.find((r) => {
+    const box = r.getBoundingClientRect();
+    return DRAG.y < box.top + box.height / 2;
+  });
+  DRAG.before = next ? next.dataset.id : null;
+  if (next) next.before(DRAG.line);
+  else rows[rows.length - 1].after(DRAG.line);
+}
+
+function dragScroll() {
+  if (!DRAG.ids) return;
+  const low = innerHeight - (document.body.classList.contains("playing") ? 110 : 0);
+  const by = DRAG.y < DRAG_EDGE ? -DRAG_SCROLL : DRAG.y > low - DRAG_EDGE ? DRAG_SCROLL : 0;
+  if (by && DRAG.moved) {
+    scrollBy(0, by);
+    dragOver();
+  }
+  DRAG.frame = requestAnimationFrame(dragScroll);
+}
+
+function dragEnd() {
+  cancelAnimationFrame(DRAG.frame);
+  DRAG.line?.remove();
+  $$("#queue .job.moving").forEach((r) => r.classList.remove("moving"));
+  document.body.classList.remove("dragging");
+  const { ids, before, moved } = DRAG;
+  Object.assign(DRAG, { ids: null, before: undefined, line: null, moved: false });
+  return { ids, before: moved ? before : undefined };
+}
+
+document.addEventListener("pointerdown", (e) => {
+  const grip = e.target.closest("[data-grip]");
+  if (!grip || e.button > 0 || DRAG.ids) return;
+  e.preventDefault();
+  const row = grip.closest(".job");
+  // a selected job takes the other selected jobs of its half of the queue with it
+  const mine = $$("#queue .job.queued").filter((r) => r.dataset.late === row.dataset.late
+    && (r === row || (S.qsel.has(row.dataset.id) && S.qsel.has(r.dataset.id))));
+  Object.assign(DRAG, { ids: mine.map((r) => r.dataset.id), late: row.dataset.late, before: undefined, y: e.clientY,
+    from: e.clientY, moved: false });
+  DRAG.line = document.createElement("div");
+  DRAG.line.className = "drop-line";
+  mine.forEach((r) => r.classList.add("moving"));
+  document.body.classList.add("dragging");
+  grip.setPointerCapture(e.pointerId);
+  dragOver();
+  DRAG.frame = requestAnimationFrame(dragScroll);
+});
+
+document.addEventListener("pointermove", (e) => {
+  if (!DRAG.ids) return;
+  DRAG.y = e.clientY;
+  if (Math.abs(DRAG.y - DRAG.from) > DRAG_SLOP) DRAG.moved = true;
+  dragOver();
+});
+
+document.addEventListener("pointerup", async () => {
+  if (!DRAG.ids) return;
+  const { ids, before } = dragEnd();
+  try {
+    if (before !== undefined) await post("/api/queue/order", before ? { ids, to: "before", before } : { ids, to: "bottom" });
+  } catch (err) {
+    toast(err.message, true);
+  }
+  await poll();
+});
+
+document.addEventListener("pointercancel", () => {
+  if (!DRAG.ids) return;
+  dragEnd();
+  paint();
+});
+
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape" || !DRAG.ids) return;
+  dragEnd();
+  paint();
 });
 
 $("#logdlg").addEventListener("close", () => { L.id = null; clearTimeout(L.timer); });

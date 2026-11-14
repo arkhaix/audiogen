@@ -260,6 +260,20 @@ class ScreenplayRulesTest(unittest.TestCase):
                                       {"speaker": "narrator", "text": "said Mira."}])
             self.assertFalse([p for p in problems if "asterisks" in p], text)
 
+    def test_a_cast_changes_nothing_the_pass_is_sent(self):
+        # A screenplay is written before its chapter's speakers are cast or beside the cast, so the pass's input
+        # names the chapter's characters and doesn't say who has a voice.
+        serial = {"title": "Harbour"}
+        meta = {"number": 1, "label": "Chapter 1", "title": "Morning", "characters_present": ["mira"]}
+        mira = {"name": "Mira", "aliases": ["the guard"]}
+        uncast = {"characters": {"mira": mira, "odo": {"name": "Odo"}}, "pronunciations": {}}
+        cast = {"characters": {"mira": {**mira, "voice_id": "mira", "voice_status": "auto", "bio": "A guard."},
+                               "odo": {"name": "Odo"}}, "pronunciations": {}}
+        sent = screenplay.build_input(serial, meta, TEXT, uncast)
+        self.assertEqual(screenplay.build_input(serial, meta, TEXT, cast), sent)
+        self.assertIn("id | name | aliases\nmira | Mira | the guard\n", sent)
+        self.assertNotIn("odo", sent)
+
 
 MARKED = [{"speaker": "narrator", "text": "The harbour was quiet.", "direction": ""},
           {"speaker": "mira", "text": "Nobody answered,", "direction": "shouting, panicked"},

@@ -280,6 +280,18 @@ details.char .body { padding: 10px 16px 14px; display: grid; gap: 8px; font-size
 .job .prog { grid-column: 1 / -1; display: grid; gap: 4px; }
 .job .prog .bar { height: 8px; }
 .job .prog .meta { display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.job.queued { grid-template-columns: auto 1fr auto; }
+.job.sel { background: color-mix(in srgb, var(--accent) 7%, transparent); }
+.job.moving { opacity: 0.4; }
+.job .pick { display: flex; align-items: center; gap: 8px; }
+.job .grip { display: flex; padding: 8px 4px; color: var(--muted); cursor: grab; touch-action: none; user-select: none; }
+.job .grip:hover { color: var(--text); }
+button.icon svg { display: block; }
+body.dragging { user-select: none; cursor: grabbing; }
+body.dragging .job .grip { cursor: grabbing; }
+.drop-line { height: 3px; margin: -2px 0 -1px; background: var(--accent); border-radius: 2px; }
+.qbar { display: flex; align-items: center; gap: 8px 12px; flex-wrap: wrap; padding: 8px 16px; border-bottom: 1px solid var(--border); }
+.qsplit { padding: 6px 16px; font-size: 0.78rem; color: var(--muted); background: var(--panel-2); border-bottom: 1px solid var(--border); }
 .machine { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; }
 .machine .stat b { font-size: 1.05rem; }
 
@@ -336,6 +348,8 @@ body.playing #toasts { bottom: 112px; }
   .cards { grid-template-columns: 1fr; }
   dl.kv { grid-template-columns: 1fr; }
   dl.kv dt { margin-top: 6px; }
+  .job.queued { grid-template-columns: auto 1fr; }
+  .job.queued .btns { grid-column: 2; justify-content: flex-start; }
 }
 @media (prefers-reduced-motion: reduce) {
   * { animation: none !important; transition: none !important; }

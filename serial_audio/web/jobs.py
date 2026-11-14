@@ -39,6 +39,8 @@ BIBLE_WRITERS = {"character-pass", "cast", "bios"}
 SERIAL_WRITERS = {"voice-effect"}    # rewrites serial.yaml in place, so it waits for any job on that serial
 # a render's own changes show in render_changes, and no render reads a name's options
 RENDER_NEUTRAL = {"render", "say-options"}
+# the kinds of backlog work that write only their own chapter's files, so they run beside each other
+BACKLOG_BESIDE = frozenset({"render", "check-takes"})
 FINISHED = {"done", "failed", "cancelled", "stopped", "skipped", "lost"}
 SETTLE_SECONDS = 15
 TICK_SECONDS = 2.0
@@ -46,9 +48,21 @@ COMFY_POLL_SECONDS = 4.0
 KEEP_FINISHED = 300
 DEFAULT_MIN_PER_LINE = 0.5
 DECODE_SECONDS = 150
-JOIN_SECONDS = 60
-SECONDS_PER_TAKE = {"breeze-server": 4, "ComfyUI": 14}
 CHECK_SECONDS_PER_TAKE = 2
+COMFY_TAKE_SECONDS = 14
+# seconds each part of a Breeze render takes, as (fixed, per unit), until a node's own renders give its numbers.
+# setup runs from the step to the end of the first take, which warms the model up. takes counts the takes after
+# the first, finish the takes made, check the takes heard before the join, and join the chapter's words
+RENDER_COST = {"setup": (25.0, 0.0), "takes": (0.0, 4.5), "check": (20.0, 1.8), "join": (10.0, 0.012),
+               "finish": (2.0, 0.15)}
+WORDS_PER_LINE = 16
+QUICK_SETUP_SECONDS = 5.0
+# a round of retakes starts the recognizer again, and a flagged take costs about two takes to make and hear
+RETAKE_SECONDS = 8.0
+RETAKE_TRIES = 2
+REORDER = ("top", "bottom", "up", "down", "before")
+# a part that outlasts its estimate keeps this share of it as time left
+OVERRUN_SHARE = 0.1
 
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 CREATE_BREAKAWAY_FROM_JOB = 0x01000000
@@ -261,10 +275,16 @@ def build(kind: str, p: dict, comfy_url: str = COMFY_URL, coming: dict | None = 
         dry = bool(p.get("dry_run"))
         if dry:
             args.append("--dry-run")
-        who = ", ".join(ids) if ids else "everyone who needs a voice"
+        first = _int(p, "from_chapter", 1, 99999)
+        if first is not None and ids:
+            raise ValueError("a cast that follows a chapter's character pass names no characters")
+        who = ", ".join(ids) if ids else f"ch {first}" if first else "everyone who needs a voice"
         verb = "Recast" if p.get("recast") else ("Casting briefs" if dry else "Cast")
+        meta = {"characters": ids, "candidates": _int(p, "candidates", 1, 12, 3), "dry_run": dry}
+        if first is not None:
+            meta["from_chapter"] = first
         return {"args": args, "heavy": True, "gpu": not dry, "comfy": not dry, "title": f"{verb} · {who}", "slug": slug,
-                "meta": {"characters": ids, "candidates": _int(p, "candidates", 1, 12, 3), "dry_run": dry}}
+                "meta": meta}
 
     if kind == "bios":
         slug = _slug(p)
@@ -421,7 +441,13 @@ TAKES_HEAD_RE = re.compile(r"generating takes .*?: (\d+) of \d+ lines")
 CHECK_HEAD_RE = re.compile(r"checking (\d+) takes with (?:Qwen3-ASR|Parakeet)")
 CHECK_RE = re.compile(r"\[(\d+) min\] checked (\d+)/(\d+), ([\d.]+) s/take")
 PRECHECK_RE = re.compile(r"checking the (\d+) (?:new )?takes? with")
-PRECHECK_SECONDS_PER_TAKE = 0.5
+RETAKE_RE = re.compile(r"taking (\d+) of them again")
+FIRST_RE = re.compile(r"first take done in (\d+) s")
+# the first line of each part of a job in a worker's log, by the name its arrival time is kept under
+LOG_MARKS = (("step", "$ python -m serial_audio.cli"), ("takes", "generating takes"), ("first", "first take done in"),
+             ("check", "before the join..."), ("join", "joining takes"), ("joined", "   joined "),
+             ("audio", "   audio: "))
+BREEZE_HINTS = ("with Breeze TTS 2", "generating takes", "joining takes", "before the join")
 CASTING_RE = re.compile(r"^casting (\d+): (.*)$", re.M)
 CANDIDATE_RE = re.compile(r"^\s+\S+ seed \d+: match", re.M)
 DESIGNED_RE = re.compile(r"^\s+\S+ seed \d+: designed ", re.M)
@@ -439,43 +465,43 @@ def read_tail(path: Path, size: int = 96_000) -> str:
     return data.replace(b"\x00", b"").decode("utf-8", "replace")
 
 
-def render_progress(text: str, log_mtime: float | None, now: float, started: float | None) -> dict:
+def render_cost(part: str, units: float = 0.0) -> float:
+    """Seconds a part of a Breeze render is expected to take on a node that has no numbers of its own.
+
+    part: a key of RENDER_COST.
+    units: the part's amount of work, in the unit RENDER_COST names for it.
+    """
+    fixed, per = RENDER_COST[part]
+    return fixed + per * units
+
+
+def render_progress(text: str, log_mtime: float | None, now: float, started: float | None, *,
+                    marks: dict | None = None, cost=None, make: int | None = None, hear: int | None = None) -> dict:
     """Phase, fraction done and seconds left for a render, from its log.
 
     text: the log, or its tail.
     log_mtime: when the log last changed, which dates its last progress line.
     now: the current time.
     started: when the render process started, or None.
+    marks, cost, make, hear: as breeze_progress takes them. A render with make counts as a Breeze render before
+        its log says so.
     Returns {"phase", "fraction", "eta", "detail"}. Fraction and eta may be None. "prechecked" is True once a
     Breeze render has checked its new takes before the join, so the check after the join has nothing to transcribe.
     """
     head = text.rfind("render: ")
     seg = text[head:] if head >= 0 else text
+    if make is not None or any(hint in seg for hint in BREEZE_HINTS):
+        return breeze_progress(seg, log_mtime, now, started, marks=marks, cost=cost, make=make, hear=hear)
     out = {"phase": "starting", "fraction": None, "eta": None, "detail": ""}
     m = RENDER_HEAD_RE.search(seg)
     if m:
         out["lines"] = int(m.group(2))
     if "audio: " in seg:
         return {**out, "phase": "done", "fraction": 1.0, "eta": 0, "detail": "audio written"}
-    if CHECK_HEAD_RE.search(seg):
-        return {**out, **check_progress(seg, log_mtime, now), "fraction": 0.99}
-    precheck = PRECHECK_RE.search(seg) if "could not check the new takes" not in seg else None
-    if precheck:
-        out["prechecked"] = True
-    if "joining takes" in seg:
-        return {**out, "phase": "joining", "fraction": 0.98, "eta": JOIN_SECONDS, "detail": "joining takes"}
-    if precheck:
-        marks = CHECK_RE.findall(seg[precheck.start():])
-        total = int(precheck.group(1))
-        done, per = (int(marks[-1][1]), float(marks[-1][3])) if marks else (0, PRECHECK_SECONDS_PER_TAKE)
-        return {**out, "phase": "checking", "fraction": 0.97, "eta": max(0, total - done) * per + JOIN_SECONDS,
-                "detail": f"checking the takes before the join, {done:,} of {total:,}"}
     if "voice effects" in seg:
         return {**out, "phase": "effects", "fraction": 0.99, "eta": 30, "detail": "applying voice effects"}
     if "decoding..." in seg:
         return {**out, "phase": "decoding", "fraction": 0.98, "eta": DECODE_SECONDS, "detail": "decoding audio"}
-    if "generating takes" in seg:
-        return {**out, **takes_progress(seg, log_mtime, now, started)}
     if "generating codes" not in seg:
         return out
     marks = PROGRESS_RE.findall(seg)
@@ -500,29 +526,125 @@ def render_progress(text: str, log_mtime: float | None, now: float, started: flo
     return out
 
 
-def takes_progress(seg: str, log_mtime: float | None, now: float, started: float | None) -> dict:
-    """Phase, fraction done and seconds left while a Breeze render generates its takes.
+def breeze_progress(seg: str, log_mtime: float | None, now: float, started: float | None, *,
+                    marks: dict | None = None, cost=None, make: int | None = None, hear: int | None = None) -> dict:
+    """Phase, fraction done and seconds left for a Breeze render, from its log.
 
-    seg: the log from the render's head line on.
+    seg: the log from the render's head line on, or all of it before that line.
     log_mtime: when the log last changed, which dates its last progress line.
     now: the current time.
-    started: when the render process started, or None.
-    Returns {"phase", "fraction", "eta", "detail"}, plus "steps" once a progress line has appeared.
+    started: when the render started, or None.
+    marks: when the first line of each part arrived, by the names of LOG_MARKS. A part without a mark does not
+        count down.
+    cost: cost(part, units) gives the seconds a part of RENDER_COST is expected to take on the render's node.
+        None reads RENDER_COST.
+    make: the takes the render is expected to make, for the time before its log says.
+    hear: the takes its check before the join is expected to hear, for the same time. None means the takes it
+        makes. A render also hears saved takes that lack evidence of the current check.
+    Returns {"phase", "fraction", "eta", "detail"}, plus "lines" from the head line, "prechecked" once the render
+    has checked its takes before the join, and "steps" once a line counts the takes made. eta runs to the end of
+    the job: the rest of the current part and every part after it. It is None while the takes to make are unknown.
+    A part that outlasts its estimate keeps OVERRUN_SHARE of it. fraction is the share of the job's expected
+    length that has passed, and None when that length is unknown.
     """
-    marks = TAKES_RE.findall(seg)
-    if not marks:
-        head = TAKES_HEAD_RE.search(seg)
-        per_take = SECONDS_PER_TAKE["breeze-server" if "via breeze-server" in seg else "ComfyUI"]
-        elapsed = now - started if started else None
-        detail = "generating takes" if "first take done" in seg else "loading Breeze TTS 2"
-        return {"phase": "generating", "fraction": None, "detail": detail + (f", {elapsed / 60:.0f} min in" if elapsed else ""),
-                "eta": int(head.group(1)) * per_take + JOIN_SECONDS if head else None}
-    _, done, total, ms = marks[-1]
-    done, total, per = int(done), int(total), int(ms) / 1000
-    if per and log_mtime:
-        done = min(total, done + int(max(0.0, now - log_mtime) / per))
-    return {"phase": "generating", "fraction": done / total if total else None, "steps": [done, total],
-            "eta": (total - done) * per + JOIN_SECONDS, "detail": f"take {done:,} of {total:,} at {per:.1f} s/take"}
+    # Read the log
+    timed = marks is not None
+    marks, cost = marks or {}, cost or render_cost
+    out: dict = {}
+    m = RENDER_HEAD_RE.search(seg)
+    lines = int(m.group(2)) if m else 0
+    if m:
+        out["lines"] = lines
+    head = TAKES_HEAD_RE.search(seg)
+    if head:
+        make = int(head.group(1))
+    pre = PRECHECK_RE.search(seg) if "could not check the new takes" not in seg else None
+    if pre:
+        out["prechecked"] = True
+    post = CHECK_HEAD_RE.search(seg)
+
+    def rest(mark: str, expected: float) -> float:
+        began = marks.get(mark)
+        if began is None:
+            return expected
+        return max(expected - (now - began), OVERRUN_SHARE * expected)
+
+    # Cost the current part and the parts after it
+    made = make or 0
+    heard = max(made, hear or 0)
+    join = cost("join", lines * WORDS_PER_LINE)
+    # only a job on the cluster, whose parts the app times, sends its audio to the app after the join
+    finish = cost("finish", made) if timed else 0.0
+    steps = None
+    if "audio: " in seg:
+        phase, detail, eta = "done", "audio written", rest("joined", finish)
+    elif post:
+        p = check_progress(seg[post.start():], log_mtime, now)
+        phase, detail, eta = p["phase"], p["detail"], (p["eta"] or 0) + rest("joined", finish)
+    elif "joining takes" in seg:
+        # takes that were not checked before the join are heard after it. A render that made none hears none
+        after = cost("check", heard) if heard and not pre else 0.0
+        phase, detail, eta = "joining", "joining takes", rest("join", join) + after + finish
+    elif pre:
+        heard, part = int(pre.group(1)), seg[pre.start():]
+        found = CHECK_RE.findall(part)
+        again = RETAKE_RE.findall(part)
+        if again:
+            # the log's last line dates the round, which makes each flagged take again and hears it
+            flagged = int(again[-1])
+            whole = RETAKE_SECONDS + RETAKE_TRIES * cost("takes", flagged)
+            spent = max(0.0, now - log_mtime) if log_mtime else 0.0
+            left = max(whole - spent, OVERRUN_SHARE * whole)
+            detail = f"taking {flagged:,} flagged take{'' if flagged == 1 else 's'} again"
+        else:
+            left = rest("check", cost("check", heard))
+            if found:
+                by_log = (int(found[-1][2]) - int(found[-1][1])) * float(found[-1][3])
+                # a check that the app did not time counts down by the lines of its log alone
+                left = max(left, by_log) if "check" in marks else by_log
+            done = min(heard, int(found[-1][1])) if found else 0
+            detail = f"checking the takes before the join, {done:,} of {heard:,}"
+        phase, eta = "checking", left + join + finish
+    elif head:
+        found, first = TAKES_RE.findall(seg), FIRST_RE.search(seg)
+        if found:
+            done, total, per = int(found[-1][1]), int(found[-1][2]), int(found[-1][3]) / 1000
+            # the log's rate is a mean that starts with the first take, which also warms the model up
+            if first and done > 1:
+                per = max(0.0, per * done - int(first.group(1))) / (done - 1) or per
+            if per and log_mtime:
+                done = min(total, done + int(max(0.0, now - log_mtime) / per))
+            left, steps = (total - done) * per, [done, total]
+            detail = f"take {done:,} of {total:,} at {per:.1f} s/take"
+        elif "via ComfyUI" in seg:
+            left, detail = rest("takes", made * COMFY_TAKE_SECONDS), "making takes in ComfyUI"
+        elif first:
+            left = rest("first", cost("takes", made - 1))
+            detail = f"making {made:,} take{'' if made == 1 else 's'}"
+        else:
+            left, detail = rest("step", cost("setup")) + cost("takes", made - 1), "loading Breeze TTS 2"
+        phase, eta = "generating", left + cost("check", heard) + join + finish
+    elif make is None:
+        phase, detail, eta = "starting", "", None
+    else:
+        # a render that makes and hears no take starts no breeze-server
+        setup = cost("setup") if heard else min(cost("setup"), QUICK_SETUP_SECONDS)
+        ahead = (cost("takes", make - 1) if make else 0.0) + (cost("check", heard) if heard else 0.0)
+        phase, detail, eta = "starting", "", rest("step", setup) + ahead + join + finish
+
+    # Share of the job that has passed
+    began = marks.get("step") or started
+    if phase == "done" and not eta:
+        fraction = 1.0
+    elif eta is not None and began:
+        spent = max(0.0, now - began)
+        fraction = spent / (spent + eta) if spent + eta > 0 else None
+    else:
+        fraction = steps[0] / steps[1] if steps and steps[1] else None
+    out.update({"phase": phase, "fraction": fraction, "eta": eta, "detail": detail})
+    if steps:
+        out["steps"] = steps
+    return out
 
 
 def check_progress(text: str, log_mtime: float | None, now: float) -> dict:
@@ -658,13 +780,23 @@ def backlog_wait(job: dict, jobs) -> str | None:
 
     job: the backlog job.
     jobs: every job the manager holds.
-    A backlog job starts only when no other job is running and no job that is not backlog work is queued. A job
-    that waits between two stages on the cluster counts as running.
+    A backlog job starts only when no job that is not backlog work is running or queued. It also waits for
+    running backlog work, unless both jobs are of BACKLOG_BESIDE, which run beside each other, each on a GPU
+    node of its own. It doesn't start beside one while a backlog job of another kind is queued ahead of it,
+    which would otherwise wait for as long as such jobs keep coming. A job that waits between two stages on the
+    cluster counts as running, and every backlog job waits for it.
     """
+    jobs = list(jobs)
+    beside = job.get("kind") in BACKLOG_BESIDE and not any(
+        other is not job and other["status"] == "queued" and other.get("backlog")
+        and other.get("kind") not in BACKLOG_BESIDE and other.get("seq", 0) < job.get("seq", 0) for other in jobs)
     for other in jobs:
         if other is job:
             continue
-        if other["status"] == "running" or between_stages(other):
+        staged = between_stages(other)
+        if other["status"] == "running" or staged:
+            if beside and not staged and other.get("backlog") and other.get("kind") in BACKLOG_BESIDE:
+                continue
             return f"backlog work, waiting for {other['title']} to finish"
         if other["status"] == "queued" and not other.get("backlog"):
             return "backlog work, waiting for the queue to empty"
@@ -865,15 +997,95 @@ class JobManager:
         return job
 
     def move(self, jid: str, direction: str) -> None:
+        self.reorder([jid], direction)
+
+    def reorder(self, ids: list[str], to: str, before: str | None = None) -> None:
+        """Moves queued jobs within the queue.
+
+        ids: the jobs to move. They stay in the order the queue has them in.
+        to: "top", "bottom", "up" or "down" by one place, or "before".
+        before: with "before", the queued job the moved ones go ahead of.
+        Returns nothing. The queue is in start_order, so a job moves only among the jobs of its own half: backlog
+        work that has not started, or the rest. A job stays behind every job of its batch that it was queued
+        behind and that _keeps_ahead names. A job of ids that started meanwhile is passed over. Raises KeyError
+        when none of ids is queued or `before` is not, and ValueError on another to.
+        """
+        if to not in REORDER:
+            raise ValueError(f"cannot move jobs {to!r}: use one of {', '.join(REORDER)}")
         with self.lock:
-            queued = sorted((j for j in self.jobs.values() if j["status"] == "queued"), key=lambda j: j["seq"])
-            idx = next((i for i, j in enumerate(queued) if j["id"] == jid), None)
-            if idx is None:
-                raise KeyError(jid)
-            other = idx - 1 if direction == "up" else idx + 1
-            if 0 <= other < len(queued):
-                queued[idx]["seq"], queued[other]["seq"] = queued[other]["seq"], queued[idx]["seq"]
+            # Find the jobs
+            queue = sorted((j for j in self.jobs.values() if j["status"] == "queued"), key=start_order)
+            by_id = {j["id"]: j for j in queue}
+            moving, order = {jid for jid in ids if jid in by_id}, []
+            if not moving:
+                raise KeyError(", ".join(map(str, ids)))
+            if to == "before" and before not in by_id:
+                raise KeyError(before)
+
+            # Place them in their half of the queue
+            for late in (False, True):
+                half = [j for j in queue if start_order(j)[0] == late]
+                mine = [j for j in half if j["id"] in moving]
+                rest = [j for j in half if j["id"] not in moving]
+                if not mine:
+                    order += half
+                    continue
+                if to == "top":
+                    at = 0
+                elif to == "bottom":
+                    at = len(rest)
+                elif to == "up":
+                    at = max(0, half.index(mine[0]) - 1)
+                elif to == "down":
+                    at = min(len(rest), half.index(mine[-1]) - len(mine) + 2)
+                elif by_id[before] in rest:
+                    at = rest.index(by_id[before])
+                else:
+                    # the job to go ahead of is in the other half, or is one of the moved jobs
+                    at = (half.index(by_id[before]) - sum(1 for j in mine if half.index(j) < half.index(by_id[before]))
+                          if by_id[before] in half else 0 if late else len(rest))
+                order += rest[:at] + mine + rest[at:]
+
+            # A job goes no higher than the jobs of its batch that it has to follow
+            was = {j["id"]: i for i, j in enumerate(queue)}
+            for _ in range(len(order)):
+                moved = False
+                for i, job in enumerate(order):
+                    last = max((k for k, other in enumerate(order) if k > i and job.get("batch")
+                                and other.get("batch") == job["batch"] and was[other["id"]] < was[job["id"]]
+                                and self._keeps_ahead(other, job)), default=None)
+                    if last is not None:
+                        order.insert(last, order.pop(i))
+                        moved = True
+                        break
+                if not moved:
+                    break
+
+            # Deal the queue's numbers out again in the new order
+            for job, seq in zip(order, sorted(j["seq"] for j in queue)):
+                job["seq"] = seq
+            self._save()
+
+    def _keeps_ahead(self, first: dict, job: dict) -> bool:
+        """Whether job has to stay behind first, a job of its batch that was queued ahead of it."""
+        return True
+
+    def cancel_queued(self, ids: list[str]) -> int:
+        """Cancels the jobs of ids that are still queued, as cancel does one.
+
+        ids: job ids. A job that started meanwhile keeps running, and an unknown id is passed over.
+        Returns how many were cancelled.
+        """
+        with self.lock:
+            done = 0
+            for jid in ids:
+                job = self.jobs.get(jid)
+                if job and job["status"] == "queued":
+                    job.update({"status": "cancelled", "finished": now_iso()})
+                    done += 1
+            if done:
                 self._save()
+        return done
 
     def retry(self, jid: str) -> dict:
         with self.lock:
@@ -938,13 +1150,17 @@ class JobManager:
             mtime = None
         started = _ts(job.get("started"))
         if job["kind"] == "render":
-            return render_progress(text, mtime, now, started)
+            return render_progress(text, mtime, now, started, **self._render_timing(job))
         if job["kind"] == "check-takes":
             return check_progress(text, mtime, now)
         if job["kind"] == "cast" and not job["meta"].get("dry_run"):
             return cast_progress(text, job["meta"].get("candidates") or 3)
         last = next((ln.strip() for ln in reversed(text.splitlines()) if ln.strip() and not ln.startswith("$")), "")
         return {"phase": "running", "fraction": None, "eta": None, "detail": last[:200]}
+
+    def _render_timing(self, job: dict) -> dict:
+        """What render_progress takes for a job beyond its log: its marks, cost and make. Nothing on one machine."""
+        return {}
 
     def minutes_per_line(self) -> float:
         rates = []
@@ -1074,15 +1290,37 @@ class JobManager:
                 return f"waiting for {same['title']}, which reads serial.yaml"
         return None
 
-    def _already_done(self, job: dict) -> str | None:
-        """Why a queued render no longer needs to run, or None.
+    def _nobody_to_cast(self, job: dict) -> str | None:
+        """Why a queued cast has nothing to do, or None.
 
+        job: a cast job.
+        Returns a note when the cast names no characters, is not a dry run, and no character of the serial needs a
+        voice as casting.characters_needing_voices counts them. None for any other cast, and when the serial or its
+        bible can't be read. Never raises.
+        """
+        meta = job.get("meta")
+        if not isinstance(meta, dict) or meta.get("characters") or meta.get("dry_run"):
+            return None
+        try:
+            from ..casting import characters_needing_voices
+            if characters_needing_voices(lib.load_serial(job["slug"]), lib.load_bible(job["slug"])):
+                return None
+        except Exception:
+            return None
+        return "nobody needs a voice, so there is nothing to cast"
+
+    def _already_done(self, job: dict) -> str | None:
+        """Why a queued render or cast no longer needs to run, or None.
+
+        A cast is done when _nobody_to_cast says so.
         A render is stale when its chapter was rendered after the job was queued, by a run the app did not start.
         A backlog render is also stale when a render with the same arguments started after it was queued, no job
         that changes what a render reads has run since that render started, the chapter's last render is Breeze,
         and a render would make, take again, hear and join nothing. A job that stands in for a later request
         counts as queued at that request.
         """
+        if job["kind"] == "cast":
+            return self._nobody_to_cast(job)
         if job["kind"] != "render" or job["meta"].get("decode_only"):
             return None
         n = job["meta"]["chapters"][0]

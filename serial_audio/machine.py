@@ -26,10 +26,15 @@ Standard library only, because fx.py and breeze_join.py run under the audio Pyth
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
+import urllib.parse
 from pathlib import Path
 
 WINDOWS = os.name == "nt"
+LOOPBACK = ("127.0.0.1", "localhost", "::1")
+# Windows takes 2 s to refuse a connection to a closed port of this machine
+PROBE_TIMEOUT = 0.5
 
 
 def _path(name: str, default: str) -> Path:
@@ -59,6 +64,27 @@ PHONE_MODEL = _beside_parakeet("SERIAL_AUDIO_PHONE_MODEL", "zipa-small-crctc-300
 ASR = os.environ.get("SERIAL_AUDIO_ASR", "").strip().lower()
 MEDIA_MIRROR_ENV = "SERIAL_AUDIO_MEDIA_MIRROR"
 MEDIA_MIRROR = Path(os.environ[MEDIA_MIRROR_ENV].strip()) if os.environ.get(MEDIA_MIRROR_ENV, "").strip() else None
+
+
+def listening(url: str) -> bool:
+    """Whether something may answer at url.
+
+    url: an http address.
+    Returns False only when url names a port of this machine that takes no connection within PROBE_TIMEOUT.
+    True for any other host, without a connection. Never raises.
+    """
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host, port = parts.hostname, parts.port or (443 if parts.scheme == "https" else 80)
+    except (ValueError, TypeError, AttributeError):
+        return True
+    if host not in LOOPBACK:
+        return True
+    try:
+        socket.create_connection((host, port), timeout=PROBE_TIMEOUT).close()
+        return True
+    except OSError:
+        return False
 
 
 def breeze_server_pids() -> list[int]:

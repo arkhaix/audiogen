@@ -18,7 +18,7 @@ from ..breeze import TAKES_FILE
 from ..render import COMFY_OUTPUT, plan_engine, plan_slots
 from .. import phones, pronounce, takecheck
 from ..asr import words
-from ..pronounce import steady
+from ..pronounce import offered
 from ..takecheck import CHECK_FILE, NAME_APART, VERDICTS, for_take, heard, rejudged, stale
 from .jobs import INCOMING, read_tail
 
@@ -494,20 +494,22 @@ def _options_view(options, term: str = "") -> dict | None:
                             "seconds": c.get("seconds"),
                             "media": comfy_media(c["clip"]) if isinstance(c.get("clip"), str) else None,
                             "steady": _count(c, term),
+                            "alike": _count(c, term, "alike"),
                             "typical": c.get("typical") is not False or _count(c, term) is None,
-                            "offered": _count(c, term) is None or steady(c)}
+                            "offered": _count(c, term) is None or offered(c)}
                            for c in options["candidates"] if isinstance(c, dict)]}
 
 
-def _count(candidate: dict, term: str = "") -> list[int] | None:
+def _count(candidate: dict, term: str = "", field: str = "steady") -> list[int] | None:
     """A candidate's screening count as [takes without an added sound, takes].
 
     candidate: an option of a term.
     term: the term as the text spells it.
+    field: the count to read. "alike" is [takes that say the name the usual way, takes].
     Returns None while pronounce.SCREENS is off, for a candidate that pronounce.SCREEN_V did not screen, for the
     term as written, which the name rule doesn't judge, and for a count that is not two whole numbers.
     """
-    value = candidate.get("steady")
+    value = candidate.get(field)
     ok = (pronounce.SCREENS and candidate.get("screen") == pronounce.SCREEN_V and candidate.get("say") != term
           and isinstance(value, list) and len(value) == 2
           and all(isinstance(n, int) and not isinstance(n, bool) for n in value))
@@ -554,10 +556,11 @@ def names_heard(slug: str) -> dict:
     counts the chapters that say the term whose check was not. "unsteady" is whether the takes with an added
     sound are takecheck.BREAKER_MIN or more and over takecheck.BREAKER_SHARE of the takes that say it. The
     options are {"line", "voice", "at", "candidates"}, and a candidate is {"say", "why", "heard", "seconds",
-    "media", "steady", "typical", "offered"}, where heard is how the recognizer wrote the spelling in
+    "media", "steady", "alike", "typical", "offered"}, where heard is how the recognizer wrote the spelling in
     the candidate's take, steady is [the screening takes without an added sound, the screening takes] or None,
-    typical is whether the clip is one of those, and offered is False for a screened candidate that
-    pronounce.steady rejects. The candidate that is the term as written has no count and is offered. While
+    alike is [the screening takes that say the name the usual way, the screening takes] or None, typical is
+    whether the clip is one of those, and offered is False for a screened candidate that pronounce.offered
+    rejects, which is one whose clip is not. The candidate that is the term as written has no count and is offered. While
     pronounce.SCREENS is off, steady is None and every candidate is offered.
     "screens" in the answer says whether options jobs screen. The held terms with the most takes that add a
     sound come first, then the terms with the most sayings off their first way, then those with the most

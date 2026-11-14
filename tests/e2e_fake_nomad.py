@@ -263,6 +263,10 @@ def inside(slug: str) -> int:
     check((lib.serial_dir(slug) / "serial.yaml").read_text(encoding="utf-8") != serial_before, "the library copy changed")
     check("fake-node fetched the bundle" in text, "the log records the bundle fetch")
     check(all("key" not in (j.get("nomad") or {}) for j in m.snapshot()["jobs"]), "the snapshot hides the job keys")
+    timed = ((m.placement.get("timing") or {}).get("fake-node") or {}).get("character-pass/llm") or []
+    check(len(timed) == 1 and 0 <= timed[0][1] < 120,
+          f"the app timed the step from the worker's command line to the result ({m.placement.get('timing')})")
+    check("step" in (job["nomad"].get("marks") or {}), f"the job records when its step began ({job['nomad'].get('marks')})")
 
     # A failing step fails the job and writes nothing back
     job = submit("screenplay", {"slug": slug, "chapters": "1"}, args=["no-such-command"])
@@ -405,6 +409,38 @@ def inside(slug: str) -> int:
           f"the pick filed the candidate ({filed.get('seed')}, {filed.get('status')})")
     check((voices / "captain.wav").is_file() and (voices / "captain.wav").read_bytes() == wav(pcm[2]),
           "the voice's clip comes from the mirror")
+
+    # Two breeze jobs queued together run in one task: the worker of the first is handed the second with its result
+    dispatched = len(fake.children)
+    pair = m.submit([{"kind": "render", "params": {"slug": slug, "chapter": 5}},
+                     {"kind": "render", "params": {"slug": slug, "chapter": 6}}], stop_on_failure=False)
+    for job in pair:
+        job["args"] = ["chapters", slug]
+    check(run_until(lambda: all(finished(j)() for j in pair)), "the two renders finished")
+    first, second = pair
+    check(all(j["status"] == "done" for j in pair), f"both are done ({[(j['status'], j.get('note')) for j in pair]})")
+    check(len(fake.children) == dispatched + 1, f"one Nomad job ran the two ({len(fake.children) - dispatched})")
+    check(second["nomad"].get("dispatched") == first["nomad"].get("dispatched")
+          and second["nomad"].get("follows") == first["id"],
+          f"the second job runs under the first one's Nomad job ({second['nomad'].get('dispatched')})")
+    text = log(second)
+    check("handed to the worker on fake-node as it finished" in text and "fake-node fetched the bundle" in text
+          and f"$ python -m serial_audio.cli chapters {slug}" in text and "[web] dispatched" not in text,
+          f"the second job's log says how it started and has its step ({text.strip()[:300]})")
+    check("next" not in json.dumps(m.snapshot()["jobs"]) or all(
+        "key" not in json.dumps((j.get("nomad") or {}).get("reports") or {}) for j in m.snapshot()["jobs"]),
+        "no report in the snapshot holds a job key")
+    entry = fake.children[first["nomad"]["dispatched"]]
+    check(run_until(lambda: entry["proc"].poll() is not None, 60) and entry["proc"].returncode == 0,
+          f"the task ended once the app had no further job for it (exit {entry['proc'].returncode})")
+    out = (entry["task"] / "stdout.log").read_text(encoding="utf-8", errors="replace")
+    check(f"the app handed this worker its next job, {second['id']}" in out, "the task's output names the handed job")
+    check((entry["task"] / "local" / "next-2" / "work" / "bundle.json").is_file()
+          and not (entry["task"] / "local" / "work" / "library").exists(),
+          "the second job has a work folder of its own, and the first one's library copy is gone")
+    kept_file = root / "gpu.kept.json"
+    check(kept_file.is_file() and json.loads(kept_file.read_text(encoding="utf-8")).get("kept") == {},
+          "the worker's registry of kept processes is empty after the task")
 
     # A GPU job waits while something outside it uses the machine, and stops when asked
     if os.name == "nt":

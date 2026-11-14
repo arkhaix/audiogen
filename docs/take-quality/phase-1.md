@@ -46,6 +46,21 @@ Everything in tracks A and D reads what this package stores.
 * Let a job be marked as backlog in its params. Start a backlog job only when no other job is queued or running. Don't interrupt a backlog job that is already running. Show the mark in the job list.
 * Add a command that lists the chapters a render would change, with the count of takes it would make or retake and whether the join's version is older than the current one. This is the definition of "findings" in contract point 10.
 * It is done when two backlog renders and one ordinary job, queued together on the fake Nomad, run with the ordinary job first, and the list command on a scratch copy of The Hundred Reigns matches `reusable_takes` chapter by chapter.
+* Changed on 2026-11-13: two backlog renders or take checks run beside each other, one on each GPU node, so a batch uses the Mac too (`DECISIONS.md`, "Backlog work runs only on an empty queue"). An ordinary job that arrives then waits for the node that frees first. AJ accepted that wait for now and asked for F3.
+
+## F3: a backlog job gives way to a priority job
+
+Not started. AJ asked for it on 2026-11-13: "jobs should be pause-able and evictable. if a priority job needs a worker that is busy with a backlog job, then the backlog job should be paused and returned to the queue so that the priority job can run without waiting".
+
+* Today a running backlog job is left to finish, by F2's third sentence and by the entry in `DECISIONS.md`. This package reverses that for the case AJ names. A priority job is any job that is not backlog work, until he says otherwise.
+* When `_pick_node()` in `serial_audio/web/nomad.py` would make a priority job wait for a node that runs backlog work, stop that backlog job, put it back in the queue as backlog work, and give the node to the priority job. With backlog work on both nodes, pick the node where the priority job ends soonest. Don't evict when the priority job can start at once on a free node that ends it as soon.
+* A stopped job already keeps what it made. A worker that is told to stop sends back its resumable files, such as the takes list of a Breeze render (`exchange.RESUMABLE`), and the app keeps a copy of every take. So the evicted render makes only the takes it had not made, on either node. Check that this holds for a render stopped in each of its steps: while it makes takes, while it checks them, and in the join. Decide for each step whether to stop at once or let the step end. A join takes about a minute and can't be resumed.
+* Decide what pause means for the other kinds: a take check, a cast between its briefs and its voices, and a `say-options` job. A job that can't be resumed without losing work may be left to finish, and the plan should say which.
+* Measure what an eviction costs before choosing the rule: the time from the stop request to a free node, and the time the evicted job loses when it starts again, which is the bundle fetch and the start of breeze-server, about 25 s on the laptop by the estimates of 2026-11-13.
+* Keep an evicted job from starving. One that is evicted again and again never ends, so cap the count or let a backlog job that was evicted run to its end the next time.
+* Show it. The job list says that a job was paused for another and is queued again, and the wait reason of the priority job names the job it is waiting to stop.
+* The one-machine executor runs one heavy job at a time, so the same rule applies there with one node.
+* It is done when, on the fake Nomad with two GPU nodes that both run backlog renders, an ordinary render starts without waiting for either to end, the evicted render runs again afterwards and reuses its takes, and no job is evicted twice in a row. `tests/e2e_fake_nomad.py` has one fake node today, so the test needs a second.
 
 ## A1: word rules
 

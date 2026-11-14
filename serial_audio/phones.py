@@ -8,6 +8,11 @@ The name rule and the screening read skeletons: a name's consonants in order, wi
 vowels. The reference is the skeleton of the spelling the voice is sent. adds() gives the sounds that both the word
 recognizer's spelling and the phone recognizer's phones add to it.
 
+The screening also reads a name's vowels by their place in the skeleton. vowels() gives each one as both
+recognizers have it, usual() picks the saying of a spelling that its other sayings are nearest, and compared() gives
+the vowels that a saying has another way than that one by both recognizers. Nothing reads what vowel a spelling
+means, so this tells one way of saying a spelling from another and not a right way from a wrong one.
+
 The Names tab sorts a name's sayings by the distance between phone strings. There a reference is compared with the
 window and may match any part of it. Standard library only.
 """
@@ -57,6 +62,10 @@ LETTERS = {"b": "b", "d": "d", "f": "f", "g": "g", "j": "ʒ", "k": "k", "l": "l"
 SAME = 0.5
 # a heard consonant over this far from a reference consonant, by sub(), doesn't stand for it
 FAR = 0.6
+# the vowels that end a diphthong
+OFFGLIDES = frozenset("ɪʊ")
+# a heard nucleus over this far from a usual one, by vowel_apart(), is another vowel
+VOWEL_FAR = 0.6
 
 
 def indel(p: str) -> float:
@@ -211,14 +220,6 @@ def ways(spans: list, ref: str | None, limit: float) -> list[dict]:
     return [out[0]] + sorted(out[1:], key=lambda w: -w["count"])
 
 
-def push(out: list, symbol: str) -> bool:
-    """Adds a symbol to a skeleton unless it repeats the last one. Returns whether it was added."""
-    if symbol and (not out or out[-1] != symbol):
-        out.append(symbol)
-        return True
-    return False
-
-
 def spelled(text: str, loud: bool = False) -> tuple[list[str], list[int]]:
     """The skeleton of a spelling, read as English.
 
@@ -229,8 +230,19 @@ def spelled(text: str, loud: bool = False) -> tuple[list[str], list[int]]:
     number of the word it is from. A w or a y after a vowel is part of the vowel, and an h is said only before a
     vowel.
     """
-    out: list[str] = []
-    owner: list[int] = []
+    found = lettered(text, loud)
+    return [symbol for symbol, _, _ in found], [number for _, _, number in found]
+
+
+def lettered(text: str, loud: bool = False) -> list[tuple[str, str, int]]:
+    """The skeleton of a spelling with the letters each of its symbols is read from.
+
+    text: one or more words.
+    loud: as spelled() takes it.
+    Returns [(symbol, letters, word), ...] with the symbols and the word numbers that spelled() gives. A vowel has
+    every letter of its run, with a w, a y, an h or a gh that is read as part of it.
+    """
+    out: list[list] = []
     found = re.findall(r"[a-z]+", text.lower().replace("'", "").replace("’", ""))
     for number, word in enumerate(found):
         if loud and number == len(found) - 1 and word[-1] == "e":
@@ -240,46 +252,46 @@ def spelled(text: str, loud: bool = False) -> tuple[list[str], list[int]]:
         elif (len(word) > 3 and word.endswith("es") and word[-3] not in "aeiouyszx"
               and re.search(r"[aeiouy]", word[:-3])):
             word = word[:-2] + "s"
-        symbols: list[str] = []
+        read: list[tuple[str, str]] = []
         i = 0
         while i < len(word):
             c, two = word[i], word[i:i + 2]
             after = word[i + 1:i + 2]
             if c in VOWEL_LETTERS:
-                symbols.append(VOWEL)
+                read.append((VOWEL, c))
             elif c == "y":
-                symbols.append("j" if i == 0 and after and after in VOWEL_LETTERS else VOWEL)
+                read.append(("j" if i == 0 and after and after in VOWEL_LETTERS else VOWEL, c))
             elif c == "w":
                 if two == "wh":
-                    symbols.append("w")
+                    read.append(("w", two))
                     i += 1
                 elif two == "wr" and i == 0:
-                    symbols.append("ɹ")
+                    read.append(("ɹ", two))
                     i += 1
-                elif not (i and word[i - 1] in "aeiouyw"):
-                    symbols.append("w")
+                else:
+                    read.append(("" if i and word[i - 1] in "aeiouyw" else "w", c))
             elif c == "h":
-                if after and after in "aeiouy":
-                    symbols.append("h")
+                read.append(("h" if after and after in "aeiouy" else "", c))
             elif two == "gh":
-                if i == 0:
-                    symbols.append("g")
+                read.append(("g" if i == 0 else "", two))
                 i += 1
             elif two == "kn" and i == 0:
-                symbols.append("n")
+                read.append(("n", two))
                 i += 1
             elif two in DIGRAPHS:
-                symbols.extend(DIGRAPHS[two])
+                read.extend((symbol, two) for symbol in DIGRAPHS[two])
                 i += 1
             elif c == "c":
-                symbols.append("s" if after and after in "eiy" else "k")
+                read.append(("s" if after and after in "eiy" else "k", c))
             elif c in LETTERS:
-                symbols.extend(LETTERS[c])
+                read.extend((symbol, c) for symbol in LETTERS[c])
             i += 1
-        for symbol in symbols:
-            if push(out, symbol):
-                owner.append(number)
-    return out, owner
+        for symbol, letters in read:
+            if symbol and (not out or out[-1][0] != symbol):
+                out.append([symbol, letters, number])
+            elif out and out[-1][0] == VOWEL and symbol in ("", VOWEL):
+                out[-1][1] += letters
+    return [(symbol, letters, number) for symbol, letters, number in out]
 
 
 def sounded(phones: str) -> list[str]:
@@ -289,16 +301,26 @@ def sounded(phones: str) -> list[str]:
     Returns the consonants in order with one VOWEL for each run of vowels. A glide right after a vowel is part of
     the vowel, and a glottal stop and the marks are left out.
     """
-    out: list[str] = []
+    return [symbol for symbol, _ in sounds(phones)]
+
+
+def sounds(phones: str) -> list[tuple[str, str]]:
+    """The skeleton of a phone string with the phones each of its symbols is heard from.
+
+    phones: the phones, one character each.
+    Returns [(symbol, phones), ...] with the symbols that sounded() gives. A vowel has every vowel of its run,
+    with a glide that is part of it.
+    """
+    out: list[list[str]] = []
     for p in phones:
-        if p in VOWELS:
-            push(out, VOWEL)
-        elif p in GLIDE_VOWELS:
-            if not (out and out[-1] == VOWEL):
-                push(out, p)
-        elif p in CONSONANTS and p != "ʔ":
-            push(out, p)
-    return out
+        if p in VOWELS or (p in GLIDE_VOWELS and out and out[-1][0] == VOWEL):
+            if out and out[-1][0] == VOWEL:
+                out[-1][1] += p
+            else:
+                out.append([VOWEL, p])
+        elif (p in GLIDE_VOWELS or (p in CONSONANTS and p != "ʔ")) and (not out or out[-1][0] != p):
+            out.append([p, p])
+    return [(symbol, heard) for symbol, heard in out]
 
 
 def stands(a: str, b: str) -> float:
@@ -460,13 +482,180 @@ def adds(said: str, heard: str, phones: str, following: str = "", before: str = 
     refs = [ref for ref in forms(said) if ref]
     if not refs:
         return []
-    onset = spelled(following)[0][:1]
     coda = spelled(before)[0][-1:]
-    loud = len(refs) == 1 and (not following or (bool(onset) and onset[0] not in (VOWEL, "h")
-                                                 and stands(refs[0][-1], onset[0]) > FAR))
+    loud = loud_e(refs, following)
     found = []
     for ref in refs:
         both = shared(by_spelling(ref, heard, loud), by_sound(ref, phones))
         found.append([(s, g) for s, g in both
                       if not (g == 0 and s != VOWEL and coda and coda[0] != VOWEL and stands(coda[0], s) <= FAR)])
     return min(found, key=len)
+
+
+def loud_e(refs: list[list[str]], following: str) -> bool:
+    """Whether a final e of the word recognizer's spelling of a name is a vowel.
+
+    refs: the name's reference skeletons, from forms(), without an empty one.
+    following: the line's next word, or "" at the end of the line.
+    Returns True where a vowel after the name can't be the next word's, as adds() says.
+    """
+    onset = spelled(following)[0][:1]
+    return len(refs) == 1 and (not following or (bool(onset) and onset[0] not in (VOWEL, "h")
+                                                 and stands(refs[0][-1], onset[0]) > FAR))
+
+
+def nuclei(run: str) -> list[str]:
+    """The vowels in a run of vowel phones, one for each syllable.
+
+    run: the phones of one vowel of a skeleton, from sounds().
+    Returns the vowels in order, each with ɪ or ʊ as its offglide when one follows it. A vowel that is written
+    twice is one, and a glide between two vowels parts them.
+    """
+    out: list[str] = []
+    joined = False
+    for p in run:
+        if p not in VOWELS:
+            joined = False
+        elif joined and (p == out[-1][-1] or (p in OFFGLIDES and len(out[-1]) == 1)):
+            if p != out[-1][-1]:
+                out[-1] += p
+        else:
+            out.append(p)
+            joined = True
+    return out
+
+
+def placed(ref: list[str], heard: list[str]) -> dict[int, int]:
+    """Where each vowel of a reference skeleton is in a heard one.
+
+    ref, heard: the skeletons.
+    Returns {reference index: heard index} for the vowels of ref. A vowel is the heard vowel right before the
+    sound that stands for the reference's next consonant, else the one right after the sound that stands for the
+    consonant before it, else the one aligned() lays on it. A heard vowel is the place of one reference vowel at
+    most, the first that finds it. A vowel that finds none is left out.
+    """
+    at = {i: j for i, j in aligned(ref, heard) if i is not None and j is not None}
+    out: dict[int, int] = {}
+    for i, symbol in enumerate(ref):
+        if symbol != VOWEL:
+            continue
+        after, before = at.get(i + 1), at.get(i - 1)
+        found = [after - 1 if after and heard[after - 1] == VOWEL else None,
+                 before + 1 if before is not None and before + 1 < len(heard) and heard[before + 1] == VOWEL else None,
+                 at.get(i)]
+        free = [j for j in found if j is not None and j not in out.values()]
+        if free:
+            out[i] = free[0]
+    return out
+
+
+def vowels(said: str, heard: str, phones: str, following: str = "") -> list[tuple[list[str], str]]:
+    """Each vowel of a name as one saying has it, by both recognizers.
+
+    said, heard, phones, following: as adds() takes them.
+    Returns [(nuclei, letters), ...] for the vowels of the name's skeleton, in order: the nuclei the phone
+    recognizer heard in the vowel's place, from placed(), and the letters the word recognizer wrote there. ([], "")
+    has neither. [] for a name whose spelling has no sound.
+    """
+    refs = [ref for ref in forms(said) if ref]
+    if not refs:
+        return []
+    ref = refs[0]
+    runs = []
+    for found in (sounds(phones), [(symbol, letters) for symbol, letters, _ in lettered(heard, loud_e(refs, following))]):
+        at = placed(ref, [symbol for symbol, _ in found])
+        runs.append([found[at[i]][1] if i in at else "" for i, symbol in enumerate(ref) if symbol == VOWEL])
+    return [(nuclei(run), letters) for run, letters in zip(*runs)]
+
+
+def leads(said: str, before: str) -> bool:
+    """Whether a saying's first vowel may start with the last vowel of the word before.
+
+    said: the name's words as the voice was sent them.
+    before: the line's word before the name, or "" at the start of the line.
+    Returns True when the name starts with a vowel and that word ends in one.
+    """
+    return forms(said)[0][:1] == [VOWEL] and spelled(before)[0][-1:] == [VOWEL]
+
+
+def vowel_apart(usual: str, heard: str) -> float:
+    """How far a heard nucleus is from the usual nucleus it stands for.
+
+    usual, heard: the nuclei.
+    Returns sub() of the vowels the two start with.
+    """
+    return sub(usual[0], heard[0])
+
+
+def compared(usual: list, saying: list, lead: bool = False) -> tuple[list[int], float]:
+    """A saying's vowels against the vowels of a usual saying of its name.
+
+    usual, saying: the vowels of each, from vowels().
+    lead: whether the saying's first vowel may start with vowels of the word before, from leads().
+    Returns (differing, cost). differing has the numbers of the vowels where the word recognizer's letters are
+    not the usual ones and a nucleus that stands for a usual nucleus is more than VOWEL_FAR from it by
+    vowel_apart(). The nuclei of a vowel are laid on the usual ones at the least cost, where a nucleus that
+    either lacks costs 1.0, and with lead the saying's nuclei before its first vowel's first match cost nothing.
+    cost is that least cost over all the vowels.
+    """
+    differing, cost = [], 0.0
+    for k, ((want, letters), (got, written)) in enumerate(zip(usual, saying)):
+        n, m = len(want), len(got)
+        best = [[0.0] * (m + 1) for _ in range(n + 1)]
+        for i in range(1, n + 1):
+            best[i][0] = float(i)
+        for j in range(1, m + 1):
+            best[0][j] = 0.0 if lead and k == 0 else float(j)
+        for i in range(1, n + 1):
+            for j in range(1, m + 1):
+                best[i][j] = min(best[i - 1][j - 1] + vowel_apart(want[i - 1], got[j - 1]), best[i - 1][j] + 1.0,
+                                 best[i][j - 1] + 1.0)
+        cost += best[n][m]
+        far, i, j = False, n, m
+        while i > 0 and j > 0:
+            step = vowel_apart(want[i - 1], got[j - 1])
+            if abs(best[i][j] - (best[i - 1][j - 1] + step)) < 1e-9:
+                far = far or step > VOWEL_FAR
+                i, j = i - 1, j - 1
+            elif abs(best[i][j] - (best[i - 1][j] + 1.0)) < 1e-9:
+                i -= 1
+            else:
+                j -= 1
+        if far and written != letters:
+            differing.append(k)
+    return differing, round(cost, 3)
+
+
+def usual(found: list[tuple[list, bool]]) -> list[tuple[list[str], str]] | None:
+    """The usual saying of a spelling, by its vowels.
+
+    found: (vowels, lead) of each saying, from vowels() and leads().
+    Returns [(nuclei, letters), ...] as vowels() gives a saying. The nuclei are those of the saying that the
+    others cost the least against by compared(), among the sayings that have every vowel by both recognizers
+    with as many nuclei in each as most such sayings have. The letters of a vowel are the ones most sayings
+    have among those whose nuclei there are within VOWEL_FAR of the usual ones. None when no saying has every
+    vowel.
+    """
+    whole = [n for n, (said, _) in enumerate(found) if said and all(heard and letters for heard, letters in said)]
+    if not whole:
+        return None
+    sizes = [tuple(len(heard) for heard, _ in found[n][0]) for n in whole]
+    most = max(sizes, key=lambda size: (sizes.count(size), -sizes.index(size)))
+    whole = [n for n, size in zip(whole, sizes) if size == most]
+
+    def cost(n: int) -> tuple[float, int]:
+        said = found[n][0]
+        return round(sum(compared(said, other, lead)[1] for other, lead in found if len(other) == len(said)), 3), n
+
+    middle = found[min(whole, key=cost)][0]
+    heard = [(nuclei, None) for nuclei, _ in middle]
+    letters: list[dict[str, int]] = [{} for _ in middle]
+    for other, lead in found:
+        if len(other) != len(middle):
+            continue
+        far = compared(heard, other, lead)[0]
+        for k, (nuclei, written) in enumerate(other):
+            if nuclei and written and k not in far:
+                letters[k][written] = letters[k].get(written, 0) + 1
+    return [(nuclei, max(counts, key=counts.get) if counts else written)
+            for (nuclei, written), counts in zip(middle, letters)]

@@ -1,0 +1,28 @@
+Lets the environment variable BREEZE_THREADS set the thread count of breeze-server's CPU backend.
+Breeze-TTS-2.cpp v0.1.6 leaves ggml's default of 4 threads and doesn't have a flag for it. Without
+the variable the build behaves as the pin does. dev-arch's breeze-server is built with the patch, so
+it runs 6 threads when it can't start Vulkan and falls back to the CPU. Apply it in the
+Breeze-TTS-2.cpp folder with git apply. docs/machines.md has the build.
+
+diff --git a/src/common.cpp b/src/common.cpp
+--- a/src/common.cpp
++++ b/src/common.cpp
+@@ -2,6 +2,7 @@
+ #include "ggml-cpu.h"
+ 
+ #include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ #include <stdexcept>
+ 
+@@ -16,6 +17,10 @@
+     if (!backend) {
+         backend = ggml_backend_cpu_init();
+         is_gpu = false;
++        if (const char * t = std::getenv("BREEZE_THREADS")) {
++            int n = std::atoi(t);
++            if (n > 0) ggml_backend_cpu_set_n_threads(backend, n);
++        }
+     }
+     alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+ }

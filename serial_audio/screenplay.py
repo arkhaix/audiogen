@@ -34,13 +34,12 @@ QUOTES = "\"'()" + chr(0x201C) + chr(0x201D) + chr(0x2018) + chr(0x2019)
 def cast_list(bible: dict, present: list[str] | None) -> str:
     chars = bible.get("characters") or {}
     ids = present or list(chars)
-    lines = ["id | name | aliases | voiced"]
+    lines = ["id | name | aliases"]
     for cid in ids:
         c = chars.get(cid)
         if not c:
             continue
-        lines.append(f"{cid} | {c['name']} | {', '.join(c.get('aliases') or []) or '-'} | "
-                     f"{'yes' if c.get('voice_id') else 'no'}")
+        lines.append(f"{cid} | {c['name']} | {', '.join(c.get('aliases') or []) or '-'}")
     return "\n".join(lines)
 
 

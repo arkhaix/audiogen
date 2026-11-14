@@ -32,6 +32,7 @@ CSRF_HEADER = "X-Serial-Audio"
 KEY_HEADER = "X-Serial-Audio-Key"
 NODE_HEADER = "X-Serial-Audio-Node"
 STAGE_HEADER = "X-Serial-Audio-Stage"
+NEXT_HEADER = "X-Serial-Audio-Next"
 TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
          ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon",
          ".opus": "audio/ogg; codecs=opus", ".flac": "audio/flac", ".wav": "audio/wav", ".mp3": "audio/mpeg", ".ogg": "audio/ogg", ".m4a": "audio/mp4",
@@ -373,6 +374,28 @@ def post_move(h: Handler, q, jid):
     h._send_json({"ok": True})
 
 
+def _job_ids(body: dict) -> list[str]:
+    ids = body.get("ids")
+    if not isinstance(ids, list) or not ids or not all(isinstance(i, str) and re.fullmatch(JOB, i) for i in ids):
+        raise HTTPError(400, "give the ids of the queued jobs")
+    return ids
+
+
+def post_order(h: Handler, q):
+    body = h.body_json()
+    to, before = body.get("to"), body.get("before")
+    if not isinstance(to, str) or not isinstance(before, (str, type(None))):
+        raise HTTPError(400, "give where the jobs go")
+    if to == "before" and not before:
+        raise HTTPError(400, "give the job to move them ahead of")
+    h.manager.reorder(_job_ids(body), to, before)
+    h._send_json({"ok": True})
+
+
+def post_cancel_queued(h: Handler, q):
+    h._send_json({"cancelled": h.manager.cancel_queued(_job_ids(h.body_json()))})
+
+
 def post_retry(h: Handler, q, jid):
     h._send_json({"job": h.manager.retry(jid)})
 
@@ -456,8 +479,9 @@ def post_worker_log(h: Handler, q, jid):
 def post_worker_result(h: Handler, q, jid):
     m = _worker_manager(h)
     data = h.read_body(MAX_UPLOAD)
+    code = (h.headers.get(NEXT_HEADER) or "")[:64] or None
     h._send_json(_worker_call(lambda: m.worker_result(jid, h.headers.get(KEY_HEADER) or "", h.headers.get(STAGE_HEADER),
-                                                      data)))
+                                                      data, code)))
 
 
 def post_worker_media_have(h: Handler, q, jid):
@@ -523,6 +547,8 @@ POST_ROUTES = [
     (rf"/api/jobs/{JOB}/retry", post_retry),
     (r"/api/jobs/clear", post_clear),
     (r"/api/queue/pause", post_pause),
+    (r"/api/queue/order", post_order),
+    (r"/api/queue/cancel", post_cancel_queued),
     (r"/api/upload", post_upload),
     (rf"/api/worker/{JOB}/log", post_worker_log),
     (rf"/api/worker/{JOB}/result", post_worker_result),

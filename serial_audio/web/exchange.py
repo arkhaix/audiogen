@@ -167,21 +167,30 @@ def build_bundle(slug: str, info: dict, root: Path = lib.ROOT) -> bytes:
     slug: the serial the step works on.
     info: what bundle.json carries besides the manifest: job, stage, steps, class.
     root: the repository root holding the code and library/.
-    Returns the zip bytes. Raises ExchangeError when the serial folder is missing.
+    Returns the zip bytes. The manifest gives each shipped file the hash of the bytes the zip holds, also when the
+    file changes during the call, and it leaves out a file that is gone by the time it is read. Raises
+    ExchangeError when the serial folder is missing.
     """
     folder = root / "library" / slug
     if not (folder / "serial.yaml").is_file():
         raise ExchangeError(f"no serial {slug!r} in the library")
     files = manifest(folder)
     shipped = {rel for rel in files if not _matches(rel, NOT_SHIPPED)}
-    meta = {**info, "slug": slug, "code": code_version(root),
-            "manifest": {rel: {"sha256": h, "shipped": rel in shipped} for rel, h in files.items()}}
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
         for rel, path in code_files(root):
             z.write(path, rel)
         for rel in sorted(shipped):
-            z.write(folder / rel, f"library/{slug}/{rel}")
+            # a job's result can replace the file between two reads of it, and its temporary file is gone by then
+            try:
+                data = (folder / rel).read_bytes()
+            except FileNotFoundError:
+                del files[rel]
+                continue
+            files[rel] = hashlib.sha256(data).hexdigest()
+            z.writestr(f"library/{slug}/{rel}", data)
+        meta = {**info, "slug": slug, "code": code_version(root),
+                "manifest": {rel: {"sha256": h, "shipped": rel in shipped} for rel, h in files.items()}}
         z.writestr(BUNDLE_FILE, json.dumps(meta, ensure_ascii=False, indent=1))
     return buf.getvalue()
 

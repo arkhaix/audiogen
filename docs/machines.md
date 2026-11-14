@@ -161,7 +161,8 @@ so they work without the models.
 | `zipa-small-crctc-300k` | `model.int8.onnx`, 70,677,672 bytes, sha256 8f0505173e4606b4afe041f19477b38d6a72a98a19863562749066dc496e86ae. `tokens.txt`, 769 bytes, sha256 f8e042a0c9130532b22d03ec7cae2f75a23fbec70c450c31a8efb51787b2b8fe | https://huggingface.co/anyspeech/zipa-small-crctc-300k, revision 2f458a4d | CC BY 4.0 |
 
 * The four folders hold 255 MB. On the laptop they go in `D:\comfy\models`, beside `parakeet-tdt-0.6b-v2-int8`. On
-  the Mac they go in `/Users/aj/serial-audio/models`, beside its Parakeet folder.
+  the Mac they go in `/Users/aj/serial-audio/models`, beside its Parakeet folder. dev-arch has them in
+  `/home/aj/serial-audio/models` since 2026-11-13.
 * `machine.py` defaults each folder to its name beside the Parakeet folder, so neither node's `serial_audio_config`
   needs a line, and no Nomad client config changes. `SERIAL_AUDIO_VAD_MODEL`, `SERIAL_AUDIO_SPEAKER_MODEL`,
   `SERIAL_AUDIO_ASR2_MODEL` and `SERIAL_AUDIO_PHONE_MODEL` move one.
@@ -180,7 +181,119 @@ so they work without the models.
 
 ---
 
-## containers and dev-arch
+## dev-arch, the Linux VM
 
-`deploy/README.md` covers both: the app's folder, deploys, logs and the dispatch token on containers, and dev-arch's
-dynamic node meta and the Claude token its jobs sign in with.
+The `llm` node, and since 2026-11-13 a third `breeze` node, which makes a take in about 25 s on its Iris Xe. It is VM
+104 on silver, with 12 vCPUs of an i9-12900HK, 24 GB and the host's Iris Xe. Everything the Breeze worker uses is in
+`/home/aj/serial-audio`, 5.2 GB:
+
+* `breeze-cpp/bin/breeze-server`: a static Vulkan build, which runs on the Iris Xe and starts in about 20 s.
+* `breeze-cpp/src`: Breeze-TTS-2.cpp at tag v0.1.6 with `deploy/linux/breeze-cpu-threads.patch` applied.
+* `breeze-cpp/vulkan-sdk`: the Vulkan and SPIR-V headers the build needs, copied from the laptop's Vulkan SDK 1.4.363.0. dev-arch has `vulkan-icd-loader` 1.4.363, `vulkan-intel` and `shaderc`, and doesn't have the `vulkan-headers` and `spirv-headers` packages.
+* `breeze-cpp/models/breeze-tts-2-q8_0.gguf`: the same weights as the laptop's, with the sha256 above.
+* `venv`: the system Python 3.14 with numpy 2.5.4, scipy 1.18.1, librosa 1.0.0, soundfile 0.14.0, sherpa-onnx 2.0.0 and pyyaml 6.0.3, which are the Mac's versions, installed with uv. It is the audio Python. The task itself runs `/usr/bin/python3`.
+* `models`: Parakeet and the four folders of the take check's other models, copied from the laptop, with every file checked against the hashes in this file.
+* `output/`: takes and joined audio.
+* `node.json`: the node's `serial_audio_config`.
+
+`node.json` holds:
+
+```
+{
+  "env": {
+    "SERIAL_AUDIO_COMFY_OUTPUT": "/home/aj/serial-audio/output",
+    "SERIAL_AUDIO_AUDIO_PYTHON": "/home/aj/serial-audio/venv/bin/python",
+    "SERIAL_AUDIO_BREEZE_HOME": "/home/aj/serial-audio/breeze-cpp",
+    "SERIAL_AUDIO_PARAKEET_MODEL": "/home/aj/serial-audio/models/parakeet-tdt-0.6b-v2-int8",
+    "BREEZE_THREADS": "6"
+  },
+  "comfy_url": "http://127.0.0.1:8188"
+}
+```
+
+Nothing answers on that ComfyUI address. `BREEZE_THREADS` is read by the patched breeze-server, and only when it
+can't start Vulkan and falls back to the CPU.
+
+### Nomad
+
+The client config is static, with class `server` and `gpu = "none"`, and it is in the ansible repo. The serial_audio
+keys are dynamic node meta, set with the management token:
+
+```
+nomad node meta apply -node-id <id> serial_audio=llm,breeze serial_audio_python=/usr/bin/python3 \
+  serial_audio_config=/home/aj/serial-audio/node.json
+```
+
+The Nomad client runs as root on dev-arch, so the pinned job `serial-audio-breeze-dev-arch` is registered with
+`-var user=aj` (`deploy/README.md`), and a Breeze task runs as aj, as the Claude passes do. A Breeze job doesn't wait
+for the Claude passes that run beside it. A node without a GPU label starts at `RATE_DEFAULT["none"]` in
+`serial_audio/web/nomad.py`, 25 s a take, until its own renders give its rate.
+
+### Rebuild breeze-server
+
+Send the source, the headers and the patch from the laptop. The Breeze repo's `.gitattributes` has `* text=auto`, so
+on Windows `git archive` writes CRLF unless `core.eol` is `lf`, and the patch needs its CR stripped too:
+
+```
+B=/d/comfy/breeze-cpp/src
+V=/c/VulkanSDK/1.4.363.0
+D=/home/aj/serial-audio/breeze-cpp
+G="-c core.autocrlf=false -c core.eol=lf"
+ssh aj@dev-arch "mkdir -p $D/src/third_party/ggml $D/vulkan-sdk/include $D/vulkan-sdk/lib/cmake/SPIRV-Headers"
+git -C $B $G archive HEAD | ssh aj@dev-arch "tar xf - -C $D/src"
+git -C $B/third_party/ggml $G archive HEAD | ssh aj@dev-arch "tar xf - -C $D/src/third_party/ggml"
+tar cf - -C $V/Include vulkan vk_video spirv spirv-headers | ssh aj@dev-arch "tar xf - -C $D/vulkan-sdk/include"
+tar cf - -C $V/Lib/cmake/SPIRV-Headers . | ssh aj@dev-arch "tar xf - -C $D/vulkan-sdk/lib/cmake/SPIRV-Headers"
+tr -d '\r' < deploy/linux/breeze-cpu-threads.patch | ssh aj@dev-arch "cat > $D/breeze-cpu-threads.patch"
+```
+
+Check on the laptop that the clone is at commit 87b43667 with the submodule ggml at 36da5713. Then build on dev-arch,
+which has cmake, ninja, gcc and glslc:
+
+```
+cd /home/aj/serial-audio/breeze-cpp/src
+git apply ../breeze-cpu-threads.patch
+S=/home/aj/serial-audio/breeze-cpp/vulkan-sdk
+cmake -S . -B build-vulkan -G Ninja -DCMAKE_BUILD_TYPE=Release -DBREEZE_VULKAN=ON -DBREEZE_CUDA=OFF \
+  -DBREEZE_MP3=OFF -DBUILD_SHARED_LIBS=OFF -DBREEZE_BUILD_SHARED=OFF -DBREEZE_BUILD_CLI=OFF \
+  -DVulkan_INCLUDE_DIR=$S/include -DVulkan_LIBRARY=/usr/lib/libvulkan.so \
+  -DVulkan_GLSLC_EXECUTABLE=/usr/bin/glslc -DSPIRV-Headers_DIR=$S/lib/cmake/SPIRV-Headers
+cmake --build build-vulkan -j 12
+install -m 755 build-vulkan/breeze-server ../bin/breeze-server
+```
+
+The build takes about 3 minutes, most of it the shaders. With `-DBREEZE_VULKAN=OFF` and none of the four Vulkan
+settings it is the CPU build, which takes 16 s. A server log starts with `backend: Vulkan0` when it runs on the card
+and with `backend: CPU` when it doesn't.
+
+### The audio Python
+
+```
+cd /home/aj/serial-audio
+uv venv --python /usr/bin/python3.14 venv
+uv pip install --python venv/bin/python --only-binary :all: numpy==2.5.4 scipy==1.18.1 librosa==1.0.0 \
+  soundfile==0.14.0 sherpa-onnx==2.0.0 pyyaml==6.0.3
+```
+
+`tests/test_fx.py` passes under it, all 34 tests, with the settings of `node.json` exported.
+
+### How fast it is
+
+Measured on 2026-11-13 with real lines of chapter 38 of The Hundred Reigns, the same takes the Mac made, planned and
+made with `breeze.cpp_take` as a render does:
+
+* silver has 6 fast cores and 8 slow ones, and its running VMs allocate 28 vCPUs over 20 threads. So dev-arch shares the fast cores with containers, storage, proxy and vaultwarden, and more than 6 threads make the CPU build slower.
+* The CPU build made four lines, 30 s of audio, in 128 s with 4 threads, 118 s with 5, 109 s and 113 s with 6, 137 s with 7, 144 s with 8, 160 s with 10 and 177 s with 12. At the pin the CPU backend runs 4 threads and breeze-server doesn't have a flag for it, which is what the patch is for.
+* 30 lines spread over the chapter took 480 s on the CPU with 6 threads and 487 s on the Iris Xe, for 122 s of audio, which is 0.25x realtime both ways. The Mac made the same 30 takes in 311 s. At that ratio a whole chapter costs 24.6 s a take on the CPU and 24.9 s on the card, against 15.9 s on the Mac for that chapter and about 4 s on the laptop.
+* On the card breeze-server uses about a quarter of one core and 260 MB of its own memory. The CPU build uses six cores and 3.7 GB. That is why the node runs the Vulkan build, though it is not faster.
+* The takes are speech of the right length on both. Of the 30, Parakeet on the laptop heard 21 from the CPU and 20 from the card word for word, and the rest with a name spelled another way, as in "Belzamine" for "Belzemine". None needed a second try.
+* A scratch render of a throwaway chapter of 20 short lines took 217 s there, with the check before the join, the join and the take check. The take check gathered all six blocks and flagged nothing. The same chapter then went through the cluster with one take to make, and the job took 37 s.
+* Mesa prints "Support for this platform is experimental with Xe KMD" when breeze-server starts. The card ran the 34 benchmark takes and the two test renders without a fault. In the night that followed the node made four whole chapters of The Hundred Reigns, in 87 to 110 minutes each, and none failed. The job logs don't name the backend, so it is not confirmed that those ran on the card (`docs/scheduling.md`, S4).
+* dev-arch's clock was 135 s behind containers' and the Mac's that day, and 138 s behind containers' on 2026-11-14. Its time sync is off. A render record made there has that node's time.
+
+---
+
+## containers
+
+`deploy/README.md` covers the app's folder, deploys, logs and the dispatch token on containers, and the Claude token
+that dev-arch's jobs sign in with.

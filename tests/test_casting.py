@@ -655,15 +655,16 @@ class ScreenTest(SayOptionsTest):
         self.assertEqual(self.blocks, [("asr", "phone")])
 
         # A spelling that every take says without an added sound gets its usual saying and counts as steady. One
-        # that half of the takes add a syllable to is not steady, and the log says it is not offered. Each saying
-        # is kept with the sounds both recognizers heard added.
+        # that half of the takes add a syllable to is not steady. It is offered all the same, because its clip is
+        # a usual take. Each saying is kept with the sounds both recognizers heard added.
         got = {c["say"]: (c.get("said"), c.get("steady"), c.get("typical")) for c in options["candidates"]}
         self.assertEqual(got["Eole"], ("iol", [8, 8], True))
         self.assertEqual(got["Ay-ole"], ("eɪoʊl", [8, 8], True))
         self.assertEqual(got["Yole"][1:], ([4, 8], True))
         self.assertEqual([c.get("screen") for c in options["candidates"]], [pronounce.SCREEN_V] * 3)
         self.assertEqual([pronounce.steady(c) for c in options["candidates"]], [True, True, False])
-        self.assertTrue(any("'Yole'" in line and "not offered" in line for line in logs), logs)
+        self.assertTrue(all(pronounce.offered(c) for c in options["candidates"]))
+        self.assertFalse([line for line in logs if "not offered" in line], logs)
         self.assertEqual([spans[0][2] for spans in options["candidates"][2]["sayings"]], ["", "V@3"] * 4)
 
         # Only the clip AJ hears is kept of each option, and it holds what the recognizer heard.
@@ -720,6 +721,106 @@ class ScreenTest(SayOptionsTest):
         lib.save_bible(SLUG, bible)
         pronounce.render_options(SLUG, "Eole", log=lambda *_: None, missing=True)
         self.assertEqual([c["steady"] for c in self.entry()["options"]["candidates"]], [[8, 8], [8, 8]])
+
+    def test_a_count_of_added_sounds_brings_no_further_round_and_holds_no_option_back(self):
+        # "Yole" adds a syllable in two screening takes of eight, and the name as written in one. The count is
+        # shown and decides nothing: neither is said again, and both are offered, because each clip says its
+        # option the usual way.
+        pronounce.add_option(SLUG, "Eole", "Yole")
+        sounds = [("Yole", "jol")] * 8
+        sounds[3] = sounds[6] = ("Yoley", "joli")
+        written = [("Eole", "iol")] * 8
+        written[3] = ("Eoley", "ioli")
+        logs: list[str] = []
+        with mock.patch.dict(SOUNDS, {"Yole": sounds, "Eole": written}):
+            options = pronounce.render_options(SLUG, "Eole", log=logs.append)
+        self.assertEqual([len(server.requests) for server in FakeServer.instances], [16])
+        self.assertFalse([line for line in logs if "not offered" in line or "another seed" in line], logs)
+        asis, typed = options["candidates"]
+        self.assertEqual((asis["steady"], typed["steady"], typed["alike"], typed["typical"]),
+                         ([7, 8], [6, 8], [6, 8], True))
+        self.assertTrue(pronounce.offered(typed))
+        self.assertFalse(pronounce.unsure(typed))
+
+        # hold() still asks for a share of clean takes before it keeps an option's usual saying, and six of eight
+        # is under it.
+        self.assertFalse(pronounce.steady(typed))
+        self.assertNotIn("said", pronounce.set_say_as(SLUG, "Eole", "Yole"))
+
+    def test_a_clip_that_is_not_said_the_usual_way_is_said_again_from_another_seed(self):
+        # The voice says "Ay-ole" as "eye-ole" in every take but the first one of the line AJ hears, which says
+        # "ay-ole". No take adds a sound, so the old count was eight of eight with a clip that sounds right.
+        eye, ay = ("Aiol", "aɪoʊl"), ("Aol", "eɪoʊl")
+        pronounce.add_option(SLUG, "Eole", "Ay-ole")
+        logs: list[str] = []
+        written = [("Aiol", "aɪol")] + [("Eole", "iol")] * 15
+        with mock.patch.dict(SOUNDS, {"Ay-ole": [eye] * 8 + [ay] + [eye] * 7, "Eole": written}):
+            options = pronounce.render_options(SLUG, "Eole", log=logs.append)
+        first, second = [[f for f, _ in server.requests] for server in FakeServer.instances]
+
+        # The first round finds the clip is not how the option is usually said: seven takes of eight have the
+        # usual vowels, by both recognizers. So a second round says the clip's line from another seed, and the
+        # seven other lines again.
+        self.assertTrue(any("'Ay-ole'" in line and "8 of 8" in line and "7 of them the usual way" in line
+                            and "the clip is not one of those" in line for line in logs), logs)
+        self.assertEqual((len(first), len(second)), (16, 8))
+        self.assertTrue(all("Ay-ole" in f["text"] for f in second))
+        self.assertEqual(second[0]["text"], first[8]["text"])
+        self.assertNotEqual(second[0]["seed"], first[8]["seed"])
+        seeds = [f["seed"] for f in first[9:]] + [f["seed"] for f in second[1:]]
+        self.assertEqual((len(seeds), len(set(seeds))), (14, 14))
+        # The name as written has a clip that is not usual too, and it is not said again: its count is not shown,
+        # and it is offered whatever a screen says.
+        self.assertEqual((options["candidates"][0]["typical"], options["candidates"][0]["clips"]), (False, 1))
+
+        # The new clip says it the usual way, so the option is offered with a clip of "eye-ole" for AJ to hear.
+        # The first clip counts as one of its sixteen takes.
+        typed = options["candidates"][1]
+        self.assertEqual((typed["steady"], typed["alike"], typed["typical"], typed["clips"], len(typed["sayings"])),
+                         ([16, 16], [15, 16], True, 2, 16))
+        self.assertEqual((typed["seed"], typed["heard"]), (second[0]["seed"], second[0]["text"].replace("Ay-ole", "Aiol")))
+        self.assertTrue(pronounce.steady(typed))
+
+        # A later screen of the option says the clip from the seed it has now.
+        with mock.patch.dict(SOUNDS, {"Ay-ole": [eye]}):
+            pronounce.render_options(SLUG, "Eole", log=lambda *_: None, missing=True, again="Ay-ole")
+        third = [f for f, _ in FakeServer.instances[-1].requests]
+        self.assertEqual((len(FakeServer.instances), third[0]["seed"]), (3, second[0]["seed"]))
+        self.assertEqual(self.entry()["options"]["candidates"][1]["clips"], 2)
+
+    def test_an_option_is_offered_by_its_clip_and_its_usual_saying_is_kept_by_its_count(self):
+        # An option is offered when it was screened and its clip says it the usual way, whatever share of its
+        # takes add a sound. An option without a count of this screen over eight takes or more is not offered.
+        v = pronounce.SCREEN_V
+        for count, typical, want in (([8, 8], True, True), ([3, 8], True, True), ([0, 8], True, True),
+                                     ([8, 8], False, False), ([22, 22], False, False), ([3, 4], True, False),
+                                     ([9, 8], True, False)):
+            self.assertEqual(pronounce.offered({"screen": v, "steady": count, "typical": typical}), want, count)
+        self.assertFalse(pronounce.offered({"steady": [8, 8], "typical": True}))
+        self.assertFalse(pronounce.offered("Yole"))
+
+        # Another round is for the clip alone: an option whose clip is not said the usual way gets one, whatever
+        # its count, and an option whose clip is usual gets none.
+        for count, typical, want in (([8, 8], False, True), ([4, 8], False, True), ([22, 22], False, True),
+                                     ([7, 8], True, False), ([4, 8], True, False), ([3, 4], False, False)):
+            self.assertEqual(pronounce.unsure({"screen": v, "steady": count, "typical": typical}), want, count)
+        self.assertFalse(pronounce.unsure({"steady": [7, 8], "typical": False}))
+        self.assertFalse(pronounce.unsure("Yole"))
+
+        # hold() keeps an option's usual saying when it is more likely than not that STEADY_SHARE of its takes add
+        # no sound. With every share as likely as another beforehand, a count of k in n leaves that chance at the
+        # chance of k successes or fewer in n + 1 tries at STEADY_SHARE.
+        share = pronounce.STEADY_SHARE
+        self.assertEqual(share, 0.75)
+        self.assertAlmostEqual(pronounce.likely(8, 8), 1 - share ** 9)
+        self.assertAlmostEqual(pronounce.likely(0, 0), 1 - share)
+        self.assertAlmostEqual(pronounce.likely(7, 8), 1 - share ** 9 - 9 * share ** 8 * (1 - share))
+        # That is 7 of 8, 12 of 15 and 17 of 22. The second count doesn't enter it, and a count far over what a
+        # screen makes gives a chance too, so the function doesn't raise on it.
+        for count, want in (([7, 8], True), ([6, 8], False), ([12, 15], True), ([11, 15], False), ([17, 22], True),
+                            ([16, 22], False), ([5000, 5000], True)):
+            self.assertEqual(pronounce.steady({"screen": v, "steady": count, "typical": True}), want, count)
+        self.assertTrue(pronounce.steady({"screen": v, "steady": [22, 22], "alike": [9, 22], "typical": True}))
 
     def test_a_screen_that_could_not_count_its_takes_still_counts_with_the_next(self):
         # No take of the spelling has a word in the name's place, so the screen gives no count. Its sayings are
@@ -788,7 +889,7 @@ class ScreenTest(SayOptionsTest):
         v = pronounce.SCREEN_V
         for count, typical, want in (([8, 8], True, True), ([7, 8], True, True), ([6, 8], True, False),
                                      ([7, 8], False, False), ([0, 0], True, False), ([4, 4], True, False),
-                                     ([14, 16], True, True), ([13, 16], True, False)):
+                                     ([14, 16], True, True), ([13, 16], True, True), ([12, 16], True, False)):
             self.assertEqual(pronounce.steady({"screen": v, "steady": count, "typical": typical}), want, count)
         # A count from a screen of another version proves nothing either, and neither does a candidate without one.
         self.assertFalse(pronounce.steady({"steady": [8, 8], "typical": True}))
@@ -798,9 +899,9 @@ class ScreenTest(SayOptionsTest):
         # the option's usual saying.
         usual, odd = [["eɪoʊl", "deɪoʊls", ""]], [["eɪoʊli", "deɪoʊlis", "V@2"]]
         self.assertEqual(pronounce.screened([usual] * 7 + [odd]),
-                         {"said": "eɪoʊl", "steady": [7, 8], "typical": True})
+                         {"said": "eɪoʊl", "steady": [7, 8], "alike": [7, 8], "typical": True})
         self.assertEqual(pronounce.screened([odd] + [usual] * 7),
-                         {"said": "eɪoʊl", "steady": [7, 8], "typical": False})
+                         {"said": "eɪoʊl", "steady": [7, 8], "alike": [7, 8], "typical": False})
         # A take that says the name twice has to say it right both times. A take without a span is a take that
         # doesn't say it as spelled, so four good takes of eight are not four of four.
         self.assertEqual(pronounce.screened([usual] * 4 + [usual + odd, []])["steady"], [4, 6])
@@ -834,6 +935,15 @@ class ScreenTest(SayOptionsTest):
         self.assertEqual([line["text"] for line in pronounce.screening_lines(beside, (0, 0), 4, "Eole")],
                          [texts[0], texts[3], texts[4], texts[5]])
         self.assertEqual([line["text"] for line in pronounce.screening_lines(beside, (0, 0), 4)], texts[:4])
+
+        # A later round leaves out the lines an earlier round used while enough others remain. With too few
+        # others, the used lines are said again.
+        first = pronounce.screening_lines(beside, (0, 0), 2, "Eole")
+        second = pronounce.screening_lines(beside, (0, 0), 2, "Eole", first)
+        self.assertEqual((len(second), [line for line in second if line in first]), (2, []))
+        third = pronounce.screening_lines(beside, (0, 0), 5, "Eole", first)
+        self.assertEqual(len(third), 5)
+        self.assertTrue([line for line in third if line in first])
 
     def test_a_screening_line_is_said_in_its_own_speakers_voice(self):
         serial, bible = lib.load_serial(SLUG), lib.load_bible(SLUG)

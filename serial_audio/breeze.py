@@ -28,6 +28,7 @@ import zlib
 from ctypes import wintypes
 from pathlib import Path
 
+from . import kept
 from . import library as lib
 from . import machine
 from . import screenplay
@@ -58,10 +59,13 @@ CPP_MODEL = CPP_HOME / "models" / "breeze-tts-2-q8_0.gguf"
 CPP_PORT = 8137
 CPP_FIELDS = {"temperature": 0.9, "top_k": 50, "top_p": 1.0, "repetition_penalty": 1.1, "max_new_tokens": 1500}
 CPP_START_TIMEOUT = 180
+CPP_START_POLL = 0.25
+KEPT_NAME = "breeze"
 COMFY_IDLE_TIMEOUT = 4 * 3600
 RETAKES = 2
 RETAKE_SEED_STEP = 7919
 CHECK_RETAKES = 2
+NAME_RETAKES = 5
 RETAKE_FLOOR = 8
 RETAKE_SHARE = 0.125
 LONG_LINE = 60
@@ -516,15 +520,24 @@ def tie_to_this_process(proc: subprocess.Popen):
 
 
 class CppServer:
-    """A breeze-server on 127.0.0.1 that this process starts, and stops on exit."""
+    """A breeze-server on 127.0.0.1 for this process's takes.
+
+    This process starts it and stops it on exit. Under a worker that keeps processes up between its jobs (kept.py),
+    start() uses the server that an earlier step or an earlier round of this one left up, and stop() leaves the
+    server up for the next. The kept server writes to one log beside the worker's registry, and stop() and kill()
+    copy what it wrote for this process to log_path.
+    """
 
     def __init__(self, log_path: Path, log):
         self.url = f"http://127.0.0.1:{CPP_PORT}"
         self.log_path, self.log = log_path, log
         self.proc, self.job, self.log_file = None, None, None
         self.sample_rate = None
+        self.kept_pid, self.kept_log, self.kept_from = None, None, 0
 
     def health(self) -> dict | None:
+        if not machine.listening(self.url):
+            return None
         try:
             with urllib.request.urlopen(f"{self.url}/health", timeout=3) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
@@ -533,9 +546,11 @@ class CppServer:
             return None
 
     def refuse_if_busy(self) -> None:
-        """Raises ComfyError when a breeze-server process exists or a breeze-server answers on the port."""
-        pids = [str(p) for p in machine.breeze_server_pids()]
-        if pids or self.health():
+        """Raises ComfyError when a breeze-server process exists or a breeze-server answers on the port, other
+        than the one a worker keeps up for this process."""
+        found = kept.recorded(KEPT_NAME)
+        pids = [str(p) for p in machine.breeze_server_pids() if not (found and p == found["pid"])]
+        if pids or (not found and self.health()):
             raise ComfyError(f"another breeze-server is running (pids {', '.join(pids) or 'unknown'}, port {CPP_PORT}); "
                              "stop it before rendering, so two models do not share the card")
 
@@ -545,18 +560,50 @@ class CppServer:
         return self
 
     def start(self) -> None:
-        """Starts the server and waits until it answers. On Windows a job object stops it when this process ends.
-        Elsewhere it stays in this process's group, so stopping the group stops it."""
+        """Starts the server and waits until it answers, or uses the one a worker keeps up.
+
+        On Windows a job object stops a server this process starts when this process ends. Elsewhere it stays in
+        this process's group, so stopping the group stops it. A server that a worker keeps is stopped by the worker
+        instead. On Windows it also ends with the worker's process, and elsewhere a worker that is killed leaves it
+        to the next worker that takes the GPU lock.
+        """
+        # Use the kept server
+        found = kept.recorded(KEPT_NAME)
+        same = found and (found.get("port"), found.get("server"), found.get("model")) == (
+            CPP_PORT, str(CPP_SERVER), str(CPP_MODEL))
+        health = self.health() if same else None
+        if health:
+            self.kept_pid, self.sample_rate = found["pid"], int(health.get("sample_rate") or 24000)
+            self.follow_kept_log(found.get("log"))
+            self.log(f"   breeze-server is still up at {self.url}")
+            return
+        if found:
+            self.log("   the breeze-server that was left up " + ("does not answer" if same else "runs another model")
+                     + ", so it is stopped")
+            kept.forget(KEPT_NAME)
+            kept.end(found["pid"])
+
+        # Start one
         for path in (CPP_SERVER, CPP_MODEL):
             if not path.exists():
                 raise ComfyError(f"breeze-server needs {path}; build Breeze-TTS-2.cpp and fetch its Q8_0 weights first")
-        self.log_file = open(self.log_path, "ab")
+        registry = kept.registry()
+        shared = registry.with_suffix(".breeze.log") if registry else None
+        try:
+            self.log_file = open(shared, "wb") if shared else open(self.log_path, "ab")
+        except OSError:
+            shared, self.log_file = None, open(self.log_path, "ab")
+        if shared:
+            self.follow_kept_log(str(shared))
         self.proc = subprocess.Popen(
             [str(CPP_SERVER), str(CPP_MODEL), "--host", "127.0.0.1", "--port", str(CPP_PORT), "--ws-port", "-1",
              "--voices-dir", str(CPP_HOME / "voices")],
             cwd=str(CPP_HOME), stdout=self.log_file, stderr=subprocess.STDOUT,
             creationflags=subprocess.CREATE_NO_WINDOW if machine.WINDOWS else 0)
-        if machine.WINDOWS:
+        if shared and kept.record(KEPT_NAME, self.proc.pid, CPP_PORT, server=str(CPP_SERVER), model=str(CPP_MODEL),
+                                  log=str(shared)):
+            self.kept_pid = self.proc.pid
+        elif machine.WINDOWS:
             self.job = tie_to_this_process(self.proc)
             if self.job is None:
                 self.log("   warning: could not tie breeze-server to this process, so a hard kill may leave it running")
@@ -567,25 +614,60 @@ class CppServer:
                     raise ComfyError(f"breeze-server exited with {self.proc.returncode} while starting; see {self.log_path}")
                 if time.time() > deadline:
                     raise ComfyError(f"breeze-server did not answer within {CPP_START_TIMEOUT} s; see {self.log_path}")
-                time.sleep(1)
+                time.sleep(CPP_START_POLL)
             self.sample_rate = int(health.get("sample_rate") or 24000)
         except BaseException:
-            self.stop()
+            self.kill()
             raise
         self.log(f"   breeze-server started at {self.url}")
 
+    def follow_kept_log(self, shared: str | None) -> None:
+        """Notes where the kept server's log stands, so stop() copies what the server writes from here on."""
+        try:
+            self.kept_log = Path(shared) if shared else None
+            self.kept_from = self.kept_log.stat().st_size if self.kept_log else 0
+        except OSError:
+            self.kept_log, self.kept_from = None, 0
+
+    def copy_kept_log(self) -> None:
+        """Appends what the kept server wrote since follow_kept_log to log_path. Never raises."""
+        if self.kept_log is None or self.kept_log == self.log_path:
+            return
+        try:
+            with open(self.kept_log, "rb") as src, open(self.log_path, "ab") as dst:
+                src.seek(self.kept_from)
+                shutil.copyfileobj(src, dst)
+                self.kept_from = src.tell()
+        except OSError:
+            pass
+
     def stop(self) -> None:
+        """Stops the server, unless a worker keeps it up for the next job."""
+        if self.kept_pid is None:
+            self.kill()
+            return
+        self.copy_kept_log()
+        if self.log_file is not None:
+            self.log_file.close()
+        self.proc, self.log_file, self.kept_pid, self.kept_log = None, None, None, None
+
+    def kill(self) -> None:
+        """Stops the server, also one a worker keeps up."""
         if self.proc is not None and self.proc.poll() is None:
             self.proc.terminate()
             try:
                 self.proc.wait(timeout=15)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+        if self.kept_pid is not None:
+            kept.forget(KEPT_NAME)
+            kept.end(self.kept_pid)
         if self.job is not None:
             close_handle(self.job)
         if self.log_file is not None:
             self.log_file.close()
-        self.proc, self.job, self.log_file = None, None, None
+        self.copy_kept_log()
+        self.proc, self.job, self.log_file, self.kept_pid, self.kept_log = None, None, None, None, None
 
     def __exit__(self, *exc) -> None:
         self.stop()
@@ -630,7 +712,7 @@ class CppServer:
             return self.speech(fields, wav)
         except ComfyError as e:
             log(f"   {label} failed, restarting breeze-server and retrying once: {str(e)[:500]}")
-            self.stop()
+            self.kill()
             self.start()
             return self.speech(fields, wav)
 
@@ -768,7 +850,7 @@ def retake_ceiling(spoken: int) -> int:
 
 
 def retake_flagged(folder: Path, lines: list[dict], bible: dict, saved: dict, made: list[str], again, *, save,
-                   comfy_url: str, log, rounds: int = CHECK_RETAKES) -> dict:
+                   comfy_url: str, log, rounds: int = CHECK_RETAKES, name_rounds: int = NAME_RETAKES) -> dict:
     """Checks a render's takes before the join and replaces the ones the check flags.
 
     folder: the chapter folder. Its take_check.json gets the entry of every take in made, and each voice's baseline.
@@ -783,7 +865,9 @@ def retake_flagged(folder: Path, lines: list[dict], bible: dict, saved: dict, ma
     save: save() writes saved to disk. It is called after each replaced take and at the end of each round.
     comfy_url: the ComfyUI address the recognizer functions take.
     log: receives the progress lines.
-    rounds: how many rounds a flagged line gets, over every render of its take.
+    rounds: how many rounds a flagged line gets, over every render of its take, while its take is not flagged for
+        a name.
+    name_rounds: how many it gets while its take is flagged for a name.
     Returns {"replaced", "findings", "left"}: the lines whose take was replaced, the voice findings from
     takecheck.voice_findings, and the flagged lines that the render's ceiling left for a later render. A new take
     replaces the old one only when takecheck.better ranks it above. A line goes on from the round its retake_rounds
@@ -837,9 +921,13 @@ def retake_flagged(folder: Path, lines: list[dict], bible: dict, saved: dict, ma
             done = saved[k].get("retake_rounds")
             return done if isinstance(done, int) and not isinstance(done, bool) else 0
 
+        def limit(k: str) -> int:
+            reasons = results[k].get("reasons")
+            return name_rounds if isinstance(reasons, list) and "name" in reasons else rounds
+
         budget, left = retake_ceiling(len(saved)), set()
-        for _ in range(rounds):
-            bad = [k for k in made if results[k]["verdict"] == "flagged" and k not in held and spent(k) < rounds]
+        for _ in range(max(rounds, name_rounds)):
+            bad = [k for k in made if results[k]["verdict"] == "flagged" and k not in held and spent(k) < limit(k)]
             if len(bad) > budget:
                 worst = sorted(bad, key=lambda k: (-(results[k]["sub"] + results[k]["del"] + results[k]["ins"]),
                                                    results[k].get("reasons") == ["name"]))
@@ -880,7 +968,7 @@ def retake_flagged(folder: Path, lines: list[dict], bible: dict, saved: dict, ma
                 f"these lines again: {', '.join(map(str, out['left']))}")
         still = [k for k in still if int(k) not in out["left"]]
         if still:
-            log(f"   still flagged after {rounds} rounds of retakes: {', '.join(still)}")
+            log(f"   still flagged after every round of retakes: {', '.join(still)}")
     except Exception as e:
         for new in pending.values():
             Path(new["file"]).unlink(missing_ok=True)
@@ -915,9 +1003,9 @@ def flagged_before(folder: Path, saved: dict, lines: list[dict] | None = None, b
     lines, bible: the script lines and the serial's bible. With them, a file that takecheck.stale names, for older
         rules or other picked spellings, is judged again from its evidence first, without being written.
     Returns the lines as keys of saved. A verdict counts only for the take and the audio it was heard in. A line
-    that has been through every retake round is left out, and so is a take whose reasons a voice finding covered
-    (retake_held). No hold covers the reason "name". A take_check.json that cannot be read or parsed counts as no
-    verdicts.
+    that has been through every retake round is left out, NAME_RETAKES for a take flagged for a name and
+    CHECK_RETAKES for any other, and so is a take whose reasons a voice finding covered (retake_held). No hold
+    covers the reason "name". A take_check.json that cannot be read or parsed counts as no verdicts.
     """
     from . import takecheck
     path = folder / takecheck.CHECK_FILE
@@ -938,8 +1026,9 @@ def flagged_before(folder: Path, saved: dict, lines: list[dict] | None = None, b
         if not isinstance(verdict, dict) or not isinstance(take, dict) or verdict.get("verdict") != "flagged":
             continue
         rounds = take.get("retake_rounds")
-        spent = isinstance(rounds, int) and rounds >= CHECK_RETAKES
         held, reasons = take.get("retake_held"), verdict.get("reasons")
+        named = isinstance(reasons, list) and "name" in reasons
+        spent = isinstance(rounds, int) and rounds >= (NAME_RETAKES if named else CHECK_RETAKES)
         covered = (isinstance(held, list) and isinstance(reasons, list) and bool(reasons)
                    and all(isinstance(r, str) and r != "name" and r in held for r in reasons))
         if (verdict.get("key") == take.get("key") and verdict.get("audio") == take.get("audio") and not spent
@@ -967,11 +1056,14 @@ def wait_comfy_idle(comfy_url: str, log, timeout: float = COMFY_IDLE_TIMEOUT) ->
     """Returns once ComfyUI has no running or queued prompt, or at once when it does not answer.
 
     comfy_url: the ComfyUI to watch.
-    log: receives one line when the wait starts.
+    log: receives one line when the wait starts, and one before it when a breeze-server that a worker keeps up
+        is stopped, so ComfyUI has the card.
     timeout: seconds to wait. Raises ComfyError when ComfyUI is still busy after it.
     """
     client, deadline, told = ComfyClient(comfy_url), time.time() + timeout, False
     while True:
+        if not machine.listening(comfy_url):
+            return
         try:
             queue = client._get("/queue", timeout=10)
         except Exception:
@@ -981,6 +1073,11 @@ def wait_comfy_idle(comfy_url: str, log, timeout: float = COMFY_IDLE_TIMEOUT) ->
         if time.time() > deadline:
             raise ComfyError(f"ComfyUI stayed busy for {timeout / 60:.0f} min; breeze-server would share the card with it")
         if not told:
+            found = kept.recorded(KEPT_NAME)
+            if found:
+                kept.forget(KEPT_NAME)
+                kept.end(found["pid"])
+                log("   stopped the breeze-server that was left up, so ComfyUI has the card")
             log("   waiting for ComfyUI to finish its prompts before starting breeze-server")
             told = True
         time.sleep(5)
@@ -989,7 +1086,8 @@ def wait_comfy_idle(comfy_url: str, log, timeout: float = COMFY_IDLE_TIMEOUT) ->
 def free_comfy(comfy_url: str) -> None:
     """Asks ComfyUI to unload its models so breeze-server has the card. Never raises."""
     try:
-        ComfyClient(comfy_url).free(settle=1.0)
+        if machine.listening(comfy_url):
+            ComfyClient(comfy_url).free(settle=1.0)
     except Exception:
         pass
 

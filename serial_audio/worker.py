@@ -5,6 +5,10 @@ The worker runs the job's CLI steps there against its copy of the serial, sends 
 seconds, stops when the app asks, and sends back every file the steps created or changed. Before the steps it fetches
 the chapter's saved takes from the app when another node made them, and after the steps it sends the app the takes
 and cast candidates this node made, so a later job can run on any node.
+
+A worker that finishes a breeze job asks the app, with the result, for the job this node would get next. When the
+app hands it one, the worker runs that job in the same task. It holds the machine's GPU lock from its first GPU job
+to its last, and the breeze-server and the recognizer its steps start stay up between them (kept.py).
 """
 from __future__ import annotations
 
@@ -16,6 +20,7 @@ import io
 import json
 import os
 import platform
+import shutil
 import signal
 import subprocess
 import sys
@@ -25,8 +30,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import wave
+import zipfile
 from pathlib import Path
 
+from . import kept
 from . import library as lib
 from .web import exchange
 
@@ -47,6 +54,11 @@ CSRF_HEADER = "X-Serial-Audio"
 KEY_HEADER = "X-Serial-Audio-Key"
 NODE_HEADER = "X-Serial-Audio-Node"
 STAGE_HEADER = "X-Serial-Audio-Stage"
+# sent with a result by a worker that would take another job: the version of the code it runs
+NEXT_HEADER = "X-Serial-Audio-Next"
+NEXT_CLASSES = ("breeze",)
+BUNDLE_TRIES = 6
+BUNDLE_RETRY = 10.0
 CHILD_ENV_DROP = ("CLAUDECODE", "NOMAD_TOKEN")
 CLAUDE_AUTH = "SERIAL_AUDIO_CLAUDE_AUTH"
 CLAUDE_TOKEN = "CLAUDE_CODE_OAUTH_TOKEN"
@@ -75,10 +87,12 @@ class App:
         self.url, self.job = url.rstrip("/"), job
         self.headers = {CSRF_HEADER: "1", KEY_HEADER: key, NODE_HEADER: node, STAGE_HEADER: str(stage)}
 
-    def request(self, method: str, path: str, data: bytes | None = None, timeout: float = 60) -> dict:
+    def request(self, method: str, path: str, data: bytes | None = None, timeout: float = 60,
+                headers: dict | None = None) -> dict:
         """The JSON answer to one request. Raises AppError with the HTTP status, or None when unreachable."""
         req = urllib.request.Request(f"{self.url}/api/worker/{self.job}/{path}", data=data, method=method,
-                                     headers={**self.headers, "Content-Type": "application/octet-stream"})
+                                     headers={**self.headers, "Content-Type": "application/octet-stream",
+                                              **(headers or {})})
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.loads(resp.read().decode("utf-8") or "{}")
@@ -188,8 +202,12 @@ def node_config() -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def machine_busy(comfy_url: str) -> str | None:
-    """Why the GPU on this machine is in use by something outside this job, or None."""
+def machine_busy(comfy_url: str, kept_pids=()) -> str | None:
+    """Why the GPU on this machine is in use by something outside this job, or None.
+
+    comfy_url: this machine's ComfyUI.
+    kept_pids: the processes this worker keeps up between its jobs, which are not outside it.
+    """
     from .web import jobs, procs
     snap = procs.snapshot()
     ours = procs.descendants(snap, os.getpid()) if snap else {os.getpid()}
@@ -198,9 +216,11 @@ def machine_busy(comfy_url: str) -> str | None:
             what = f"{e['kind']} chapter {e['chapter']}" if e.get("chapter") else e["kind"]
             return f"an outside {what} is running (pid {e['pid']})"
     from . import machine
-    pids = machine.breeze_server_pids()
+    pids = [p for p in machine.breeze_server_pids() if p not in kept_pids]
     if pids:
         return f"a breeze-server is running (pid {', '.join(map(str, pids))})"
+    if not machine.listening(comfy_url):
+        return None
     try:
         with urllib.request.urlopen(f"{comfy_url}/api/jobs?status=in_progress,pending&limit=5", timeout=5) as resp:
             items = json.loads(resp.read().decode("utf-8")).get("jobs") or []
@@ -531,15 +551,21 @@ def run_step(args: list[str], work: Path, env: dict, log: Log, stop: threading.E
     return -1 if stopped else proc.returncode
 
 
-def wait_for_machine(comfy_url: str, log: Log, stop: threading.Event) -> None:
-    """Returns once nothing outside this job uses the GPU, or when the job is stopped."""
+def wait_for_machine(comfy_url: str, log: Log, stop: threading.Event, held: "Held | None" = None) -> None:
+    """Returns once nothing outside this job uses the GPU, or when the job is stopped.
+
+    held: what the worker holds between jobs. The processes it keeps up are ended before the wait, so whatever is
+        outside has the card to itself.
+    """
     last, said = None, 0.0
     while not stop.is_set():
-        reason = machine_busy(comfy_url)
+        reason = machine_busy(comfy_url, held.kept_pids() if held else ())
         if reason is None:
             if last:
                 log.line("[worker] the machine is free")
             return
+        if held is not None:
+            held.end_kept(log, "so what is outside this job has the card")
         if reason != last or time.time() - said > BUSY_REPORT:
             log.line(f"[worker] waiting: {reason}")
             last, said = reason, time.time()
@@ -583,6 +609,68 @@ def gpu_lock(log: Log, stop: threading.Event, path: Path = GPU_LOCK):
     return None
 
 
+class Held:
+    """What a worker holds from one job to the next: the machine's GPU lock, and the processes its steps left up."""
+
+    def __init__(self, lock_path: Path = GPU_LOCK):
+        self.lock_path = lock_path
+        self.path = lock_path.with_suffix(".kept.json")
+        self.lock = None
+        self.registry: Path | None = None
+        self.job = None
+        self.halt = threading.Event()
+        self.code: str | None = None
+
+    def take(self, log: Log, stop: threading.Event) -> None:
+        """Takes the GPU lock unless this worker has it, and starts the registry of kept processes.
+
+        log: the job log.
+        stop: when it is set, the wait for the lock ends without the lock.
+        A process the registry still records is one an earlier worker left behind, and is ended. Never raises.
+        Without a registry the steps don't keep anything up.
+        """
+        if self.lock is not None:
+            return
+        self.lock = gpu_lock(log, stop, self.lock_path)
+        if self.lock is None:
+            return
+        try:
+            left = kept.end_all(self.path)
+            if left:
+                log.line(f"[worker] ended what an earlier job left running: {', '.join(left)}")
+            self.job = kept.open_registry(self.path)
+            self.registry = self.path
+        except OSError as e:
+            log.line(f"[worker] no registry at {self.path}, so the steps don't keep anything up between jobs: {e}")
+
+    def kept_pids(self) -> set[int]:
+        """The ids of the processes this worker keeps up. Never raises."""
+        if self.registry is None:
+            return set()
+        found = kept.load(self.registry)["kept"].values()
+        return {f["pid"] for f in found if isinstance(f, dict) and isinstance(f.get("pid"), int)}
+
+    def end_kept(self, log: Log | None = None, why: str = "") -> None:
+        """Ends the processes this worker keeps up. Never raises."""
+        if self.registry is None:
+            return
+        ended = kept.end_all(self.registry)
+        if ended and log is not None:
+            log.line(f"[worker] stopped {', '.join(ended)}" + (f", {why}" if why else ""))
+
+    def release(self, log: Log | None = None, why: str = "") -> None:
+        """Ends the kept processes and gives up the GPU lock. Never raises."""
+        self.end_kept(log, why)
+        kept.close_job(self.job)
+        self.job, self.registry = None, None
+        if self.lock is not None:
+            try:
+                self.lock.close()
+            except OSError:
+                pass
+            self.lock = None
+
+
 def comfy_marker(info: dict) -> str | None:
     """The text that marks this job's ComfyUI prompts in their graphs, or None for a job that queues none."""
     slug, kind = info.get("slug") or "", info.get("kind")
@@ -617,15 +705,23 @@ def cancel_comfy(comfy_url: str, marker: str) -> list[str]:
     return done
 
 
-def send_result(app: App, data: bytes, log: Log) -> dict | None:
-    """Delivers the result, retrying while the app is unreachable. Returns the app's report, or None."""
+def send_result(app: App, data: bytes, log: Log, next_code: str | None = None, waiting=None) -> dict | None:
+    """Delivers the result, retrying while the app is unreachable.
+
+    next_code: the version of the code this worker runs, when it would take another job after this one.
+    waiting: called once, before the first retry, so the caller can give up what it holds for a next job.
+    Returns the app's report, or None. The report names the job the app hands this worker next under "next".
+    """
+    headers = {NEXT_HEADER: next_code} if next_code else None
     for attempt in range(RESULT_TRIES):
         try:
-            return app.request("POST", "result", data, timeout=300)
+            return app.request("POST", "result", data, timeout=300, headers=headers)
         except AppError as e:
             if e.status is not None and e.status < 500:
                 log.line(f"[worker] the app refused the result: {e}")
                 return None
+            if attempt == 0 and waiting is not None:
+                waiting()
             if attempt == 0 or attempt % 10 == 9:
                 log.line(f"[worker] result not delivered yet, retrying: {e}")
             time.sleep(RESULT_RETRY)
@@ -633,39 +729,116 @@ def send_result(app: App, data: bytes, log: Log) -> dict | None:
     return None
 
 
+def fetch_next(app_url: str, following: dict, node: str, folder: Path, halt: threading.Event) -> Path | None:
+    """Fetches and unpacks the bundle of the job the app handed this worker.
+
+    app_url: the web app's address.
+    following: the job, as {"job", "key"}.
+    node: this node's name.
+    folder: an empty or missing folder for the job. The bundle goes to its work folder.
+    halt: when it is set, the fetch ends without the bundle.
+    Returns the work folder, or None when the job no longer wants to run or its bundle did not arrive. The app
+    queues the job again when this task ends without having fetched it. Never raises.
+    """
+    app = App(app_url, str(following.get("job")), str(following.get("key")), node, 0)
+    for attempt in range(BUNDLE_TRIES):
+        if halt.is_set():
+            return None
+        try:
+            data = app.fetch(f"/api/worker/{app.job}/bundle", timeout=300)
+            work = folder / "work"
+            zipfile.ZipFile(io.BytesIO(data)).extractall(work)
+            return work
+        except AppError as e:
+            if e.status is not None and e.status < 500:
+                print(f"[worker] the next job {app.job} is not for this worker: {e}", flush=True)
+                return None
+            print(f"[worker] the next job's bundle not fetched, try {attempt + 1} of {BUNDLE_TRIES}: {e}", flush=True)
+            halt.wait(BUNDLE_RETRY)
+        except (OSError, zipfile.BadZipFile) as e:
+            print(f"[worker] the next job's bundle could not be unpacked: {e}", file=sys.stderr, flush=True)
+            return None
+    return None
+
+
 def main(app_url: str, job: str, key: str, work: str | Path) -> int:
+    """Runs the job the task was dispatched for, and after it each job the app hands this worker with a result.
+
+    app_url: the web app's address.
+    job, key: the app's job id and the key it gave this job.
+    work: the folder the bundle was unpacked into.
+    Returns 0 when every step of the last job succeeded and the app took the result, else non-zero.
+    """
+    held = Held()
+    work, first = Path(work), Path(work)
+    node = os.environ.get("SERIAL_AUDIO_NODE") or platform.node()
+    if node.startswith("${"):
+        node = platform.node()
+    count = 1
+    try:
+        while True:
+            code, following = run_job(app_url, job, key, work, node, held)
+            if not following or held.halt.is_set():
+                return code
+            count += 1
+            nxt = fetch_next(app_url, following, node, first.parent / f"next-{count}", held.halt)
+            if nxt is None:
+                return code
+            # the code stays for the processes the steps left up
+            shutil.rmtree(work / "library", ignore_errors=True)
+            job, key, work = str(following["job"]), str(following["key"]), nxt
+    finally:
+        held.release()
+
+
+def run_job(app_url: str, job: str, key: str, work: Path, node: str, held: Held) -> tuple[int, dict | None]:
     """Runs one job step from an unpacked bundle.
 
     app_url: the web app's address.
     job, key: the app's job id and the key it gave this job.
     work: the folder the bundle was unpacked into.
-    Returns 0 when every step succeeded and the app took the result, else non-zero.
+    node: this node's name.
+    held: what the worker holds between jobs. A GPU job takes the GPU lock into it, and the lock and the processes
+        the steps left up stay in it only while this worker may get another job. A job whose bundle has other code
+        than the worker's first one ends those processes before its steps, its steps keep nothing up, and the
+        worker asks for no job after it. The processes also end when the app doesn't take the result at once.
+    Returns (code, following). code is 0 when every step succeeded and the app took the result, else non-zero.
+    following is the job the app handed this worker next, as {"job", "key"}, or None.
     """
     # Setup
-    work = Path(work)
     info = json.loads((work / exchange.BUNDLE_FILE).read_text(encoding="utf-8"))
-    node = os.environ.get("SERIAL_AUDIO_NODE") or platform.node()
-    if node.startswith("${"):
-        node = platform.node()
     app = App(app_url, job, key, node, int(info.get("stage") or 0))
     log_path = work.parent / "job.log"
     log = Log(log_path)
     pump = LogPump(app, log_path)
     stop = pump.cancel
+
+    def halted(*_):
+        held.halt.set()
+        stop.set()
+
     for name in ("SIGTERM", "SIGINT", "SIGBREAK"):
         if hasattr(signal, name):
-            signal.signal(getattr(signal, name), lambda *_: stop.set())
+            signal.signal(getattr(signal, name), halted)
+    if held.halt.is_set():
+        stop.set()
     pump.start()
     config = node_config()
     log.line(f"[worker] {info.get('title') or job} on {node}, stage {app.headers[STAGE_HEADER]}, code {info.get('code')}")
+    if held.code is None:
+        held.code = str(info.get("code") or "")
+    same_code = bool(held.code) and str(info.get("code") or "") == held.code
+    if not same_code:
+        held.end_kept(log, "because this job's code is not the code they run")
 
     # Steps
     comfy_url = config.get("comfy_url") or COMFY_URL
-    lock = None
     if info.get("gpu"):
-        lock = gpu_lock(log, stop)
-        wait_for_machine(comfy_url, log, stop)
+        held.take(log, stop)
+        wait_for_machine(comfy_url, log, stop, held)
     env = child_env(config, work)
+    if info.get("gpu") and held.registry is not None and same_code:
+        env[kept.ENV] = str(held.registry)
     folder = work / "library" / info["slug"]
     if info.get("takes") and not stop.is_set():
         from . import machine
@@ -690,8 +863,10 @@ def main(app_url: str, job: str, key: str, work: str | Path) -> int:
         ids = cancel_comfy(comfy_url, marker)
         if ids:
             log.line(f"[worker] cancelled ComfyUI prompt(s) {', '.join(ids)}")
-    if lock is not None:
-        lock.close()
+    more = (code == 0 and not cancelled and bool(info.get("gpu")) and info.get("class") in NEXT_CLASSES
+            and held.lock is not None and same_code)
+    if not more:
+        held.release(log)
 
     # Result
     changed = exchange.changes(folder, info.get("manifest") or {})
@@ -713,10 +888,17 @@ def main(app_url: str, job: str, key: str, work: str | Path) -> int:
         time.sleep(5)
     data = exchange.build_result(folder, {"job": job, "stage": info.get("stage") or 0, "exit_code": code,
                                           "cancelled": cancelled, "node": node, "finished": now_iso()}, changed)
-    report = send_result(app, data, log)
+    report = send_result(app, data, log, held.code if more and not stop.is_set() else None,
+                         lambda: held.end_kept(log, "while the app doesn't answer"))
+    following = report.get("next") if isinstance(report, dict) and isinstance(report.get("next"), dict) else None
     if report is not None:
-        print(f"[worker] the app took the result: {json.dumps(report)[:2000]}", flush=True)
+        shown = {k: v for k, v in report.items() if k != "next"}
+        print(f"[worker] the app took the result: {json.dumps(shown)[:2000]}", flush=True)
+        if following:
+            print(f"[worker] the app handed this worker its next job, {following.get('job')}", flush=True)
     log.close()
+    if not following:
+        held.release()
     if report is None:
-        return 3
-    return 0 if code == 0 and not cancelled else (code if code > 0 else 1)
+        return 3, None
+    return (0 if code == 0 and not cancelled else (code if code > 0 else 1)), following
