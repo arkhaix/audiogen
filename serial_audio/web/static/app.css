@@ -269,6 +269,17 @@ details.char .body { padding: 10px 16px 14px; display: grid; gap: 8px; font-size
 .facts { margin: 0; padding-left: 0; list-style: none; display: grid; gap: 3px; }
 .facts li { display: grid; grid-template-columns: 3.5em 1fr; gap: 6px; }
 .facts li b { color: var(--muted); font-weight: 600; font-size: 0.8rem; }
+q.passage { display: block; margin-top: 2px; padding-left: 8px; border-left: 2px solid var(--border); color: var(--muted); font-size: 0.86rem; font-style: italic; }
+q.passage em { font-style: normal; }
+.appearance { margin-top: 4px; padding: 10px 12px; border-radius: 8px; background: var(--panel-2); display: grid; gap: 8px; }
+details.char > summary .thumb { width: 36px; height: 36px; flex: none; border-radius: 8px; object-fit: cover; object-position: 50% 20%; background: var(--panel-2); }
+.art { display: grid; grid-template-columns: minmax(140px, 240px) 1fr; gap: 14px; align-items: start; }
+.art img.main { display: block; width: 100%; border-radius: 8px; }
+.art .stack > * + * { margin-top: 8px; }
+.picks { display: flex; gap: 8px; flex-wrap: wrap; }
+.picks figure { margin: 0; display: grid; gap: 4px; justify-items: center; }
+.picks img { display: block; width: 96px; border-radius: 6px; border: 2px solid transparent; }
+.picks figure.chosen img { border-color: var(--accent); }
 
 /* Jobs */
 .job { display: grid; grid-template-columns: 1fr auto; gap: 6px 14px; padding: 12px 16px; border-bottom: 1px solid var(--border); align-items: center; }
@@ -294,6 +305,7 @@ body.dragging .job .grip { cursor: grabbing; }
 .qsplit { padding: 6px 16px; font-size: 0.78rem; color: var(--muted); background: var(--panel-2); border-bottom: 1px solid var(--border); }
 .machine { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 14px; }
 .machine .stat b { font-size: 1.05rem; }
+.machine .node-btns { margin-top: 6px; }
 
 /* Player */
 .player {
@@ -345,6 +357,8 @@ body.playing #toasts { bottom: 112px; }
   .line { grid-template-columns: 1fr; gap: 2px; }
   .line .idx { display: none; }
   .voices { grid-template-columns: 1fr; }
+  .art { grid-template-columns: 1fr; }
+  .art img.main { max-width: 300px; }
   .cards { grid-template-columns: 1fr; }
   dl.kv { grid-template-columns: 1fr; }
   dl.kv dt { margin-top: 6px; }

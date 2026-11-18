@@ -1,6 +1,7 @@
 """Copies of the library on another disk: a daily backup, and the rendered chapters as audiobook folders.
 
-backup() writes a snapshot archive of everything but the audio and copies new or changed audio beside it.
+backup() writes a snapshot archive of everything but the audio and the images, and copies new or changed audio and
+images beside it.
 publish() copies each rendered chapter to <folder>/<serial title>/<NNN> - <chapter title>.opus, the layout of an
 audiobook player that reads one folder per book. Mirror runs both on a schedule beside the web app. Neither writes
 to the library. Standard library only.
@@ -22,6 +23,7 @@ from typing import Iterable
 
 from .. import library as lib
 from . import views
+from .exchange import IMAGE_SUFFIXES
 
 MARKER = ".serial-audio-backup"
 RECORD = ".serial-audio.json"
@@ -54,6 +56,11 @@ def _write_json(path: Path, data: dict) -> None:
     os.replace(tmp, path)
 
 
+def _is_image(path: Path, library: Path) -> bool:
+    """Whether a library file is one of a serial's images, which a snapshot leaves out."""
+    return path.relative_to(library).parts[1:2] == ("images",) and path.suffix.lower() in IMAGE_SUFFIXES
+
+
 def snapshots(dest: Path) -> list[tuple[float, Path]]:
     """The snapshot archives under dest as (time made, path), oldest first."""
     out = []
@@ -74,18 +81,20 @@ def backup(library: Path, dest: Path, extra: dict[str, Path] | None = None, keep
     extra: other files and folders for the snapshot, as {name in the archive: path}. A missing one is left out.
     keep: how many snapshots stay under dest.
     now: the time the snapshot is named for. None means the current time.
-    Returns {"snapshot", "files", "skipped", "audio_copied", "removed"}. Writes
-    snapshots/library-<time>.tar.gz with every library file but the audio, and copies each audio file that is new
-    or changed to library/<slug>/audio/. An audio copy is never deleted. A file that cannot be read is named in
-    "skipped". A snapshot that fails partway leaves no file behind.
+    Returns {"snapshot", "files", "skipped", "audio_copied", "images_copied", "removed"}. Writes
+    snapshots/library-<time>.tar.gz with every library file but the audio and the images, and copies each audio
+    file and each image that is new or changed to its place under library/<slug>/. A copy is never deleted. A file
+    that cannot be read is named in "skipped". A snapshot that fails partway leaves no file behind.
     Raises MirrorError when dest has no marker, and OSError when dest cannot be written.
     """
     if not (dest / MARKER).is_file():
         raise MirrorError(f"{dest} has no {MARKER} file, so the backup disk may not be mounted there")
 
     # Snapshot
-    sources = [(p, "library/" + p.relative_to(library).as_posix()) for p in sorted(library.rglob("*"))
-               if p.is_file() and p.relative_to(library).parts[1:2] != ("audio",)]
+    every = [p for p in sorted(library.rglob("*")) if p.is_file()]
+    images = [p for p in every if _is_image(p, library)]
+    sources = [(p, "library/" + p.relative_to(library).as_posix()) for p in every
+               if p.relative_to(library).parts[1:2] != ("audio",) and not _is_image(p, library)]
     for name, path in sorted((extra or {}).items()):
         if path.is_dir():
             sources += [(p, f"{name}/{p.relative_to(path).as_posix()}") for p in sorted(path.rglob("*")) if p.is_file()]
@@ -115,9 +124,9 @@ def backup(library: Path, dest: Path, extra: dict[str, Path] | None = None, keep
     finally:
         tmp.unlink(missing_ok=True)
 
-    # Audio
-    copied = 0
-    for src in sorted(library.glob("*/audio/*")):
+    # Audio and images
+    copied = {"audio": 0, "images": 0}
+    for kind, src in [("audio", p) for p in sorted(library.glob("*/audio/*"))] + [("images", p) for p in images]:
         dst = dest / "library" / src.relative_to(library)
         if not src.is_file():
             continue
@@ -125,13 +134,14 @@ def backup(library: Path, dest: Path, extra: dict[str, Path] | None = None, keep
         if dst.is_file() and dst.stat().st_size == st.st_size and int(dst.stat().st_mtime) == int(st.st_mtime):
             continue
         _copy(src, dst)
-        copied += 1
+        copied[kind] += 1
 
     # Old snapshots
     old = [path for _, path in snapshots(dest)][:-keep] if keep > 0 else []
     for path in old:
         path.unlink()
-    return {"snapshot": target.name, "files": files, "skipped": skipped, "audio_copied": copied, "removed": len(old)}
+    return {"snapshot": target.name, "files": files, "skipped": skipped, "audio_copied": copied["audio"],
+            "images_copied": copied["images"], "removed": len(old)}
 
 
 def _publish_serial(slug: str, dest: Path) -> int:
@@ -259,7 +269,8 @@ class Mirror(threading.Thread):
             self.next_backup, self.last_backup = now + BACKUP_EVERY, now
             self.state["backup"] = {"ok": True, "last": _iso(now), **report}
             print(f"[mirror] backup {report['snapshot']}: {report['files']} files, {report['audio_copied']} audio "
-                  f"file(s) copied, {len(report['skipped'])} skipped", file=sys.stderr, flush=True)
+                  f"file(s) and {report['images_copied']} image(s) copied, {len(report['skipped'])} skipped",
+                  file=sys.stderr, flush=True)
         except Exception as e:
             self.next_backup = now + RETRY_AFTER
             self.state["backup"] = {"ok": False, "last": _iso(self.last_backup), "error": f"{type(e).__name__}: {e}"}

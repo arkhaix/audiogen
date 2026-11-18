@@ -5,8 +5,8 @@ bible, pick a voice) itself and dispatches everything else to the Nomad cluster.
 meta offers the job's class:
 
 * `breeze`: Breeze renders through breeze-server, Breeze voice design, joining saved takes again and checking takes. The laptop (aj-legion5), the Mac (jsc-m1) and dev-arch.
-* `comfyui`: Drama 3 renders and Qwen voice design, which need ComfyUI. The laptop.
-* `llm`: the character pass, the screenplay, the casting briefs and the casting bios, which run `claude` under AJ's subscription. dev-arch.
+* `comfyui`: Drama 3 renders, Qwen voice design and the bible's images, which need ComfyUI. The laptop.
+* `llm`: the character pass, the look pass, the screenplay, the casting briefs, the casting bios and the image descriptions, which run `claude` under AJ's subscription. dev-arch.
 
 A cast runs as two dispatches: the briefs on an `llm` node, then the voices on a GPU node, which finds the briefs
 cached and doesn't call Claude. The voices stage is a `breeze` job, or a `comfyui` job for a Qwen cast. The options of
@@ -14,8 +14,14 @@ a name (`say-options`) run the same way: the respellings on an `llm` node, then 
 and Say them on the Names tab don't ask for respellings, so each is one `breeze` job. The takes go to the app's media
 mirror with the job's result, so the Names tab plays them whichever node made them.
 
+A `draw` job runs as two dispatches too: the descriptions on an `llm` node, then the images on a `comfyui` node,
+which asks no LLM (`--briefed`). A draw from a description typed in its dialog is the `comfyui` dispatch alone. A
+draw whose descriptions stage finds nothing to draw ends there and doesn't wait for the card. Its candidates come
+back as library files under `images/`, so picking one is a quick job on the app's machine.
+
 Every Breeze job runs while dev-arch is up, because it offers `llm` and `breeze` and the app keeps a copy of the
-audio a later job needs from a node (The media mirror, below). A Drama 3 render and a Qwen cast need the laptop.
+audio a later job needs from a node (The media mirror, below). A Drama 3 render, a Qwen cast and a draw need the
+laptop.
 
 ---
 
@@ -54,9 +60,9 @@ fetches the code with its job, so a deploy needs nothing on the nodes.
 ### Backup
 
 The app backs the library up once a day to `/mnt/nfs/serial-audio/backup`, which `compose.yml` mounts at `/backup`
-and names with `--backup-dir`. `snapshots/library-<time>.tar.gz` holds `library/` without the audio, `incoming/` and
-`state/placement.json`, and the newest 30 stay. `library/<slug>/audio/` holds a copy of every chapter's audio, which
-a later render of the chapter replaces. A line that starts with `[mirror]` in the app's log reports each backup.
+and names with `--backup-dir`. `snapshots/library-<time>.tar.gz` holds `library/` without the audio and the images,
+`incoming/` and `state/placement.json`, and the newest 30 stay. `library/<slug>/audio/` holds a copy of every
+chapter's audio, which a later render of the chapter replaces, and `library/<slug>/images/` a copy of every image. A line that starts with `[mirror]` in the app's log reports each backup.
 
 The app backs up only into a folder that holds the file `.serial-audio-backup`. When the share is not mounted as the
 container starts, Docker makes an empty folder on the local disk in its place. The backup then fails, and the app's
@@ -136,6 +142,16 @@ A node offers classes through client meta:
 * `serial_audio_config` optionally names a JSON file, `{"env": {...}, "comfy_url": "..."}`. The worker adds `env` to the CLI's environment, asks `comfy_url` whether ComfyUI is busy, and cancels its own prompts there when it stops.
 * `busy` must be `"false"`, because every job constrains on it. A node sets `busy = "true"` to stop taking jobs.
 
+The Jobs page can keep a node out without a change to Nomad. Hold on the node's row stops the app from sending it jobs
+until Resume, and Going offline does the same until the node was away and is ready again. The node's running job
+carries on either way, and its worker is handed no next job. The hold is the app's own, in `state/placement.json`
+under `held`. Nomad still lists the node as eligible, and the app's token could not change that. From a shell:
+
+```
+curl -s -X POST https://audiogen.grayfam.us/api/nodes/hold -H 'Content-Type: application/json' -H 'X-Serial-Audio: 1' \
+  -d '{"node": "aj-legion5", "held": true, "until_back": false}'
+```
+
 A GPU node also needs its pinned jobs registered (above).
 
 The laptop sets them in `C:\nomad\config\client.hcl` (copy in the ansible repo, `nomad/aj-legion5/client.hcl`), then
@@ -151,18 +167,21 @@ Its `breeze` jobs run as aj too, on the Iris Xe, beside the Claude passes (`docs
 
 A node with the class `breeze` needs breeze-server and its Q8_0 weights, and the Python with numpy and soundfile that
 joins the takes. A `comfyui` node needs ComfyUI on 127.0.0.1:8188 with the ComfyUI-Drama3 and ComfyUI-Qwen-TTS node
-packs.
+packs. A draw needs the image models of `comfy.IMAGE_MODELS` in ComfyUI's models folder and no node pack. It uses
+the ComfyUI that is up on the node, on port 8188 of any of the node's addresses, and starts one itself only when
+none is (`SERIAL_AUDIO_COMFY_MAIN`, `docs/machines.md`).
 
 ---
 
 ## How a job runs
 
 1. The app dispatches the job with `-meta job=<app job id> -meta key=<random per-job key>`. A Claude job goes to `serial-audio-llm`. For a GPU job the app picks the node and dispatches its pinned job (below).
-2. The task's `bootstrap.py` fetches the job's bundle from the app: the code, the prompts and schemas, and the serial's folder without its audio, about 1.5 MB for Twenty Thousand Leagues.
+2. The task's `bootstrap.py` fetches the job's bundle from the app: the code, the prompts and schemas, and the serial's folder without its audio and its images, about 1.5 MB for Twenty Thousand Leagues.
 3. A GPU job takes the machine's GPU lock first (`C:\ProgramData\serial-audio\gpu.lock`, or `/tmp/serial-audio-gpu.lock`), so two GPU jobs on one machine run one after the other, whoever dispatched them. It also waits while ComfyUI is busy with another prompt and, on Windows, while a render or pipeline script started by hand runs. It then fetches from the app the chapter's saved takes that its node lacks (The media mirror, below). Then the worker runs the CLI steps in its copy of the serial and sends the log to the app every 3 seconds.
-4. At the end the worker sends the app the takes and cast candidates its node made, and then every file the steps created or changed. The app writes a file only when the library copy still has the hash it had when the bundle was made. A file that changed meanwhile goes to `state/conflicts/<job id>/` instead, and the job's note says so. A failed or stopped job writes back only the files a rerun can use, such as `breeze_takes.json` and the casting briefs. A failed Claude pass writes back the chapters it finished, because the passes save each chapter as it completes.
+4. At the end the worker sends the app the takes and cast candidates its node made, and then every file the steps created or changed. The app writes a file only when the library copy still has the hash it had when the bundle was made. A file that changed meanwhile goes to `state/conflicts/<job id>/` instead, and the job's note says so. A failed or stopped job writes back only the files a rerun can use, such as `breeze_takes.json`, the casting briefs, the images a draw finished and the chapters a look pass read. The look pass and the draw write each of those files whole, under another name first, so a stop can't send back half a file. A failed Claude pass writes back the chapters it finished, because the passes save each chapter as it completes.
 5. Stop in the app asks the worker to stop. It kills the CLI within a few seconds, cancels the job's ComfyUI prompts and reports. A job no node has started yet is cancelled at once, and its dispatch exits as soon as a node starts it. A dispatch that fails or times out is tried again with the same idempotency token, so Nomad never runs it twice.
 6. A worker that finishes a `breeze` job sends the version of its code with the result. The app answers with the job it would dispatch to that node next, when that is a `breeze` job too and the worker runs the app's code. The worker fetches that job's bundle and runs it in the same task, so the app doesn't dispatch a Nomad job for it, and the job's log says which task it runs in. The worker keeps the GPU lock from its first job to its last. The breeze-server and the Parakeet process its steps started stay up between the jobs, recorded in a registry beside the lock (`gpu.kept.json`, `serial_audio/kept.py`), so the next job doesn't load a model. The worker stops them when the app doesn't hand it a job, when a job fails or is stopped, when a handed job has other code than its own, and before it waits for something outside the job. A step that finds ComfyUI busy stops the kept breeze-server before it waits, so ComfyUI has the card. On Windows they also sit in a job object the worker holds, so they end with it however it ends. A worker that finds processes in the registry when it takes the lock stops them first. A handed job whose task ends before it fetched the bundle is queued again. `HAND_NEXT` in `serial_audio/web/nomad.py` turns the handing off.
+7. A job whose node goes away is queued again. Nomad calls the allocation lost when its node has been disconnected for 2 hours (`lost_after` in the job spec), and the app also counts a task that failed after it saw the node disconnected. The stage that did not end runs again on any node that offers it, under another key, so the worker that went away can't send anything for it. The stages before it stand, and the batch jobs that wait for the job stay queued. A job that was asked to stop is not queued again. A job is queued again twice in a row at most, and a result of any stage starts that count again (`LOST_BACKS` in `serial_audio/web/nomad.py`, where 0 switches the rule off).
 
 Jobs on different chapters, serials or nodes run at the same time. Jobs on the same chapter wait for each other, and
 so does any job beside one that changes a whole serial (a cast, casting bios, picking a voice, fetching from the
@@ -190,12 +209,13 @@ meta, "Cast · ch 55" in the queue). A render or a take check waits for a cast, 
 but not for one that follows a later chapter's pass. So a chapter renders once the passes and casts up to its own
 chapter and its screenplay are done. A cast for everyone that finds nobody who needs a voice is skipped when its turn
 comes, without a dispatch. A laptop that sleeps through part of a render has 2 hours to come back before Nomad
-gives the allocation up.
+gives the allocation up, and the render is then queued again (point 7, above).
 
 A job of a Process batch waits by the same rules and for nothing else, so a chapter renders as soon as its voices are
 cast and its screenplay is written, beside the other chapters' passes, casts and screenplays. When a batch job fails or is lost, the queued jobs of the batch
 that wait for it are skipped and the rest run. Stopping a batch job skips every queued job of the batch as soon as
 the stop is asked for. A job of the batch that already runs on another node keeps running until it is stopped too.
+A look pass, a draw and an image pick write only `bible/looks.yaml`, `bible/settings.yaml`, the chapters' `look_pass.json` and `images/`, which no other job reads (`LOOK_KINDS` in `serial_audio/web/nomad.py`). So none of them waits for a render, a screenplay, a take check, a cast or a character pass of another chapter, and none of those waits for them. A look pass and the character pass or the import of a chapter wait for each other, and a look pass waits for another look pass of its serial. A draw waits for another draw, and an image pick for another pick. A pick and a draw wait for each other only when the draw names the pick's subject, so a pick starts beside a draw for everyone. A look pass and a draw don't wait for each other. Each of them and a bible reset wait for each other. A batch queues a chapter's look pass after its character pass and its cast.
 An import with "process the chapters after import" ticked queues the same batch behind its imports. A character pass
 or a screenplay queued behind the import of its chapter counts as a job on that chapter before the chapter is on disk,
 so it waits for the import, and a failed import skips it and the jobs that wait for it.
@@ -256,7 +276,7 @@ next job on that chapter on the same node sends it again.
 
 * A job's key is in its dispatch meta, which every tailnet device can read through Nomad's anonymous policy. It ties a worker's uploads to its own job. It is not a secret, and the app has no login either, so the tailnet stays the boundary.
 * The worker doesn't send back deleted files. Only fetch and reset-bible delete library files, and they run on the app's machine.
-* A Drama 3 render, a Drama 3 decode and a Qwen cast need ComfyUI, which only the laptop has.
+* A Drama 3 render, a Drama 3 decode, a Qwen cast and a draw need ComfyUI, which only the laptop has.
 * A join or a take check of a chapter whose takes the mirror lacks waits for the node that holds them.
 * The mirror keeps one copy of a chapter's takes for each node that worked on the chapter, about 70 MB each, and nothing removes the copies the library no longer names. The daily backup leaves the mirror out, because the nodes hold the takes too.
 * The Claude passes run only on a Linux node with aj's install of `claude`, which today is dev-arch.

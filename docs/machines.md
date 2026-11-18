@@ -31,6 +31,24 @@ python_embeded\python.exe -s ComfyUI\main.py --windows-standalone-build --disabl
 Add `--highvram` only for the `comfyui` Breeze runner. Run `--quick-test-for-ci --cpu` on a spare port to check that
 a node pack loads without disturbing a running ComfyUI.
 
+A `draw` job paints the bible's images with one of two models, which ComfyUI loads without a node pack
+(`IMAGE_MODELS` in `serial_audio/comfy.py`), as of 2026-11-15:
+
+* Qwen Image 2.1, the default: `qwen_image_2.1_int8_convrot` in `models/diffusion_models`, `qwen3vl_8b_int8_convrot` in `models/text_encoders` and `qwen_image_2.1_vae_bf16` in `models/vae`.
+* Krea 2 turbo: `krea2_turbo_fp8_scaled` in `models/diffusion_models`, `qwen3vl_4b_fp8_scaled` in `models/text_encoders` and `qwen_image_vae` in `models/vae`.
+
+The job sends its prompts to the ComfyUI that is up: the one on 127.0.0.1:8188, else one that answers on port 8188
+of another address of the laptop. AJ's own launcher listens on the tailnet address, 100.81.138.51, and it was up and
+idle on 2026-11-15, so a draw uses that one and asks it to unload its models at the end. Only when no ComfyUI is up
+does the job start one, with the command above, and stop it at the end. Under a cluster worker that ComfyUI runs as
+SYSTEM, and its log is `D:\comfy\ComfyUI\output\images\<slug>\comfyui.log`. Two instances of one install share the
+card, the `temp` folder and `user\comfyui.db`, which is why the job never starts a second. `SERIAL_AUDIO_COMFY_MAIN` and `SERIAL_AUDIO_COMFY_PYTHON` name
+the `main.py` and the Python on another machine. On 2026-11-16 both models painted for the pipeline on the laptop,
+through AJ's ComfyUI: Qwen Image 2.1 took 34 s an image and Krea 2 turbo 38 s, at 896 by 1152 and at 1344 by 768,
+with a few seconds more for a model's first image. Krea 2 turbo has 8 steps against 25 and is no faster, probably because
+its 13 GB of weights don't fit the 8 GB card. A graph can be checked without the card at any time: start `main.py` with
+`--cpu --port 8199`, post the graph to `/prompt`, read `node_errors`, and stop the process before it loads a model.
+
 ### breeze-server
 
 `D:\comfy\breeze-cpp` holds `src` (Breeze-TTS-2.cpp at tag v0.1.6), `bin\breeze-server.exe` with its DLLs, copied from

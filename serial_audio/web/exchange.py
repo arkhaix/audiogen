@@ -1,8 +1,8 @@
 """Files between the web app and a cluster worker: the job bundle the app sends and the result it takes back.
 
-A bundle is a zip of the pipeline code, the prompts and schemas, and one serial's library folder without its audio,
-plus bundle.json. bundle.json names the job and its CLI steps and holds a manifest of every file in the serial's
-folder, shipped or not, by SHA-256. A result is a zip of result.json and files/<path> for each file the worker
+A bundle is a zip of the pipeline code, the prompts and schemas, and one serial's library folder without its audio
+and its images, plus bundle.json. bundle.json names the job and its CLI steps and holds a manifest of every file in
+the serial's folder, shipped or not, by SHA-256. A result is a zip of result.json and files/<path> for each file the worker
 created or changed. The app writes a file back only when its copy still has the hash the worker started from.
 The app keeps a media mirror of the audio the library names by a path on a node: Breeze takes and cast candidates.
 A worker sends the mirror every take and candidate its node made, one request per file, and fetches from it the takes
@@ -24,9 +24,14 @@ from .. import library as lib
 BUNDLE_FILE = "bundle.json"
 RESULT_FILE = "result.json"
 CODE_DIRS = ("serial_audio", "prompts", "schemas")
-NOT_SHIPPED = ("audio/*",)
+IMAGE_SUFFIXES = {".webp", ".png", ".jpg", ".jpeg"}
+# a worker makes audio and images and reads neither, so a bundle leaves them out
+NOT_SHIPPED = ("audio/*", *(f"images/*{suffix}" for suffix in sorted(IMAGE_SUFFIXES)))
 NOT_CODE = ("*/__pycache__/*", "*.pyc", "serial_audio/web/static/*", "*/._*")
-RESUMABLE = ("chapters/*/breeze_takes.json", "chapters/*/*.log", "voices/_briefs.yaml")
+# the looks and the images are here because each of their files is written whole, with library.replace_yaml
+RESUMABLE = ("chapters/*/breeze_takes.json", "chapters/*/*.log", "voices/_briefs.yaml", "images/_briefs.yaml",
+             "images/*/*.yaml", *NOT_SHIPPED[1:], "bible/looks.yaml", "bible/settings.yaml",
+             "chapters/*/look_pass.json")
 MEDIA_SUFFIXES = {".flac", ".wav", ".opus", ".ogg", ".mp3", ".m4a"}
 # what the mirror keeps: audio, and the Drama 3 voice file of a Qwen cast candidate
 MIRROR_SUFFIXES = MEDIA_SUFFIXES | {".safetensors"}

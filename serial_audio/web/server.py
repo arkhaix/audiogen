@@ -35,6 +35,7 @@ STAGE_HEADER = "X-Serial-Audio-Stage"
 NEXT_HEADER = "X-Serial-Audio-Next"
 TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=utf-8",
          ".css": "text/css; charset=utf-8", ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon",
+         ".webp": "image/webp", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
          ".opus": "audio/ogg; codecs=opus", ".flac": "audio/flac", ".wav": "audio/wav", ".mp3": "audio/mpeg", ".ogg": "audio/ogg", ".m4a": "audio/mp4",
          ".json": "application/json", ".txt": "text/plain; charset=utf-8", ".log": "text/plain; charset=utf-8"}
 
@@ -332,7 +333,9 @@ def get_log(h: Handler, q, jid):
 
 
 def get_lib_media(h: Handler, q, rel):
-    h.send_file(_under(lib.LIBRARY, rel, views.AUDIO_SUFFIXES))
+    path = _under(lib.LIBRARY, rel, views.AUDIO_SUFFIXES | views.IMAGE_SUFFIXES)
+    # an image's address carries its file's time, so a browser may keep it
+    h.send_file(path, cache=path.suffix.lower() in views.IMAGE_SUFFIXES)
 
 
 def get_download(h: Handler, q, slug, n):
@@ -410,6 +413,14 @@ def post_pause(h: Handler, q):
         raise HTTPError(400, "paused must be true or false")
     h.manager.set_paused(paused)
     h._send_json({"paused": h.manager.paused})
+
+
+def post_node_hold(h: Handler, q):
+    body = h.body_json()
+    node, held, until_back = body.get("node"), body.get("held"), body.get("until_back", False)
+    if not isinstance(node, str) or not isinstance(held, bool) or not isinstance(until_back, bool):
+        raise HTTPError(400, "give the node's name, and held and until_back as true or false")
+    h._send_json({"node": _worker_manager(h).hold_node(node, held, until_back)})
 
 
 def post_upload(h: Handler, q):
@@ -547,6 +558,7 @@ POST_ROUTES = [
     (rf"/api/jobs/{JOB}/retry", post_retry),
     (r"/api/jobs/clear", post_clear),
     (r"/api/queue/pause", post_pause),
+    (r"/api/nodes/hold", post_node_hold),
     (r"/api/queue/order", post_order),
     (r"/api/queue/cancel", post_cancel_queued),
     (r"/api/upload", post_upload),

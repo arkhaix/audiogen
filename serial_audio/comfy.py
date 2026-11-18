@@ -251,3 +251,69 @@ def encode_voice_graph(*, clip_ref: str, transcript: str, voice_name: str,
         "encode": {"class_type": "Drama3EncodeVoice", "inputs": {"codec": ["codec", 0], "audio": ["clip", 0], "transcript": transcript}},
         "save_voice": {"class_type": "Drama3SaveVoice", "inputs": {"voice": ["encode", 0], "name": voice_name}},
     }
+
+
+#
+# Images. The file names are the ones in ComfyUI's models folder.
+#
+
+IMAGE_MODELS = {
+    "qwen21": {"label": "Qwen Image 2.1", "unet": "qwen_image_2.1_int8_convrot.safetensors",
+               "clip": "qwen3vl_8b_int8_convrot.safetensors", "clip_type": "qwen_image",
+               "vae": "qwen_image_2.1_vae_bf16.safetensors", "steps": 25, "cfg": 1.0},
+    "krea2": {"label": "Krea 2 turbo", "unet": "krea2_turbo_fp8_scaled.safetensors",
+              "clip": "qwen3vl_4b_fp8_scaled.safetensors", "clip_type": "krea2",
+              "vae": "qwen_image_vae.safetensors", "steps": 8, "cfg": 1.0},
+}
+IMAGE_QUALITY = 90
+THUMB_QUALITY = 80
+
+
+def image_graph(*, model: str, prompt: str, seed: int, width: int, height: int, prefix: str, thumb: int) -> dict:
+    """Text -> one image, saved as WebP under the output folder with a small copy beside it.
+
+    model: a key of IMAGE_MODELS.
+    prompt: the whole prompt.
+    seed: the sampler's seed.
+    width, height: the image's size in pixels.
+    prefix: the file name prefix under the output folder. The small copy gets the prefix with "_thumb".
+    thumb: the width of the small copy in pixels.
+    Returns the graph. Its node "save" saves the image and its node "save_thumb" the small copy.
+    Raises ComfyError on an unknown model.
+    """
+    m = IMAGE_MODELS.get(model)
+    if m is None:
+        raise ComfyError(f"unknown image model {model!r}; known: {', '.join(IMAGE_MODELS)}")
+    graph = {
+        "unet": {"class_type": "UNETLoader", "inputs": {"unet_name": m["unet"], "weight_dtype": "default"}},
+        "clip": {"class_type": "CLIPLoader", "inputs": {"clip_name": m["clip"], "type": m["clip_type"],
+                                                         "device": "default"}},
+        "vae": {"class_type": "VAELoader", "inputs": {"vae_name": m["vae"]}},
+        "latent": {"class_type": "EmptyLatentImage", "inputs": {"width": width, "height": height, "batch_size": 1}},
+    }
+    if model == "qwen21":
+        graph["cache"] = {"class_type": "QwenImage21Cache", "inputs": {"model": ["unet", 0], "device": "auto",
+                                                                      "dtype": "default"}}
+        graph["text"] = {"class_type": "TextEncodeQwenImage21", "inputs": {
+            "clip": ["clip", 0], "prompt": prompt, "negative_prompt": "", "resolution": 1024, "vae": ["vae", 0]}}
+        diffusion, positive, negative = ["cache", 0], ["text", 0], ["text", 1]
+    else:
+        graph["text"] = {"class_type": "CLIPTextEncode", "inputs": {"clip": ["clip", 0], "text": prompt}}
+        graph["no_text"] = {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["text", 0]}}
+        diffusion, positive, negative = ["unet", 0], ["text", 0], ["no_text", 0]
+    graph.update({
+        "sample": {"class_type": "KSampler", "inputs": {
+            "model": diffusion, "seed": seed, "steps": m["steps"], "cfg": m["cfg"], "sampler_name": "euler",
+            "scheduler": "simple", "positive": positive, "negative": negative, "latent_image": ["latent", 0],
+            "denoise": 1.0}},
+        "decode": {"class_type": "VAEDecode", "inputs": {"samples": ["sample", 0], "vae": ["vae", 0]}},
+        "save": {"class_type": "SaveAnimatedWEBP", "inputs": {
+            "images": ["decode", 0], "filename_prefix": prefix, "fps": 6.0, "lossless": False,
+            "quality": IMAGE_QUALITY, "method": "default"}},
+        "small": {"class_type": "ImageScale", "inputs": {
+            "image": ["decode", 0], "upscale_method": "area", "width": thumb, "height": 0, "crop": "disabled"}},
+        "save_thumb": {"class_type": "SaveAnimatedWEBP", "inputs": {
+            "images": ["small", 0], "filename_prefix": prefix + "_thumb", "fps": 6.0, "lossless": False,
+            "quality": THUMB_QUALITY, "method": "default"}},
+    })
+    return graph

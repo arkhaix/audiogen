@@ -34,8 +34,12 @@ LOG_DIR = STATE_DIR / "jobs"
 INCOMING = ROOT / "incoming"
 COMFY_URL = "http://127.0.0.1:8188"
 
-HEAVY = {"render", "cast", "bios", "check-takes", "character-pass", "screenplay", "say-options"}
+HEAVY = {"render", "cast", "bios", "check-takes", "character-pass", "screenplay", "say-options", "look-pass", "draw"}
 BIBLE_WRITERS = {"character-pass", "cast", "bios"}
+# jobs that start ComfyUI themselves when none answers
+STARTS_COMFY = {"draw"}
+# the model of a look pass whose request names none
+LOOK_MODEL = "sonnet"
 SERIAL_WRITERS = {"voice-effect"}    # rewrites serial.yaml in place, so it waits for any job on that serial
 # a render's own changes show in render_changes, and no render reads a name's options
 RENDER_NEUTRAL = {"render", "say-options"}
@@ -149,19 +153,19 @@ def _incoming_file(slug_dir: str, name, suffixes: tuple[str, ...]) -> Path:
     return path
 
 
-def _character_ids(p: dict) -> list[str]:
-    raw = p.get("characters") or []
+def _character_ids(p: dict, key: str = "characters") -> list[str]:
+    raw = p.get(key) or []
     if not isinstance(raw, list) or not all(isinstance(c, str) for c in raw):
-        raise ValueError("characters must be a list of ids")
+        raise ValueError(f"{key} must be a list of ids")
     ids = [c.strip() for c in raw if c.strip()]
     for cid in ids:
         if not SLUG_RE.match(cid):
-            raise ValueError(f"bad character id {cid!r}")
+            raise ValueError(f"bad id {cid!r} in {key}")
     return ids
 
 
-def _llm_args(p: dict) -> list[str]:
-    args = ["--backend", _choice(p, "backend", BACKENDS, "auto"), "--model", _choice(p, "model", MODELS, "opus"),
+def _llm_args(p: dict, model: str = "opus") -> list[str]:
+    args = ["--backend", _choice(p, "backend", BACKENDS, "auto"), "--model", _choice(p, "model", MODELS, model),
             "--on-limit", _choice(p, "on_limit", ON_LIMIT, "api")]
     effort = _choice(p, "effort", EFFORTS, None)
     return args + (["--effort", effort] if effort else [])
@@ -188,6 +192,27 @@ def _expand(slug: str, spec: str, coming=()) -> list[int]:
 def _chapter_lines(slug: str, number: int) -> int | None:
     meta = lib.load_yaml(lib.chapter_dir(slug, number) / "chapter.yaml", {}) or {}
     return (meta.get("script") or {}).get("lines")
+
+
+def to_draw(slug: str, style: str | None = None) -> int | None:
+    """How many subjects a draw for everyone would take now in a style, or None when the serial's records can't
+    be read. style is the style's name, and None means the serial's first. Never raises."""
+    try:
+        from .. import images, looks
+        found = images.subjects(lib.load_bible(slug), looks.load_looks(slug), looks.load_settings(slug))
+        name = style or next(iter(images.load_briefs(slug)["styles"]), images.DEFAULT_STYLE_NAME)
+        return len(images.plan(lib.load_serial(slug), found, set(images.records(slug, name)))["keys"])
+    except Exception:
+        return None
+
+
+def _style(p: dict) -> str | None:
+    """The name of the image style a request names, or None. Raises ValueError on a name that names no folder."""
+    name = _text(p, "style", 81)
+    if name is None:
+        return None
+    from ..images import style_name
+    return style_name(name)
 
 
 def _render_plan(slug: str, number: int, decode_only: bool) -> tuple[str, str | None]:
@@ -300,6 +325,83 @@ def build(kind: str, p: dict, comfy_url: str = COMFY_URL, coming: dict | None = 
             who = ", ".join(ids) if len(ids) <= 3 else f"{len(ids)} characters"
         return {"args": args, "heavy": True, "gpu": False, "comfy": False, "title": f"Casting bios · {who}",
                 "slug": slug, "meta": {"characters": ids}}
+
+    if kind == "look-pass":
+        slug = _slug(p)
+        spec = _spec(p.get("chapters"))
+        if spec == "new":
+            raise ValueError("a look pass needs its chapters: use 7, 7-12, 3,5,8 or all")
+        args = ["look-pass", slug, spec] + _llm_args(p, LOOK_MODEL) + (["--redo"] if p.get("redo") else [])
+        return {"args": args, "heavy": True, "gpu": False, "comfy": False, "title": f"Look pass · ch {spec}",
+                "slug": slug, "meta": {"chapters": _expand(slug, spec, (coming or {}).get(slug, ()))}}
+
+    if kind == "draw":
+        from ..comfy import IMAGE_MODELS
+        slug = _slug(p)
+        chars, places = _character_ids(p), _character_ids(p, "settings")
+        named = chars + places
+        count = _int(p, "candidates", 1, 8, 2)
+        args = ["draw", slug, "--candidates", str(count), "--comfy-url", comfy_url] + _llm_args(p)
+        seed = _int(p, "seed", 0, 2**31)
+        if seed is not None:
+            args += ["--seed", str(seed)]
+        if chars:
+            args += ["--characters", ",".join(chars)]
+        if places:
+            args += ["--settings", ",".join(places)]
+        if p.get("redraw"):
+            if not named:
+                raise ValueError("a redraw needs the characters or settings to replace")
+            args.append("--redraw")
+        prompt = _text(p, "prompt")
+        if prompt:
+            if len(named) != 1:
+                raise ValueError("a description applies to exactly one character or setting")
+            args.append(f"--prompt={prompt}")
+        if p.get("redo_brief"):
+            args.append("--redo-brief")
+        note = _text(p, "note", 500)
+        if note:
+            args.append(f"--note={note}")
+        style, style_text = _style(p), _text(p, "style_text", 600)
+        if style:
+            args += ["--style", style]
+        if style_text:
+            args.append(f"--style-text={style_text}")
+        image_model = _choice(p, "image_model", set(IMAGE_MODELS), None)
+        if image_model:
+            args += ["--image-model", image_model]
+        dry = bool(p.get("dry_run"))
+        if dry:
+            args.append("--dry-run")
+        who = ", ".join(named) if 0 < len(named) <= 3 else f"{len(named)} subjects" if named else "everyone who needs an image"
+        verb = "Redraw" if p.get("redraw") else ("Image briefs" if dry else "Draw")
+        meta = {"characters": chars, "settings": places, "candidates": count, "dry_run": dry}
+        if style:
+            meta["style"] = style
+        if not named:
+            meta["subjects"] = to_draw(slug, style)
+        return {"args": args, "heavy": True, "gpu": not dry, "comfy": not dry,
+                "title": f"{verb} · {who}" + (f" · {style}" if style else ""), "slug": slug, "meta": meta}
+
+    if kind == "pick-image":
+        slug = _slug(p)
+        subject = str(p.get("subject") or "")
+        group, _, sid = subject.partition("/")
+        if group not in ("characters", "settings") or not SLUG_RE.match(sid):
+            raise ValueError(f"bad image subject {subject!r}")
+        seed = _int(p, "seed", 0, 2**31)
+        args = ["pick-image", slug, subject] + (["--seed", str(seed)] if seed is not None else [])
+        approve = p.get("approve", True)
+        if not approve:
+            args.append("--no-approve")
+        style = _style(p)
+        if style:
+            args += ["--style", style]
+        what = f"seed {seed}" if seed is not None else "current"
+        title = f"{'Approve' if approve else 'Pick'} image · {sid} ({what})" + (f" · {style}" if style else "")
+        return {"args": args, "heavy": False, "gpu": False, "comfy": False, "title": title, "slug": slug,
+                "meta": {"subject": subject, **({"style": style} if style else {})}}
 
     if kind == "pick-voice":
         slug = _slug(p)
@@ -451,6 +553,8 @@ BREEZE_HINTS = ("with Breeze TTS 2", "generating takes", "joining takes", "befor
 CASTING_RE = re.compile(r"^casting (\d+): (.*)$", re.M)
 CANDIDATE_RE = re.compile(r"^\s+\S+ seed \d+: match", re.M)
 DESIGNED_RE = re.compile(r"^\s+\S+ seed \d+: designed ", re.M)
+DRAWING_RE = re.compile(r"^drawing (\d+): ", re.M)
+DRAWN_RE = re.compile(r"^\s+\S+ seed \d+: drawn in (\d+) s", re.M)
 
 
 def read_tail(path: Path, size: int = 96_000) -> str:
@@ -691,6 +795,28 @@ def cast_progress(text: str, candidates: int) -> dict:
     else:
         fraction, detail = matched / total, f"{matched} of {total} candidates"
     return {"phase": "candidates", "fraction": min(1.0, fraction), "eta": None, "detail": f"{detail} ({m.group(2)})"}
+
+
+def draw_progress(text: str, candidates: int) -> dict:
+    """Phase, fraction done and seconds left for a draw, from its log.
+
+    text: the log, or its tail.
+    candidates: the images the draw makes for each subject.
+    Returns {"phase", "fraction", "eta", "detail"}. eta is None until the first image is drawn, and after that
+    the images left at the median time of the ones drawn.
+    """
+    m = None
+    for m in DRAWING_RE.finditer(text):
+        pass
+    if "nothing to draw" in text:
+        return {"phase": "done", "fraction": 1.0, "eta": 0, "detail": "nothing to draw"}
+    if m is None:
+        return {"phase": "briefs", "fraction": None, "eta": None, "detail": "image pass"}
+    took = sorted(int(s) for s in DRAWN_RE.findall(text[m.end():]))
+    total = max(1, int(m.group(1)) * candidates)
+    done = min(total, len(took))
+    return {"phase": "images", "fraction": done / total, "eta": (total - done) * took[len(took) // 2] if took else None,
+            "detail": f"drawn {done} of {total} images"}
 
 
 # Activity outside the app
@@ -1155,6 +1281,8 @@ class JobManager:
             return check_progress(text, mtime, now)
         if job["kind"] == "cast" and not job["meta"].get("dry_run"):
             return cast_progress(text, job["meta"].get("candidates") or 3)
+        if job["kind"] == "draw" and not job["meta"].get("dry_run"):
+            return draw_progress(text, job["meta"].get("candidates") or 2)
         last = next((ln.strip() for ln in reversed(text.splitlines()) if ln.strip() and not ln.startswith("$")), "")
         return {"phase": "running", "fraction": None, "eta": None, "detail": last[:200]}
 
@@ -1271,7 +1399,7 @@ class JobManager:
                 return f"waiting for an outside {what} (pid {e['pid']})"
             if comfy_busy:
                 return "waiting for ComfyUI to finish a prompt the app did not queue"
-            if job.get("comfy") and not self.comfy.get("up"):
+            if job.get("comfy") and job["kind"] not in STARTS_COMFY and not self.comfy.get("up"):
                 return "waiting for ComfyUI at " + self.comfy_url
             settle = SETTLE_SECONDS - (now - self.last_busy)
             if settle > 0:
@@ -1473,6 +1601,8 @@ class JobManager:
             marker = f"{slug}/ch{int(job['meta']['chapters'][0]):04d}"
         elif job["kind"] == "cast":
             marker = f"cast/{slug}/"
+        elif job["kind"] == "draw":
+            marker = f"images/{slug}/"
         elif job["kind"] == "check-takes":
             marker = f"breeze/{slug}/ch{int(job['meta']['chapters'][0]):04d}/"
         else:

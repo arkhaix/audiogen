@@ -11,7 +11,8 @@ from pathlib import Path
 
 import yaml
 
-from .. import library as lib
+from .. import images, library as lib
+from .. import looks as look_record
 from ..casting import NARRATOR_ID, needs_narrator
 from ..comfy import ComfyError
 from ..breeze import TAKES_FILE
@@ -20,6 +21,7 @@ from .. import phones, pronounce, takecheck
 from ..asr import words
 from ..pronounce import offered
 from ..takecheck import CHECK_FILE, NAME_APART, VERDICTS, for_take, heard, rejudged, stale
+from .exchange import IMAGE_SUFFIXES
 from .jobs import INCOMING, read_tail
 
 AUDIO_SUFFIXES = {".opus", ".flac", ".wav", ".mp3", ".ogg", ".m4a"}
@@ -277,6 +279,7 @@ def serial_detail(slug: str, minutes_per_line: float) -> dict:
             "audio": lib_media(audio) if audio else None, "rendered_at": (meta.get("render") or {}).get("at"),
             "save_name": book_file(n, numbers, meta, audio.suffix) if audio else None,
             "has_notes": (folder / "author_notes.md").is_file(), "will_cast": will_cast,
+            "looked": (folder / look_record.PASS_FILE).is_file(),
             "narrator_reads": narrator_reads, "unapproved": unapproved,
             "estimate_minutes": round(script["lines"] * minutes_per_line) if script.get("lines") else None,
         })
@@ -682,14 +685,128 @@ def voices(slug: str) -> dict:
             "effects": serial.get("voice_effects") or {}}
 
 
+def _image_url(slug: str, rel) -> str | None:
+    """The address of an image in a serial's folder, which changes when the file does, or None without the file."""
+    if not isinstance(rel, str) or not rel:
+        return None
+    path = lib.serial_dir(slug) / rel
+    try:
+        stamp = int(path.stat().st_mtime)
+    except OSError:
+        return None
+    if _relative(path, lib.LIBRARY) is None:
+        return None
+    return "/media/lib/" + urllib.parse.quote(f"{slug}/{rel}") + f"?v={stamp}"
+
+
+def _image_records(slug: str) -> dict[str, dict[str, dict]]:
+    """{style name: {subject key: record}} for a serial's images."""
+    out = {}
+    base = lib.serial_dir(slug) / "images"
+    for style in sorted(p.name for p in base.iterdir() if p.is_dir()) if base.is_dir() else []:
+        for kind in images.KINDS:
+            folder = base / style / kind
+            for path in sorted(folder.glob("*.yaml")) if folder.is_dir() else []:
+                rec = _yaml(path, {}) or {}
+                if isinstance(rec, dict) and rec.get("candidates"):
+                    out.setdefault(style, {})[f"{kind}/{path.stem}"] = rec
+    return out
+
+
+def _image_view(slug: str, record: dict | None, look: list) -> dict | None:
+    """A subject's image for the bible page, or None without a record.
+
+    record: the subject's image record.
+    look: the look details the text has given for the subject.
+    Returns {"status", "seed", "model", "brief", "at", "url", "thumb", "candidates", "history", "new_facts",
+    "changed", "details"}. url and thumb are the chosen candidate's. A candidate is {"seed", "url", "thumb"}, and
+    an earlier round is {"brief", "replaced_at", "why_replaced", "candidates"}. new_facts is how many more details
+    the text has given than the description saw, and changed is whether the details are other ones than it saw.
+    details has the look details the description saw, each {"chapter", "text", "quote"} as far as it has them.
+    """
+    if not record:
+        return None
+
+    def shown(cands) -> list[dict]:
+        return [{"seed": c.get("seed"), "url": _image_url(slug, c.get("image")), "thumb": _image_url(slug, c.get("thumb"))}
+                for c in cands or [] if isinstance(c, dict)]
+
+    cands = shown(record.get("candidates"))
+    at = record.get("chosen") if isinstance(record.get("chosen"), int) else 0
+    chosen = cands[at] if 0 <= at < len(cands) else {}
+    basis = record.get("basis") if isinstance(record.get("basis"), dict) else {}
+    seen = basis.get("facts")
+    return {"status": record.get("status"), "seed": record.get("seed"), "model": record.get("model"),
+            "brief": record.get("brief"), "at": record.get("created_at"), "url": chosen.get("url"),
+            "thumb": chosen.get("thumb"), "candidates": cands,
+            "history": [{"brief": h.get("brief"), "replaced_at": h.get("replaced_at"),
+                         "why_replaced": h.get("why_replaced"), "candidates": shown(h.get("candidates"))}
+                        for h in record.get("history") or [] if isinstance(h, dict)],
+            "new_facts": max(0, len(look) - seen) if isinstance(seen, int) else 0,
+            "changed": basis.get("look") not in (None, images.look_digest(look)),
+            "details": images.passages(basis.get("details") if isinstance(basis.get("details"), list) else [])}
+
+
 def bible(slug: str) -> dict:
+    """The bible for its page.
+
+    slug: the serial.
+    Returns {"characters", "pronunciations", "settings", "looks", "draw"}. A character has its bible entry, its
+    everyday look details under "look" and its "images": {style name: image}, each image from _image_view, with
+    the styles it has none in left out. Its "appearances" are its second appearances, each {"id", "appearance",
+    "name", "look", "images"}. A setting is its record with "id" and "images", the settings with the most
+    chapters first. looks is {"read", "unread"}: the chapters a look pass has read, and those with a character
+    pass that wait for one. draw is {"styles", "ready", "undescribed", "model", "models"}: the serial's styles in
+    their order, each {"name", "text", "ready"} with how many subjects a draw for everyone would take in it, how
+    many it would take in a style that has no image yet, how many settings wait for a look detail, and the image
+    models by key with the one a draw uses.
+    """
     b = _bible(slug)
+    serial = _yaml(lib.serial_dir(slug) / "serial.yaml", {}) or {}
     voices_by_id = _voice_records(slug)
+    folder = lib.serial_dir(slug) / "bible"
+    # a file that a hand edit left malformed costs its entries, not the page
+    looks, places = _yaml(folder / "looks.yaml", {}), _yaml(folder / "settings.yaml", {})
+    looks = {k: v for k, v in looks.items() if isinstance(v, list)} if isinstance(looks, dict) else {}
+    places = {k: v for k, v in places.items() if isinstance(v, dict)} if isinstance(places, dict) else {}
+    pictures = _image_records(slug)
+    briefs = images.read_briefs(_yaml(lib.serial_dir(slug) / "images" / "_briefs.yaml", {}))
+    names = list(briefs["styles"]) + [name for name in pictures if name not in briefs["styles"]]
+    found = images.subjects(b, looks, places)
+
+    def shown(key: str, look: list) -> dict:
+        return {name: _image_view(slug, pictures[name][key], look)
+                for name in names if key in pictures.get(name, {})}
     chars = []
     for cid, c in b["characters"].items():
         vid = c.get("voice_id")
-        chars.append({**c, "id": cid, "voice_status": (voices_by_id.get(vid) or {}).get("status") if vid else None})
+        subject = found.get(f"characters/{cid}") or {}
+        look = subject.get("look") or []
+        second = [found[f"characters/{cid}--{a}"] for a in subject.get("appearances") or []]
+        chars.append({**c, "id": cid, "voice_status": (voices_by_id.get(vid) or {}).get("status") if vid else None,
+                      "look": look, "images": shown(f"characters/{cid}", look),
+                      "appearances": [{"id": s["id"], "appearance": s["appearance"], "name": s["name"],
+                                       "look": s["look"], "images": shown(f"characters/{s['id']}", s["look"])}
+                                      for s in second]})
     chars.sort(key=lambda c: (IMPORTANCE_ORDER.get(c.get("importance"), 9), c.get("first_seen") or 0,
                               (c.get("name") or "").lower()))
     pron = [{"term": t, **(p or {})} for t, p in b["pronunciations"].items()]
-    return {"characters": chars, "pronunciations": pron}
+    settings = [{**places[s["id"]], "id": s["id"], "look": s["look"], "chapters_present": s["chapters"],
+                 "images": shown(key, s["look"])}
+                for key, s in found.items() if s["kind"] == "settings"]
+    settings.sort(key=lambda s: (-len(s["chapters_present"]), str(s.get("name") or "").lower()))
+    read, unread = [], []
+    for n in lib.list_chapters(slug):
+        if (lib.chapter_dir(slug, n) / look_record.PASS_FILE).is_file():
+            read.append(n)
+        elif "characters_present" in _chapter_meta(slug, n):
+            unread.append(n)
+    todo = images.plan(serial, found, set(), limit=10 ** 6)
+    styles = [{"name": name, "text": briefs["styles"].get(name),
+               "ready": len(images.plan(serial, found, set(pictures.get(name, {})), limit=10 ** 6)["keys"])}
+              for name in names]
+    return {"characters": chars, "pronunciations": pron, "settings": settings,
+            "looks": {"read": read, "unread": unread},
+            "draw": {"styles": styles, "ready": len(todo["keys"]), "undescribed": len(todo["undescribed"]),
+                     "model": serial.get("image_model") or images.DEFAULT_MODEL,
+                     "models": {k: m["label"] for k, m in images.IMAGE_MODELS.items()}}}

@@ -1014,6 +1014,60 @@ class HandNextTest(unittest.TestCase):
         self.m._schedule(time.time(), dispatch)
         self.assertEqual((v1["nomad"].get("cancel"), v2["nomad"].get("evict"), p2["status"]), (None, "p2", "queued"))
 
+    def drawing(self, jid, seq, stage, node_name):
+        """A running backlog draw for everyone with an hour left, in its descriptions stage (0) or its images
+        stage (1)."""
+        args = ["draw", "demo", "--candidates", "2"]
+        job = {"id": jid, "seq": seq, "kind": "draw", "slug": "demo", "status": "running", "heavy": True, "gpu": True,
+               "comfy": True, "title": "Draw · everyone who needs an image", "args": args, "batch": None,
+               "meta": {"characters": [], "settings": [], "candidates": 2, "subjects": 24}, "backlog": True,
+               "long": True, "started": None}
+        job["nomad"] = {"key": f"key-{jid}", "stage": stage, "target": node_name, "node": node_name, "contact": "t",
+                        "stages": [{"class": "llm", "args": args + ["--dry-run"]},
+                                   {"class": "comfyui", "args": args + ["--briefed"]}],
+                        "dispatched": f"serial-audio-comfyui-{node_name}/dispatch-{jid}", "dispatching": False,
+                        "marks": {}}
+        self.m.jobs[jid] = job
+        return job
+
+    def test_a_backlog_draw_gives_the_laptop_to_a_job_that_is_not_backlog_work(self):
+        d = self.drawing("d", 1, 1, "laptop")
+        p = self.render("p", 2, 9, comfy=True)
+        dispatch = []
+        self.m._schedule(time.time(), dispatch)
+
+        # Only the laptop has ComfyUI, and it paints a backlog draw, so the draw is asked to stop and the job
+        # waits for it.
+        self.assertEqual((d["nomad"]["cancel"], d["nomad"]["evict"], d["stopping"]), (True, "p", True))
+        self.assertEqual((p["status"], dispatch), ("queued", []))
+        self.assertEqual(self.m.wait_reasons["p"],
+                         "waiting for Draw · everyone who needs an image to stop on laptop, which is backlog work")
+
+        # The worker confirms from the images stage: the draw is queued again as backlog work with what it filed,
+        # and the job gets the laptop.
+        data = json.dumps({"exit_code": 1, "cancelled": True, "node": "laptop"}).encode()
+        self.m.worker_result("d", "key-d", "1", data)
+        self.assertEqual((d["status"], d.get("nomad"), d["backlog"], d["evicted"]), ("queued", None, True, True))
+        self.assertEqual(d["note"], "paused for Render · ch 9 and queued again")
+        self.assertIn("with what it made", self.logged["d"][-1])
+        self.m._schedule(time.time(), dispatch)
+        self.assertEqual((p["status"], p["nomad"]["target"]), ("running", "laptop"))
+
+        # A draw gives way each time, where a render does once: what it painted is filed, so it loses a subject
+        # at most. Its descriptions stage is on a Claude node and gives nothing to a GPU job.
+        again = self.drawing("d2", 3, 1, "laptop")
+        again["evicted"] = True
+        self.assertTrue(self.m._evictable(again))
+        self.assertFalse(self.m._evictable(self.drawing("d3", 4, 0, "dev")))
+        again["nomad"]["cancel"] = True
+        self.assertFalse(self.m._evictable(again))
+        # A redraw that is queued again would paint its subjects a second time, so it runs to its end.
+        redraw = self.drawing("d5", 6, 1, "laptop")
+        redraw["args"] = redraw["args"] + ["--characters", "kael", "--redraw"]
+        self.assertFalse(self.m._evictable(redraw))
+        with mock.patch.object(self.nomad, "EVICT", False):
+            self.assertFalse(self.m._evictable(self.drawing("d4", 5, 1, "laptop")))
+
     def test_nothing_is_stopped_to_gain_less_than_the_margin(self):
         # The render has two minutes left: a stop would gain under WAIT_MARGIN, so the job waits for it.
         v = self.backlog("v", 1, 1, "laptop")

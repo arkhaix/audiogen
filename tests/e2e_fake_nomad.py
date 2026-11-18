@@ -65,6 +65,8 @@ class FakeNomad:
         self.children: dict[str, dict] = {}
         self.tokens: dict[str, str] = {}
         self.delay_next = 0.0
+        # the next dispatch goes to a node that is gone: no worker starts, and Nomad calls its allocation lost
+        self.lose_next = False
         self.lock = threading.Lock()
         # the second node offers breeze jobs only, and Nomad lists it once a scenario switches it on
         self.second = False
@@ -81,7 +83,9 @@ class FakeNomad:
                      "created": time.time_ns(), "task": self.root / "alloc" / child.replace("/", "_")}
             self.children[child] = entry
             delay, self.delay_next = self.delay_next, 0.0
-        threading.Timer(delay, self._start, args=(entry,)).start()
+            entry["lost"], self.lose_next = self.lose_next, False
+        if not entry["lost"]:
+            threading.Timer(delay, self._start, args=(entry,)).start()
         return {"DispatchedJobID": child, "EvalID": "e"}
 
     def _start(self, entry: dict) -> None:
@@ -103,6 +107,9 @@ class FakeNomad:
         entry = self.children.get(child)
         if entry is None:
             return None
+        if entry["lost"]:
+            return [{"ID": entry["alloc"], "NodeName": entry["node"], "ClientStatus": "lost",
+                     "CreateTime": entry["created"], "TaskStates": {}}]
         proc = entry["proc"]
         if proc is None:
             return []
@@ -146,6 +153,8 @@ class FakeNomad:
                 if path.startswith("/v1/client/fs/logs/"):
                     alloc = path.rsplit("/", 1)[1]
                     entry = next((e for e in fake.children.values() if e["alloc"] == alloc), None)
+                    if entry and entry["lost"]:
+                        return self.reply({"error": "the node is down"}, 404)
                     data = (entry["task"] / "stderr.log").read_bytes()[-6000:] if entry else b""
                     return self.reply(data, raw=True)
                 self.reply({"error": path}, 404)
@@ -209,6 +218,7 @@ def inside(slug: str) -> int:
     sys.path.insert(0, os.getcwd())
     from serial_audio import library as lib
     from serial_audio.web import exchange, server, views
+    from serial_audio.web import nomad as nomad_mod
     from serial_audio.web.nomad import NomadClient, NomadJobManager
 
     # Setup
@@ -335,6 +345,46 @@ def inside(slug: str) -> int:
     check(job["status"] == "done" and len(fake.children) == dispatched and not job.get("nomad"),
           f"local job ran here ({job['status']}, note {job.get('note')}, exit {job.get('exit_code')})")
     check(not (lib.serial_dir(slug) / "bible" / "characters.yaml").exists(), "the local reset removed the bible")
+
+    # A node that goes away under a job: Nomad calls the allocation lost, and the job is queued again and runs
+    grace, nomad_mod.END_GRACE = nomad_mod.END_GRACE, 1.0
+    fake.lose_next = True
+    job = submit("screenplay", {"slug": slug, "chapters": "1"}, args=["chapters", slug])
+    check(run_until(lambda: job.get("lost_node") == 1, 60),
+          f"the job whose node went away was queued again ({job['status']}, note {job.get('note')})")
+    check(run_until(finished(job)), "the job that was queued again finished")
+    nomad_mod.END_GRACE = grace
+    gone = [child for child, entry in fake.children.items() if entry["lost"]]
+    check(job["status"] == "done" and len(gone) == 1 and job["nomad"]["dispatched"] not in gone,
+          f"it ran in a task of its own, not the lost one ({job['status']}, note {job.get('note')})")
+    check("fake-node went away while it ran this job, so the job is queued again" in log(job),
+          "its log says why it started twice")
+
+    # A held node gets no job until it is resumed, by the route the page's buttons post to
+    def hold(node, held):
+        req = urllib.request.Request(f"{app_url}/api/nodes/hold", method="POST",
+                                     data=json.dumps({"node": node, "held": held}).encode(),
+                                     headers={"X-Serial-Audio": "1", "Content-Type": "application/json"})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status, json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            return e.code, {}
+
+    status, answer = hold("fake-node", True)
+    check(status == 200 and answer["node"]["held"] and not answer["node"]["ready"], f"the node is on hold ({status})")
+    dispatched = len(fake.children)
+    job = submit("screenplay", {"slug": slug, "chapters": "1"}, args=["chapters", slug])
+    for _ in range(4):
+        m.tick()
+    check(job["status"] == "queued" and len(fake.children) == dispatched
+          and "fake-node is on hold" in (m.wait_reasons.get(job["id"]) or ""),
+          f"a job waits for the held node ({job['status']}, {m.wait_reasons.get(job['id'])})")
+    check([w["held"] for w in m.snapshot()["workers"]] == [True], "the snapshot shows the hold")
+    check(hold("nowhere", True)[0] == 404, "a hold on a node that Nomad does not list is refused")
+    status, answer = hold("fake-node", False)
+    check(status == 200 and answer["node"]["ready"], f"the node takes jobs again ({status})")
+    check(run_until(finished(job)) and job["status"] == "done", f"the job that waited ran ({job['status']})")
 
     # A chapter whose takes another node made: the worker fetches them from the app, the takes file then names this
     # node's copies, and the app gets those copies under this node's paths

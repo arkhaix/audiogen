@@ -257,7 +257,76 @@ def cmd_reset_bible(args) -> int:
             meta["status"] = "fetched"
             count += 1
         lib.save_chapter_meta(args.slug, n, meta)
-    print(f"bible cleared; {count} chapters reset to 'fetched'")
+    from .looks import reset
+    looked = reset(args.slug)
+    print(f"bible cleared; {count} chapters reset to 'fetched'" + (f"; {looked} look passes cleared" if looked else ""))
+    return 0
+
+
+def cmd_look_pass(args) -> int:
+    from .looks import look_pass, was_read
+    numbers = _chapter_range(args.chapters, lib.list_chapters(args.slug))
+    for n in numbers:
+        meta, _ = lib.load_chapter(args.slug, n)
+        if "characters_present" not in meta:
+            print(f"chapter {n}: no character pass yet, skipping")
+            continue
+        if was_read(args.slug, n) and not args.redo:
+            print(f"chapter {n}: already read for looks, skipping (use --redo)")
+            continue
+        try:
+            look_pass(args.slug, n, backend=args.backend, model=args.model, effort=args.effort, on_limit=args.on_limit)
+        except LLMError as e:
+            print(f"chapter {n}: {e}", file=sys.stderr)
+            return 1
+    return 0
+
+
+def _ids(value: str | None) -> list[str]:
+    return [s.strip() for s in (value or "").split(",") if s.strip()]
+
+
+def cmd_draw(args) -> int:
+    from .comfy import ComfyError
+    from .images import draw
+    try:
+        draw(args.slug, characters=_ids(args.characters), settings=_ids(args.settings), candidates=args.candidates,
+             seed0=args.seed, redraw=args.redraw, prompt=args.prompt, redo_brief=args.redo_brief, note=args.note,
+             image_model=args.image_model, style=args.style, style_text=args.style_text, limit=args.limit,
+             briefed=args.briefed, dry_run=args.dry_run,
+             comfy_url=args.comfy_url, backend=args.backend, model=args.model, effort=args.effort,
+             on_limit=args.on_limit)
+    except (LLMError, ComfyError) as e:
+        print(f"draw: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_pick_image(args) -> int:
+    from .images import pick_image
+    try:
+        record = pick_image(args.slug, args.subject, style=args.style, seed=args.seed, approve=not args.no_approve)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"pick-image: {e}", file=sys.stderr)
+        return 1
+    print(f"{args.subject}: seed {record['seed']} filed, status {record['status']}")
+    return 0
+
+
+def cmd_images(args) -> int:
+    from .images import load_briefs, records
+    from .looks import load_looks, load_settings, unread
+    looks, places = load_looks(args.slug), load_settings(args.slug)
+    waiting = unread(args.slug)
+    print(f"looks: {len(looks)} characters and {len(places)} settings have details"
+          + (f"; {len(waiting)} chapters are not read yet" if waiting else ""))
+    for name, text in load_briefs(args.slug)["styles"].items():
+        print(f"style {name}: {text}")
+        for key, r in records(args.slug, name).items():
+            print(f"  {key}: {r.get('status')} seed {r.get('seed')}, {len(r.get('candidates') or [])} candidates, "
+                  f"{r.get('model')}")
+            if args.verbose:
+                print(f"      {r.get('brief')}")
     return 0
 
 
@@ -599,6 +668,64 @@ def main(argv=None) -> int:
     p.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
     p.add_argument("--on-limit", choices=["api", "wait", "fail"], default="api")
     p.set_defaults(fn=cmd_bios)
+
+    p = sub.add_parser("look-pass", help="read chapters for what their characters and places look like, into "
+                                         "bible/looks.yaml and bible/settings.yaml")
+    p.add_argument("slug")
+    p.add_argument("chapters")
+    p.add_argument("--backend", choices=["auto", "subscription", "api"], default="auto")
+    p.add_argument("--model", choices=["opus", "sonnet", "haiku"], default="sonnet")
+    p.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
+    p.add_argument("--on-limit", choices=["api", "wait", "fail"], default="api")
+    p.add_argument("--redo", action="store_true", help="read a chapter again and replace what its pass recorded")
+    p.set_defaults(fn=cmd_look_pass)
+
+    p = sub.add_parser("draw", help="describe and paint an image for each character and setting that needs one")
+    p.add_argument("slug")
+    p.add_argument("--characters", help="comma-separated character ids to draw. A second appearance is "
+                                        "<character id>--<appearance>")
+    p.add_argument("--settings", help="comma-separated setting ids to draw. Without either list: every major or "
+                                      "recurring character, each second appearance of one that two chapters show "
+                                      "and every setting with scenes in two chapters and a look detail, that has "
+                                      "no image")
+    p.add_argument("--candidates", type=int, default=2)
+    p.add_argument("--seed", type=int, help="first seed; candidates use seed, seed+1, ... Default: the first seed "
+                                            "the subject has not used")
+    p.add_argument("--limit", type=int, default=24, help="the most subjects a draw without names takes (default 24)")
+    p.add_argument("--redraw", action="store_true", help="replace the images of the named subjects (the old ones "
+                                                         "stay in the record's history)")
+    p.add_argument("--prompt", help="use this description instead of the image pass's (one subject only)")
+    p.add_argument("--redo-brief", action="store_true", help="ask the image pass for a fresh description first")
+    p.add_argument("--note", help="why the image is being replaced, recorded with the old one")
+    p.add_argument("--style", help="the name of the style to paint in, such as film (default: the serial's first "
+                                   "style). A name the serial doesn't have makes a new style")
+    p.add_argument("--style-text", help="the style's text from this draw on: the medium, the rendering, the palette "
+                                        "and the light, in a sentence or two. Kept for later draws")
+    p.add_argument("--image-model", choices=["qwen21", "krea2"],
+                   help="qwen21: Qwen Image 2.1. krea2: Krea 2 turbo. Default: serial.yaml image_model, else qwen21")
+    p.add_argument("--briefed", action="store_true", help="ask no LLM, and leave a subject without a cached "
+                                                          "description for a later draw")
+    p.add_argument("--dry-run", action="store_true", help="run the image pass and print the descriptions; no images")
+    p.add_argument("--comfy-url", default="http://127.0.0.1:8188")
+    p.add_argument("--backend", choices=["auto", "subscription", "api"], default="auto")
+    p.add_argument("--model", choices=["opus", "sonnet", "haiku"], default="opus")
+    p.add_argument("--effort", choices=["low", "medium", "high", "xhigh", "max"])
+    p.add_argument("--on-limit", choices=["api", "wait", "fail"], default="api")
+    p.set_defaults(fn=cmd_draw)
+
+    p = sub.add_parser("pick-image", help="after looking, file another candidate of an image (or approve the "
+                                          "current one)")
+    p.add_argument("slug")
+    p.add_argument("subject", help="characters/<id> or settings/<id>")
+    p.add_argument("--seed", type=int, help="candidate seed to use (default: keep the current choice)")
+    p.add_argument("--no-approve", action="store_true", help="leave the status as it is instead of marking approved")
+    p.add_argument("--style", help="the name of the style whose image this is (default: the serial's first style)")
+    p.set_defaults(fn=cmd_pick_image)
+
+    p = sub.add_parser("images", help="list the bible's images and how far the look pass has read")
+    p.add_argument("slug")
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.set_defaults(fn=cmd_images)
 
     p = sub.add_parser("screenplay", help="run the screenplay pass over chapters (text -> script.json)")
     p.add_argument("slug")

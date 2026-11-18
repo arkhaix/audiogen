@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import os
 import re
 import unicodedata
 from pathlib import Path
@@ -54,6 +55,13 @@ def save_yaml(path: Path, data) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as fh:
         yaml.safe_dump(data, fh, allow_unicode=True, sort_keys=False, width=100)
+
+
+def replace_yaml(path: Path, data) -> None:
+    """Saves data as YAML at path. At every moment path holds the old file whole or the new one whole."""
+    tmp = path.with_name(path.name + ".part")
+    save_yaml(tmp, data)
+    os.replace(tmp, path)
 
 
 def load_json(path: Path):

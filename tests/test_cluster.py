@@ -323,6 +323,8 @@ class SchedulingTest(unittest.TestCase):
         busy = worker_summary({"Name": "box", "Status": "ready", "SchedulingEligibility": "eligible",
                                "Meta": {"serial_audio": "llm", "busy": "true"}})
         self.assertFalse(busy["ready"])
+        # Nomad knows nothing of the app's holds, so a summary starts without one.
+        self.assertEqual((n["held"], n["until_back"]), (False, False))
 
     def test_placement_wait(self):
         evals = [{"CreateIndex": 2, "FailedTGAllocs": {"work": {"DimensionExhausted":
@@ -1338,13 +1340,274 @@ class NodeChoiceTest(unittest.TestCase):
 
         j = self.m.submit([{"kind": "screenplay", "params": {"slug": "demo", "chapters": "1"}}])[0]
         self.m._mark_dispatch(j)
+        first = j["nomad"]["key"]
         self.m._save()
         self.m._lock_file.close()
         again = NomadJobManager(Client("http://127.0.0.1:9", "token"), state_dir=Path(self.tmp.name), autostart=False)
         self.m = again
         again.tick()
-        self.assertEqual(Client.calls, [("serial-audio-llm", f"{j['id']}-0")])
+        token = f"{j['id']}-0-{hashlib.sha256(first.encode()).hexdigest()[:12]}"
+        self.assertEqual(Client.calls, [("serial-audio-llm", token)])
         self.assertEqual(again.jobs[j["id"]]["nomad"]["dispatched"], "serial-audio-llm/dispatch-1")
+
+        # A job that starts a second time, as one that gave its node away does, has a new key. Its stage is then
+        # dispatched with another token, so Nomad starts a task and doesn't answer with the one that has ended.
+        job = again.jobs[j["id"]]
+        job.pop("nomad")
+        job["status"] = "queued"
+        again._mark_dispatch(job)
+        again.tick()
+        self.assertEqual(len(Client.calls), 2)
+        self.assertNotEqual(Client.calls[1][1], token)
+        self.assertTrue(Client.calls[1][1].startswith(f"{j['id']}-0-"))
+
+
+class NodeAwayTest(unittest.TestCase):
+    """A node that goes away under its job, and a node the app holds: which job is queued again, and who gets none."""
+
+    def setUp(self):
+        from unittest import mock
+        from serial_audio.web import nomad
+        self.mock, self.nomad = mock, nomad
+        self.tmp = tempfile.TemporaryDirectory()
+        self.m = nomad.NomadJobManager(nomad.NomadClient("http://127.0.0.1:9", "token"),
+                                       state_dir=Path(self.tmp.name), autostart=False)
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self.m._lock_file.close)
+        self.m.workers = [worker("laptop", ["breeze", "comfyui"], "windows", "nvidia"),
+                          worker("mac", ["breeze"], "darwin", "metal")]
+        self.m.nomad_state["up"] = True
+        self.logged: dict[str, list[str]] = {}
+        report = {"applied": [], "unchanged": [], "conflicts": [], "held": [], "media": 0}
+        for p in (mock.patch.object(nomad.exchange, "read_result", lambda data: (json.loads(data), None)),
+                  mock.patch.object(nomad.exchange, "apply_result", lambda *a, **k: dict(report)),
+                  mock.patch.object(nomad.exchange, "code_version", lambda: "code-1"),
+                  mock.patch.object(self.m, "_append_log",
+                                    lambda job, text: self.logged.setdefault(job["id"], []).append(text)),
+                  mock.patch.object(self.m, "_save", lambda: None),
+                  mock.patch.object(self.m, "_record_timing", lambda *a: None),
+                  mock.patch.object(self.m, "_record_placement", lambda *a: None),
+                  mock.patch.object(self.m, "_already_done", lambda job: None),
+                  mock.patch.object(self.m, "_duration", lambda *a, **k: 60.0),
+                  mock.patch.object(self.m, "_remaining", lambda j, count=True: 60.0),
+                  mock.patch.object(self.m, "holder", lambda job: (None, False))):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def render(self, jid, seq, n, comfy=False):
+        job = {"id": jid, "seq": seq, "kind": "render", "slug": "demo", "status": "queued", "heavy": True, "gpu": True,
+               "comfy": comfy, "title": f"Render · ch {n}", "args": ["render", "demo", str(n)],
+               "meta": {"chapters": [n], "lines": 100, "engine": "drama3" if comfy else "breeze"},
+               "batch": None, "backlog": False, "started": None}
+        self.m.jobs[jid] = job
+        return job
+
+    def running(self, jid, seq, n, on="laptop"):
+        job = self.render(jid, seq, n)
+        job.update({"status": "running", "started": "t"})
+        job["nomad"] = {"key": f"key-{jid}", "stage": 0, "stages": [{"class": "breeze", "args": job["args"]}],
+                        "dispatched": f"serial-audio-breeze-{on}/dispatch-{jid}", "target": on, "node": on,
+                        "contact": "t", "log_got": 16, "dispatching": False, "marks": {}}
+        return job
+
+    def starts(self, job, now, task):
+        """A scheduling pass starts the queued job, and its worker on the laptop fetches the bundle."""
+        self.m._schedule(now, [])
+        self.assertEqual((job["status"], job["nomad"]["target"]), ("running", "laptop"))
+        job["nomad"].update({"dispatched": task, "dispatching": False, "contact": "t", "node": "laptop"})
+
+    def ends(self, job, status, now):
+        """Nomad reports the job's allocation as ended: when the app first sees it, and again after the grace."""
+        seen = {"polled": now, "tail": "", "allocs": [{"ID": "alloc-1", "NodeName": job["nomad"]["node"],
+                                                       "ClientStatus": status, "CreateTime": 1}]}
+        self.m._apply_poll(job, seen, now)
+        self.assertEqual(job["status"], "running")
+        self.m._apply_poll(job, seen, now + self.nomad.END_GRACE + 1)
+
+    def test_a_job_whose_node_went_away_is_queued_again(self):
+        a, b = self.running("a", 1, 1), self.render("b", 2, 1)
+        # b waits for a: the take check of the chapter that a renders, in the same batch
+        b.update({"kind": "check-takes", "title": "Check takes · ch 1", "args": ["check-takes", "demo", "1"]})
+        a["batch"] = b["batch"] = "batch-1"
+        unknown = {"polled": 1.0, "allocs": [{"ID": "alloc-1", "NodeName": "laptop", "ClientStatus": "unknown",
+                                              "CreateTime": 1}]}
+
+        # While the node is disconnected, the job waits for it and says what happens next.
+        self.m._apply_poll(a, unknown, 1.0)
+        self.assertEqual(a["status"], "running")
+        self.assertEqual(a["nomad"]["wait"], "laptop is disconnected; the job carries on if it reconnects within "
+                                             "2 hours, and is queued again if it doesn't")
+
+        # Nomad gives the allocation up. The job waits out the grace for a late result and is then as it was before
+        # it started, but for the count. The batch job that waits for it is not skipped, as it is when a job ends
+        # as lost.
+        self.ends(a, "lost", 2.0)
+        self.assertEqual((a["status"], a.get("nomad"), a["started"], a["lost_node"]), ("queued", None, None, 1))
+        self.assertEqual(a["note"], "laptop went away while it ran this job, so it is queued again")
+        self.assertIn("laptop went away while it ran this job, so the job is queued again", self.logged["a"][-1])
+        self.assertEqual(b["status"], "queued")
+
+        # The next pass gives it to the node that is up, and the worker that went away can't send a result for it.
+        self.m.workers[0] = {**self.m.workers[0], "status": "down", "ready": False}
+        self.m._schedule(100.0, [])
+        self.assertEqual((a["status"], a["nomad"]["target"], a["note"]), ("running", "mac", None))
+        with self.assertRaises(self.nomad.WorkerError) as e:
+            self.m.worker_result("a", "key-a", "0", json.dumps({"exit_code": 0}).encode())
+        self.assertEqual(e.exception.status, 403)
+
+    def test_a_task_that_failed_went_away_with_its_node_only_after_a_disconnect(self):
+        # The node was seen disconnected during this run of the stage, so the task that failed went away with it.
+        a = self.running("a", 1, 1)
+        self.m._apply_poll(a, {"polled": 1.0, "allocs": [{"ID": "alloc-1", "NodeName": "laptop",
+                                                          "ClientStatus": "unknown", "CreateTime": 1}]}, 1.0)
+        self.ends(a, "failed", 2.0)
+        self.assertEqual((a["status"], a["lost_node"]), ("queued", 1))
+
+        # The mark is of that run alone. The job's next task fails on a node that stayed connected, and so does
+        # the job.
+        self.starts(a, 100.0, "task-2")
+        self.assertIsNone(a["nomad"]["cut_off"])
+        self.ends(a, "failed", 101.0)
+        self.assertEqual(a["status"], "failed")
+        self.assertIn("ended failed without a result", a["note"])
+
+        # Nomad forgot the task of a job whose node was seen disconnected: the job is queued again. A task that
+        # Nomad forgot on a node that stayed connected leaves its job lost, as before.
+        gone = {"polled": 200.0, "error": self.nomad.NomadError(404, "job not found")}
+        b, c = self.running("b", 2, 2), self.running("c", 3, 3)
+        b["nomad"]["cut_off"] = True
+        self.m._apply_poll(b, gone, 200.0)
+        self.m._apply_poll(c, gone, 200.0)
+        self.assertEqual((b["status"], b["lost_node"], c["status"]), ("queued", 1, "lost"))
+        self.assertIn("laptop went away while it ran this job, so the job is queued again", self.logged["b"][-1])
+
+    def test_a_stopped_job_and_a_job_that_keeps_losing_its_node_are_not_queued_again(self):
+        # A stop that was asked for before the node went away stays a stop.
+        s = self.running("s", 1, 1)
+        self.m.cancel("s")
+        self.ends(s, "lost", 1.0)
+        self.assertEqual(s["status"], "lost")
+
+        # A job is queued again LOST_BACKS times in a row.
+        a = self.render("a", 2, 2)
+        for n in range(self.nomad.LOST_BACKS):
+            self.starts(a, 100.0 * (n + 1), f"task-{n}")
+            self.ends(a, "lost", 100.0 * (n + 1) + 1)
+            self.assertEqual((a["status"], a.get("nomad"), a["lost_node"]), ("queued", None, n + 1))
+
+        # The node that goes away under it once more leaves it lost, in Nomad's words.
+        self.starts(a, 1000.0, "task-9")
+        self.ends(a, "lost", 1001.0)
+        self.assertEqual(a["status"], "lost")
+        self.assertIn("ended lost without a result", a["note"])
+
+        # With LOST_BACKS at 0 no job is queued again.
+        o = self.running("o", 3, 3)
+        with self.mock.patch.object(self.nomad, "LOST_BACKS", 0):
+            self.ends(o, "lost", 2000.0)
+        self.assertEqual(o["status"], "lost")
+
+    def test_a_result_starts_the_count_again_and_a_later_stage_keeps_its_record(self):
+        a = self.running("a", 1, 1)
+        n = a["nomad"]
+        n["stages"] = [{"class": "breeze", "args": a["args"]}, {"class": "breeze", "args": a["args"]}]
+        a["lost_node"] = self.nomad.LOST_BACKS
+
+        # A job that hands a stage's work back is not one that takes its node down each time.
+        self.m.worker_result("a", "key-a", "0", json.dumps({"exit_code": 0, "node": "laptop"}).encode())
+        self.assertEqual((a["status"], n["stage"], a.get("lost_node")), ("queued", 1, None))
+
+        # Its second stage loses its node. The record stays, with the first stage's report, and the stage runs
+        # again under another key, so the worker that went away can't send anything for it.
+        self.starts(a, 10.0, "task-2")
+        key = n["key"]
+        n["cut_off"] = True
+        self.ends(a, "lost", 11.0)
+        self.assertEqual((a["status"], n["stage"], n["contact"], n["cut_off"], a["lost_node"]),
+                         ("queued", 1, None, None, 1))
+        self.assertEqual((sorted(n["reports"]), a["started"]), (["0"], "t"))
+        self.assertNotEqual(n["key"], key)
+        with self.assertRaises(self.nomad.WorkerError) as e:
+            self.m.worker_log("a", key, "1", 0, b"late\n")
+        self.assertEqual(e.exception.status, 403)
+
+    def test_a_held_node_finishes_its_job_and_gets_no_other(self):
+        a, b = self.running("a", 1, 1), self.render("b", 2, 2)
+        held = self.m.hold_node("laptop", True)
+        self.assertEqual((held["held"], held["until_back"], held["ready"]), (True, False, False))
+
+        # The job on the node carries on, and its worker is handed no next one: the queued render goes to the Mac.
+        self.assertEqual(a["status"], "running")
+        report = self.m.worker_result("a", "key-a", "0", json.dumps({"exit_code": 0, "node": "laptop"}).encode(),
+                                      "code-1")
+        self.assertEqual(a["status"], "done")
+        self.assertNotIn("next", report)
+        self.assertEqual((b["status"], b["nomad"]["target"], b["nomad"]["follows"]), ("running", "mac", None))
+
+        # A job that only the held node can run waits for it and says so.
+        c = self.render("c", 3, 3, comfy=True)
+        self.m._schedule(10.0, [])
+        self.assertEqual((c["status"], self.m.wait_reasons["c"]),
+                         ("queued", "no comfyui node is ready: laptop is on hold"))
+
+        # The hold is kept in placement.json, so it stands after the app starts again.
+        self.assertFalse(self.m._load_placement()["held"]["laptop"]["until_back"])
+
+        # An entry of the file that is not a hold is dropped, and the hold beside it stands.
+        self.m.placement["held"]["mac"] = 3
+        self.assertEqual(sorted(self.m._holds()), ["laptop"])
+
+        # Resumed, the node takes the job that waited for it.
+        self.assertTrue(self.m.hold_node("laptop", False)["ready"])
+        self.assertEqual(self.m._load_placement()["held"], {})
+        self.m._schedule(20.0, [])
+        self.assertEqual((c["status"], c["nomad"]["target"]), ("running", "laptop"))
+
+        # A name that is no node's is refused.
+        with self.assertRaises(KeyError):
+            self.m.hold_node("nowhere", True)
+
+    def test_a_hold_until_the_node_is_back_ends_by_itself(self):
+        def seen(**laptop):
+            mac = worker("mac", ["breeze"], "darwin", "metal")
+            self.m.workers = self.m._with_holds([{**worker("laptop", ["breeze"], "windows", "nvidia"), **laptop}, mac])
+            return self.m.workers[0]
+
+        held = self.m.hold_node("laptop", True, until_back=True)
+        self.assertEqual((held["held"], held["until_back"], held["ready"]), (True, True, False))
+
+        # While the node stays up the hold stands, however often Nomad is asked.
+        self.assertEqual([seen()["ready"], seen()["held"]], [False, True])
+
+        # The node goes away: the hold stands and is marked, also in the file.
+        self.assertTrue(seen(status="down")["held"])
+        self.assertTrue(self.m._load_placement()["held"]["laptop"]["away"])
+
+        # Back and ready, the node takes jobs again without anybody resuming it.
+        with self.mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            back = seen()
+        self.assertEqual((back["held"], back["until_back"], back["ready"]), (False, False, True))
+        self.assertEqual(self.m._load_placement()["held"], {})
+        self.assertIn("laptop is back, so its hold has ended", err.getvalue())
+
+        # A node that Nomad no longer lists counts as away.
+        self.m.hold_node("laptop", True, until_back=True)
+        self.m._with_holds([worker("mac", ["breeze"], "darwin", "metal")])
+        with self.mock.patch("sys.stderr", new_callable=io.StringIO):
+            self.assertTrue(seen()["ready"])
+
+        # A plain hold stands through the same absence, until it is resumed.
+        self.m.hold_node("laptop", True)
+        seen(status="down")
+        self.assertEqual([seen()["held"], seen()["ready"]], [True, False])
+
+        # A poll of Nomad's nodes puts the holds on what it reads.
+        stub = {"ID": "n1", "Name": "laptop", "Status": "ready", "SchedulingEligibility": "eligible", "ModifyIndex": 1}
+        full = {**stub, "Meta": {"serial_audio": "breeze", "busy": "false"}, "Attributes": {}}
+        with self.mock.patch.object(self.m.nomad, "nodes", return_value=[stub]), \
+                self.mock.patch.object(self.m.nomad, "node", return_value=full):
+            self.m._poll_nodes()
+        self.assertEqual([(w["name"], w["held"], w["ready"]) for w in self.m.workers], [("laptop", True, False)])
 
 
 class EstimateTest(unittest.TestCase):

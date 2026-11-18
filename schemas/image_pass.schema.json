@@ -1,0 +1,26 @@
+{
+  "type": "object",
+  "properties": {
+    "style": {
+      "type": "string",
+      "description": "One or two sentences that set the look of every picture in this serial's bible: medium, rendering, palette and light. The style in use, word for word, when the input names one."
+    },
+    "images": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string", "description": "The record's id exactly as given, such as characters/ned-land or settings/the-salon."},
+          "prompt": {
+            "type": "string",
+            "description": "Three to five sentences an image model paints from: what can be seen of the person or the place. No names, no plot, no style, no framing."
+          }
+        },
+        "required": ["id", "prompt"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["style", "images"],
+  "additionalProperties": false
+}

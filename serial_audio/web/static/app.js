@@ -457,8 +457,9 @@ function renderHeader() {
   const ready = cluster ? (st.workers || []).filter((w) => w.ready) : [];
   const up = cluster ? Boolean(st.nomad?.up && ready.length) : c.up;
   const dot = S.stateError ? "down" : run.length || ext.length ? "busy" : up ? "up" : "down";
+  const onHold = cluster ? (st.workers || []).filter((w) => w.held).map((w) => w.name).join(", ") : "";
   a.title = cluster
-    ? (st.nomad?.up ? `Workers ready: ${ready.map((w) => w.name).join(", ") || "none"}` : "Nomad is not reachable")
+    ? (st.nomad?.up ? `Workers ready: ${ready.map((w) => w.name).join(", ") || "none"}${onHold ? ` (on hold: ${onHold})` : ""}` : "Nomad is not reachable")
     : c.up ? `ComfyUI ${c.version || ""} is up. RAM free ${gb(c.ram_free)}.` : "ComfyUI is not reachable";
   if (bk) a.title += ` Last backup: ${bk.last ? when(bk.last) : "none yet"}${bk.ok ? "" : ` (${bk.error})`}.`;
   if (pb && !pb.ok) a.title += ` Audiobook folders: ${pb.errors.join(", ")}.`;
@@ -859,6 +860,7 @@ async function openProcess(slug) {
   const needChars = rows.filter((c) => c.status === "fetched");
   const needScript = rows.filter((c) => c.status === "fetched" || c.status === "characters");
   const needRender = rows.filter((c) => c.status !== "rendered");
+  const oldLooks = rows.filter((c) => c.status !== "fetched" && !c.looked);
   const castLikely = needChars.length > 0 || rows.some((c) => c.will_cast.length);
   const stage = (name, label, on, why, opts = "") => `<div class="stage" data-stage="${name}">
       <label class="inline"><input type="checkbox" name="do_${name}" ${on ? "checked" : ""}> ${label}</label>
@@ -872,6 +874,10 @@ async function openProcess(slug) {
     ${stage("cast", "Cast new voices", castLikely, "Designs a voice for each major or recurring character who has spoken and has none, after each chapter's character pass. Runs on a GPU node.",
       `<label class="inline">candidates <input type="number" name="candidates" value="3" min="1" max="12"></label>
        <label class="inline">first seed <input type="number" name="cast_seed" value="${nextSeed}" min="0"></label>`)}
+    ${stage("looks", "Look pass", needChars.length, "Reads each chapter after its character pass for what its characters and places look like, for the images on the Bible tab. It is one more Claude pass a chapter, and nothing else waits for it.",
+      `<label class="inline">model <select name="look_model">${options(["sonnet", "opus", "haiku"], "sonnet")}</select></label>
+       <label class="inline"><input type="checkbox" name="looks_old"> also read the ${plural(oldLooks.length, "selected chapter")} with a character pass and no look pass</label>
+       <label class="inline"><input type="checkbox" name="redo_looks"> redo chapters that have one</label>`)}
     ${stage("script", "Screenplay", needScript.length, `${plural(needScript.length, "chapter")} still need one.`,
       `<label class="inline"><input type="checkbox" name="redo_script"> redo chapters that have one</label>`)}
     ${stage("render", "Render", needRender.length, `${plural(needRender.length, "chapter")} have no audio yet. Runs ${engineLabel(sd.render_engine, sd.render_runner)}.`,
@@ -885,7 +891,7 @@ async function openProcess(slug) {
     submit: "Queue",
     onInput: (form) => {
       const jobs = buildProcess(form, rows, slug);
-      for (const name of ["characters", "cast", "script", "render"]) {
+      for (const name of ["characters", "cast", "looks", "script", "render"]) {
         $(`[data-stage=${name}]`).classList.toggle("off", !checked(form, `do_${name}`));
       }
       const renders = jobs.filter((j) => j.kind === "render").map((j) => rows.find((c) => c.number === j.params.chapter));
@@ -921,6 +927,8 @@ function buildProcess(form, rows, slug) {
   return processJobs(slug, rows, {
     characters: checked(form, "do_characters"), redoCharacters: checked(form, "redo_characters"),
     cast: checked(form, "do_cast"), candidates: num(form, "candidates"), castSeed: num(form, "cast_seed"),
+    looks: checked(form, "do_looks"), looksOld: checked(form, "looks_old"), redoLooks: checked(form, "redo_looks"),
+    lookModel: field(form, "look_model").value,
     script: checked(form, "do_script"), redoScript: checked(form, "redo_script"),
     render: checked(form, "do_render"), rerender: checked(form, "rerender"),
     renderSeed: field(form, "render_seed").value === "" ? null : num(form, "render_seed"),
@@ -930,7 +938,10 @@ function buildProcess(form, rows, slug) {
 
 // The jobs that take the chapters in rows through the stages switched on in o, in the order they run. A cast follows
 // each character pass, and each is for everyone who needs a voice by then. A cast after the first names the chapter
-// whose pass it follows, so the renders of earlier chapters don't wait for it.
+// whose pass it follows, so the renders of earlier chapters don't wait for it. A look pass follows the character pass
+// of its chapter, which says who is in the chapter. A chapter that has a character pass already is read only when
+// o.looksOld or o.redoLooks asks for it, because each look pass costs Claude usage. A look pass without o.lookModel
+// runs with the app's model for look passes.
 function processJobs(slug, rows, o) {
   const jobs = [];
   let casts = 0;
@@ -945,6 +956,9 @@ function processJobs(slug, rows, o) {
     if (passes(c)) {
       jobs.push({ kind: "character-pass", params: { slug, chapters: String(c.number), redo: c.status !== "fetched", ...o.llm } });
       cast(c.number);
+    }
+    if (o.looks && (passes(c) || (c.status !== "fetched" && (c.looked ? o.redoLooks : o.looksOld)))) {
+      jobs.push({ kind: "look-pass", params: { slug, chapters: String(c.number), redo: !!c.looked, ...o.llm, model: o.lookModel } });
     }
   }
   if (o.script) {
@@ -977,7 +991,7 @@ function importRows(sd, items, force) {
 // The Process dialog's default jobs for the rows of an import, which are all at fetched.
 async function importProcessJobs(slug, rows) {
   return processJobs(slug, rows, {
-    characters: true, cast: true, script: true, render: true,
+    characters: true, cast: true, looks: true, script: true, render: true,
     candidates: 3, castSeed: await nextCastSeed(slug), renderSeed: null, llm: storedLLM(),
   });
 }
@@ -1336,29 +1350,234 @@ function openCast(slug, ids, v) {
   });
 }
 
+// Looks and images
+
+// The image style the Bible tab shows for a serial: the one last chosen there, else the serial's first.
+function shownStyle(b, slug) {
+  const names = b.draw.styles.map((s) => s.name);
+  const chosen = store.get(`style:${slug}`, null);
+  return names.includes(chosen) ? chosen : names[0] || null;
+}
+
+// Whether a queued or running draw in the style takes the subject, named or as one of everyone.
+function drawBusy(slug, key, style) {
+  const [kind, id] = key.split("/");
+  return activeJobs(slug, null, "draw").some((j) => {
+    if (j.meta?.style && style && j.meta.style !== style) return false;
+    const named = (j.meta?.characters || []).length + (j.meta?.settings || []).length;
+    return !named || (j.meta?.[kind] || []).includes(id);
+  });
+}
+
+function passage(quote) {
+  return `<q class="passage">${esc(quote).replace(/\*+([^*]+)\*+/g, "<em>$1</em>").replaceAll("*", "")}</q>`;
+}
+
+function lookList(look) {
+  if (!look?.length) return "";
+  return `<div><b>Looks</b><ul class="facts">${look.map((f) => `<li><b>ch ${esc(f.chapter)}</b><span>${esc(f.text)}${
+    f.lasting === false ? ` <span class="tag">that scene</span>` : ""}${f.quote ? passage(f.quote) : ""}</span></li>`).join("")}</ul></div>`;
+}
+
+function paintedFrom(key, details) {
+  const quoted = (details || []).filter((f) => f.quote);
+  if (!quoted.length) return "";
+  return `<details class="cands" data-key="from:${esc(key)}"><summary>Painted from ${plural(quoted.length, "passage")}</summary>
+      <ul class="facts">${quoted.map((f) => `<li><b>ch ${esc(f.chapter)}</b>${passage(f.quote)}</li>`).join("")}</ul></details>`;
+}
+
+function titled(slug) {
+  const words = String(slug || "").replaceAll("-", " ");
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
+function thumb(image) {
+  return image?.thumb ? `<img class="thumb" src="${esc(image.thumb)}" alt="" loading="lazy">` : `<span class="thumb none"></span>`;
+}
+
+function picks(key, image, list, current) {
+  return `<div class="picks">${(list || []).filter((c) => c.thumb).map((c) => {
+    const filed = c.seed === current;
+    const btn = !filed ? `<button class="sm" data-act="pick-image" data-key="${esc(key)}" data-seed="${esc(c.seed)}">Use this</button>`
+      : image.status !== "approved" ? `<button class="sm primary" data-act="pick-image" data-key="${esc(key)}" data-seed="${esc(c.seed)}">Approve</button>`
+        : `<span class="small muted">filed</span>`;
+    return `<figure class="${filed ? "chosen" : ""}"><a href="${esc(c.url)}" target="_blank" rel="noopener"><img src="${esc(c.thumb)}" alt="Candidate, seed ${esc(c.seed)}" loading="lazy"></a><figcaption>${btn}</figcaption></figure>`;
+  }).join("")}</div>`;
+}
+
+function imageBlock(slug, key, name, image, look, models, style) {
+  const drawBtn = drawBusy(slug, key, style) ? `<span class="small muted">a draw is queued</span>`
+    : `<button class="sm" data-act="draw-open" data-key="${esc(key)}">${image ? "Redraw…" : "Draw…"}</button>`;
+  if (!image) {
+    return `<div class="row tight"><span class="small muted">No image yet${look?.length || key.startsWith("characters/") ? "" : ", and the text has not said what to draw"}.</span>${drawBtn}</div>`;
+  }
+  const rounds = image.history.slice().reverse().map((h) => `<div class="round">
+      <div class="small muted">Earlier round${h.replaced_at ? `, replaced ${esc(when(h.replaced_at))}` : ""}${h.why_replaced ? `: ${esc(h.why_replaced)}` : ""}</div>
+      ${picks(key, image, h.candidates, null)}</div>`).join("");
+  return `<div class="art">
+      ${image.url ? `<a href="${esc(image.url)}" target="_blank" rel="noopener"><img class="main" src="${esc(image.url)}" alt="${esc(name)}" loading="lazy"></a>` : ""}
+      <div class="stack">
+        <div class="row tight"><span class="pill ${esc(image.status)}">${esc(image.status)}</span>
+          <span class="small muted">seed ${esc(image.seed)} · ${esc(models[image.model] || image.model)}</span>${drawBtn}</div>
+        ${image.new_facts ? `<div class="notice info small">The text has given ${plural(image.new_facts, "more detail")} since this image was described. Redraw to use ${image.new_facts === 1 ? "it" : "them"}.</div>`
+    : image.changed ? `<div class="notice info small">The text's details are not the ones this image was described from. Redraw to use them.</div>` : ""}
+        <div class="small muted">${esc(image.brief)}</div>
+        ${paintedFrom(key, image.details)}
+        ${picks(key, image, image.candidates, image.seed)}
+        ${rounds ? `<details class="cands" data-key="art:${esc(key)}"><summary>${plural(image.history.length, "earlier round")}</summary>${rounds}</details>` : ""}
+      </div></div>`;
+}
+
+function looksBar(b, slug) {
+  const { read, unread } = b.looks;
+  const total = read.length + unread.length;
+  const d = b.draw;
+  const reading = activeJobs(slug, null, "look-pass").length > 0;
+  const looks = !total ? "No chapter has a character pass yet, so no chapter can be read for looks."
+    : `Read from ${read.length} of ${plural(total, "chapter")} for what people and places look like.`
+      + (!unread.length ? "" : reading ? " A look pass is queued." : ` ${jobButton(`Read ch ${esc(rangeText(unread))}`, "look-pass",
+        { slug, chapters: rangeText(unread).replaceAll(" ", ""), ...storedLLM(), model: undefined }, { cls: "primary" })}`);
+  const style = shownStyle(b, slug);
+  const st = d.styles.find((s) => s.name === style);
+  const ready = st ? st.ready : d.ready;
+  const inStyle = d.styles.length > 1 ? ` in the ${titled(style).toLowerCase()} style` : "";
+  const images = (ready ? `${plural(ready, "main character or common setting has", "main characters and common settings have")} no image${inStyle}.`
+    : `Every main character and common setting has an image${inStyle}.`)
+    + (d.undescribed ? ` ${plural(d.undescribed, "setting waits", "settings wait")} for a look detail from the text.` : "")
+    + (!ready ? "" : activeJobs(slug, null, "draw").length ? " A draw is queued." : ` <button class="sm primary" data-act="draw-open" data-key="">Draw them…</button>`);
+  const pick = d.styles.length < 2 ? "" : `<div class="row tight"><b>Style.</b>
+      <div class="filters">${d.styles.map((s) => `<button class="${s.name === style ? "on" : ""}" data-act="bible-style" data-style="${esc(s.name)}">${esc(titled(s.name))}</button>`).join("")}</div></div>`;
+  return `<div class="panel pad stack" style="margin-bottom:12px">
+      <div><b>Looks.</b> ${looks}</div>
+      <div><b>Images.</b> ${images}</div>
+      ${pick}
+      ${st?.text ? `<div class="small muted">${d.styles.length > 1 ? "" : "Style: "}${esc(st.text)}</div>` : ""}
+    </div>`;
+}
+
+function openDraw(slug, key, b) {
+  const [kind, id] = key ? key.split("/") : [];
+  const subject = !key ? null : kind === "settings" ? b.settings.find((s) => s.id === id)
+    : b.characters.find((c) => c.id === id) || b.characters.flatMap((c) => c.appearances || []).find((a) => a.id === id);
+  const style = shownStyle(b, slug);
+  const image = subject?.images?.[style];
+  const d = b.draw;
+  const textOf = (name) => d.styles.find((s) => s.name === name)?.text || "";
+  const common = `<div class="fields">
+      <label class="field"><span>Candidates</span><input type="number" name="candidates" value="2" min="1" max="8"></label>
+      <label class="field"><span>Image model</span><select name="image_model">${options(Object.entries(d.models), d.model)}</select></label>
+    </div>
+    <div class="fields">
+      <label class="field"><span>Style</span><select name="style">${options([...d.styles.map((s) => [s.name, titled(s.name)]), ["", "A new style…"]], style || "")}</select></label>
+      <label class="field"><span>Name of the new style</span><input type="text" name="style_new" placeholder="film, anime, ink ..."${style ? " disabled" : ""}></label>
+    </div>
+    <label class="field"><span>Text of the style (a change applies from this draw on)</span><textarea name="style_text" rows="3" placeholder="The image pass chooses one">${esc(textOf(style))}</textarea></label>`;
+  let last = style || "";
+  const styleInput = (form) => {
+    const picked = field(form, "style").value;
+    field(form, "style_new").disabled = !!picked;
+    if (picked !== last) field(form, "style_text").value = textOf(picked);
+    last = picked;
+  };
+  const styleOf = (form) => {
+    const name = field(form, "style").value
+      || field(form, "style_new").value.trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+    const text = field(form, "style_text").value.trim();
+    if (!name && d.styles.length) throw new Error("Name the new style, or pick one of the serial's styles.");
+    if (name && d.styles.length && !d.styles.some((s) => s.name === name) && !text) throw new Error("Give the new style its text.");
+    if (name) store.set(`style:${slug}`, name);
+    return { style: name || undefined, style_text: text && text !== textOf(name) ? text : undefined };
+  };
+  if (!subject) {
+    openDialog({
+      title: "Draw everyone who needs an image",
+      body: `<p class="small">Every major or recurring character, each second appearance of one that two chapters show, and every setting with scenes in two chapters that a look pass has described, that has no image in the style. A draw takes 24 at most, the most important first. Any other appearance has its own Draw button.</p>
+        <p class="small muted">An image pass writes a description of each from its bible entry and its look details, and ComfyUI on the laptop paints the candidates. The first is filed, and you pick another on this page.</p>
+        ${common}
+        <label class="inline small"><input type="checkbox" name="backlog" checked> background work: it starts when the queue is empty and gives the laptop to any other job</label>
+        ${llmFields()}`,
+      submit: "Queue",
+      onInput: styleInput,
+      onSubmit: async (form) => {
+        await queue([{ kind: "draw", params: { slug, candidates: num(form, "candidates"), image_model: field(form, "image_model").value, ...styleOf(form), ...llmParams(form, true),
+          backlog: checked(form, "backlog") || undefined } }]);
+      },
+    });
+    return;
+  }
+  openDialog({
+    title: `${image ? "Redraw" : "Draw"} ${subject.name}`,
+    body: `<p class="small muted">${image ? "Paints new candidates and files the first. The image it has moves to an earlier round, where you can still pick it."
+      : "An image pass writes the description from the bible entry and the look details, unless you write one here."}</p>
+      <label class="field"><span>Description (the style and the framing are added to it)</span><textarea name="prompt" rows="6">${esc(image?.brief || "")}</textarea></label>
+      <label class="inline small"><input type="checkbox" name="redo_brief"> ask the image pass for a fresh description instead</label>
+      ${common}
+      ${image ? `<label class="field"><span>Why replace it (kept with the old image)</span><input type="text" name="note" placeholder="too old, wrong hair, ..."></label>` : ""}
+      ${llmFields()}`,
+    submit: "Queue",
+    onInput: (form) => { field(form, "prompt").disabled = checked(form, "redo_brief"); styleInput(form); },
+    onSubmit: async (form) => {
+      const redo = checked(form, "redo_brief");
+      const text = field(form, "prompt").value.trim();
+      const st = styleOf(form);
+      const has = !!subject.images?.[st.style || d.styles[0]?.name];
+      await queue([{ kind: "draw", params: {
+        slug, [kind]: [id], redraw: has, candidates: num(form, "candidates"), image_model: field(form, "image_model").value,
+        ...st,
+        prompt: !redo && text && text !== (image?.brief || "").trim() ? text : undefined, redo_brief: redo,
+        note: (has && image && field(form, "note").value.trim()) || undefined, ...llmParams(form, true),
+      } }]);
+    },
+  });
+}
+
 // Bible
 
 function bibleTab(b) {
   if (!b) return `<div class="empty">Loading…</div>`;
+  const slug = S.route.slug;
   const imps = ["all", ...IMPORTANCE];
+  const style = shownStyle(b, slug);
+  const art = (x) => x.images?.[style] || null;
   const chars = b.characters.map((c) => {
     const ch = c.chapters_present || [];
     const search = [c.id, c.name, ...(c.aliases || []), c.role].join(" ").toLowerCase();
     const facts = (c.facts || []).map((f) => `<li><b>ch ${esc(f.chapter)}</b><span>${esc(f.text)}</span></li>`).join("");
     return `<details class="char" data-key="char:${esc(c.id)}" data-search="${esc(search)}" data-imp="${esc(c.importance)}">
-      <summary><span class="name">${esc(c.name)}</span><span class="tag">${esc(c.importance)}</span>
+      <summary>${thumb(art(c))}<span class="name">${esc(c.name)}</span><span class="tag">${esc(c.importance)}</span>
         <span class="small muted">${esc(c.gender)}, ${esc(String(c.age_group || "").replace("_", " "))}</span>
         <span class="small muted">${ch.length ? `ch ${esc(rangeText(ch))}` : ""}</span>
         <span class="grow"></span>
         ${c.voice_id ? `<span class="pill ${esc(c.voice_status || "")}">${esc(c.voice_status || "voiced")}</span>` : c.speaks === false ? `<span class="tag">silent</span>` : `<span class="small muted">no voice</span>`}
       </summary>
       <div class="body">
+        ${imageBlock(slug, `characters/${c.id}`, c.name, art(c), c.look, b.draw.models, style)}
+        ${lookList(c.look)}
+        ${(c.appearances || []).map((a) => `<div class="appearance"><div><b>${esc(titled(a.appearance))}.</b> <span class="small muted">A second appearance, with an image of its own.</span></div>
+          ${imageBlock(slug, `characters/${a.id}`, a.name, art(a), a.look, b.draw.models, style)}
+          ${lookList(a.look)}</div>`).join("")}
         <div><span class="mono small muted">${esc(c.id)}</span>${c.aliases?.length ? ` · also ${esc(c.aliases.join(", "))}` : ""}</div>
         ${c.bio ? `<div><b>Casting bio.</b> ${esc(c.bio)}</div>` : ""}
         <div><b>Role.</b> ${esc(c.role)}</div>
         ${c.description ? `<div><b>Description.</b> ${esc(c.description)}</div>` : ""}
         <div><b>Voice brief.</b> ${esc(c.voice_brief)}</div>
         ${facts ? `<div><b>Facts</b><ul class="facts">${facts}</ul></div>` : ""}
+      </div></details>`;
+  }).join("");
+  const places = b.settings.map((s) => {
+    const ch = s.chapters_present || [];
+    const search = [s.id, s.name, ...(s.aliases || []), s.description].join(" ").toLowerCase();
+    return `<details class="char" data-key="place:${esc(s.id)}" data-search="${esc(search)}">
+      <summary>${thumb(art(s))}<span class="name">${esc(s.name)}</span>
+        <span class="small muted">${ch.length ? `ch ${esc(rangeText(ch))}` : ""}</span>
+        <span class="grow"></span>
+        ${art(s) ? `<span class="pill ${esc(art(s).status)}">${esc(art(s).status)}</span>` : `<span class="small muted">no image</span>`}
+      </summary>
+      <div class="body">
+        ${s.description ? `<div>${esc(s.description)}</div>` : ""}
+        ${imageBlock(slug, `settings/${s.id}`, s.name, art(s), s.look, b.draw.models, style)}
+        ${lookList(s.look)}
+        <div><span class="mono small muted">${esc(s.id)}</span>${s.aliases?.length ? ` · also ${esc(s.aliases.join(", "))}` : ""}</div>
       </div></details>`;
   }).join("");
   const prons = [...b.pronunciations].sort((x, y) => (y.say ? 1 : 0) - (x.say ? 1 : 0));
@@ -1374,11 +1593,14 @@ function bibleTab(b) {
       <td class="right">${busy.has(p.term) ? `<span class="small muted nowrap">saving…</span>`
         : `<button class="sm ghost" data-act="pron-edit" data-term="${esc(p.term)}">${p.say ? "Edit" : "Override"}</button>`}</td></tr>`;
   const pron = (S.pronEdit === "" ? pronEditRow({ term: "" }) : "") + prons.map(pronRow).join("");
-  return `<div class="row" style="margin-bottom:12px">
-      <input type="search" id="bible-q" data-input="bible-q" placeholder="Search names, aliases, roles" value="${esc(S.bibleQ)}" class="grow" style="min-width:200px">
+  return `${looksBar(b, slug)}<div class="row" style="margin-bottom:12px">
+      <input type="search" id="bible-q" data-input="bible-q" placeholder="Search names, aliases, roles, places" value="${esc(S.bibleQ)}" class="grow" style="min-width:200px">
       <div class="filters">${imps.map((i) => `<button class="${S.bibleImp === i ? "on" : ""}" data-act="bible-imp" data-imp="${i}">${i.replace("_", " ")}</button>`).join("")}</div>
     </div>
     <div class="panel">${chars || `<div class="empty">The bible is empty. Run the character pass.</div>`}</div>
+    <div class="section-head"><h2>Settings</h2><span class="muted small grow">${b.settings.length || ""}</span></div>
+    <p class="small muted">The places where scenes happen, from the look pass. A setting with scenes in two chapters or more gets an image.</p>
+    <div class="panel">${places || `<div class="empty">None yet. The look pass adds them.</div>`}</div>
     <div class="section-head"><h2>Pronunciations</h2><span class="muted small grow">${prons.length}${overrides ? ` · ${plural(overrides, "override")}` : ""}</span>
       <button class="sm" data-act="pron-edit" data-term="">Add an override</button></div>
     <p class="small muted">An override replaces the term with its spoken form in every line a voice reads, as a whole word with the same capitals. The text and the script keep the original spelling. A change applies from the next render, which regenerates only the lines that name the term.</p>
@@ -1511,7 +1733,8 @@ function pronEditRow(p) {
 function applyFilters() {
   const q = S.bibleQ.toLowerCase().trim();
   $$("details.char").forEach((d) => {
-    d.hidden = (q && !d.dataset.search.includes(q)) || (S.bibleImp !== "all" && d.dataset.imp !== S.bibleImp);
+    // a setting has no importance, so only the search hides it
+    d.hidden = (q && !d.dataset.search.includes(q)) || (S.bibleImp !== "all" && "imp" in d.dataset && d.dataset.imp !== S.bibleImp);
   });
   $$(".line[data-speaker]").forEach((l) => { l.hidden = !!S.spk && l.dataset.speaker !== S.spk; });
   $$("button.chip[data-act=spk]").forEach((b) => b.classList.toggle("off", !!S.spk && b.dataset.id !== S.spk));
@@ -1579,11 +1802,20 @@ function workersPanel(st) {
   const n = st.nomad || {};
   const running = st.jobs.filter((j) => j.status === "running");
   const cells = (st.workers || []).map((w) => {
-    const job = running.find((j) => j.nomad?.node === w.name);
-    const state = !w.ready ? (w.status !== "ready" ? w.status : w.busy ? "busy" : "not taking jobs") : job ? "working" : "idle";
-    const pill = !w.ready ? "down" : job ? "running" : "done";
+    const job = running.find((j) => (j.nomad?.node || j.nomad?.target) === w.name);
+    const up = w.status === "ready";
+    const held = up && w.held;
+    const state = held ? (job ? "finishing" : "on hold")
+      : !w.ready ? (!up ? w.status : w.busy ? "busy" : "not taking jobs") : job ? "working" : "idle";
+    const pill = held ? (job ? "running" : "stopped") : !w.ready ? "down" : job ? "running" : "done";
+    const hold = (label, on, back, title) => `<button class="sm" data-act="node-hold" data-node="${esc(w.name)}" data-held="${on}" data-back="${back}" title="${title}">${label}</button>`;
+    const btns = w.held ? hold("Resume", 0, 0, "Send this node jobs again.")
+      : hold("Hold", 1, 0, "Send this node no job until you resume it. Its running job carries on.")
+        + (up ? hold("Going offline", 1, 1, "Let this node finish its job and send it no new one. The hold ends by itself when the node is back.") : "");
+    const note = !w.held ? "" : ` · ${w.until_back ? "on hold until it is back" : "on hold until you resume it"}`;
     return `<div class="stat"><b><span class="pill ${pill}">${esc(state)}</span></b>`
-      + `<span>${esc(w.name)} · ${esc(w.classes.join(", "))}${job ? ` · ${esc(job.title)}` : ""}</span></div>`;
+      + `<span>${esc(w.name)} · ${esc(w.classes.join(", "))}${job ? ` · ${esc(job.title)}` : ""}${note}</span>`
+      + `<div class="row tight node-btns">${btns}</div></div>`;
   });
   if (n.up === false) cells.unshift(`<div class="stat"><b><span class="pill down">down</span></b><span>Nomad: ${esc(n.error || "not reachable")}</span></div>`);
   else if (!cells.length) cells.push(`<div class="stat"><b>none</b><span>No Nomad worker offers serial_audio jobs yet</span></div>`);
@@ -1605,6 +1837,7 @@ function jobRow(j) {
     meta.push(`queued ${esc(when(j.created))}`);
     if (j.estimate) meta.push(`about ${span(j.estimate)}${j.on ? ` on ${esc(j.on)}` : ""}`);
     if (j.end_in != null) meta.push(`done about ${esc(clockIn(j.end_in))}`);
+    if (j.note) meta.push(esc(j.note));
     if (j.wait) meta.push(`<span class="wait">${esc(j.wait)}</span>`);
   } else if (j.status === "running" && !j.started) {
     meta.push(j.nomad?.dispatched_at ? `sent to the cluster ${esc(when(j.nomad.dispatched_at))}` : "sending to the cluster");
@@ -1718,6 +1951,10 @@ const ACT = {
     openCast(S.route.slug, el.dataset.mode === "sel" ? [...uselFor(S.route.slug)] : [], v);
   },
   "bible-imp": (el) => { S.bibleImp = el.dataset.imp; paint(); },
+  "draw-open": (el) => openDraw(S.route.slug, el.dataset.key, S.data[routeKey(S.route)].extra),
+  "bible-style": (el) => { store.set(`style:${S.route.slug}`, el.dataset.style); paint(); },
+  "pick-image": (el) => queue([{ kind: "pick-image", params: { slug: S.route.slug, subject: el.dataset.key, seed: Number(el.dataset.seed),
+    style: shownStyle(S.data[routeKey(S.route)].extra, S.route.slug) || undefined } }]),
   "names-all": (el) => { S.namesAll = el.dataset.all === "1"; paint(); },
   "name-options": async (el) => {
     const params = { slug: S.route.slug, term: el.dataset.term, ...storedLLM(), ...(el.dataset.again ? { render_only: true } : {}) };
@@ -1870,6 +2107,11 @@ const ACT = {
   "jobs-clear": async () => { await post("/api/jobs/clear"); await poll(); },
   "history-all": async () => { S.allHistory = true; await poll(); },
   "queue-hold": async (el) => { await post("/api/queue/pause", { paused: el.dataset.paused === "1" }); await poll(); },
+  "node-hold": async (el) => {
+    const d = el.dataset;
+    await post("/api/nodes/hold", { node: d.node, held: d.held === "1", until_back: d.back === "1" });
+    await poll();
+  },
   "goto-log": (el) => {
     S.chTab = "log";
     location.hash = `#/s/${el.dataset.slug}/c/${el.dataset.n}`;

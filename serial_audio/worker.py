@@ -679,6 +679,8 @@ def comfy_marker(info: dict) -> str | None:
         return f"{slug}/ch{int(chapters[0]):04d}"
     if kind == "cast":
         return f"cast/{slug}/"
+    if kind == "draw":
+        return f"images/{slug}/"
     if kind == "check-takes" and chapters:
         return f"breeze/{slug}/ch{int(chapters[0]):04d}/"
     return None
@@ -703,6 +705,28 @@ def cancel_comfy(comfy_url: str, marker: str) -> list[str]:
             except (urllib.error.URLError, OSError, ValueError):
                 pass
     return done
+
+
+def draw_comfy(comfy_url: str) -> str:
+    """The address of the ComfyUI a draw on this machine paints with, or comfy_url when none is up. Never raises."""
+    try:
+        from . import images
+        return images.comfy_up(comfy_url) or comfy_url
+    except Exception:
+        return comfy_url
+
+
+def unload_comfy(comfy_url: str) -> bool:
+    """Asks a ComfyUI to unload its models. Returns whether it answered. Never raises."""
+    try:
+        from . import machine
+        from .comfy import ComfyClient
+        if not machine.listening(comfy_url):
+            return False
+        ComfyClient(comfy_url).free(settle=0.0)
+        return True
+    except Exception:
+        return False
 
 
 def send_result(app: App, data: bytes, log: Log, next_code: str | None = None, waiting=None) -> dict | None:
@@ -860,9 +884,13 @@ def run_job(app_url: str, job: str, key: str, work: Path, node: str, held: Held)
     cancelled = stop.is_set()
     marker = comfy_marker(info) if cancelled else None
     if marker:
-        ids = cancel_comfy(comfy_url, marker)
+        # a draw paints with the ComfyUI that is up on any address, and no later step unloads that one
+        used = draw_comfy(comfy_url) if info.get("kind") == "draw" else comfy_url
+        ids = cancel_comfy(used, marker)
         if ids:
             log.line(f"[worker] cancelled ComfyUI prompt(s) {', '.join(ids)}")
+        if info.get("kind") == "draw" and unload_comfy(used):
+            log.line(f"[worker] asked the ComfyUI at {used} to unload its models")
     more = (code == 0 and not cancelled and bool(info.get("gpu")) and info.get("class") in NEXT_CLASSES
             and held.lock is not None and same_code)
     if not more:

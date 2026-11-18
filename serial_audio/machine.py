@@ -6,6 +6,8 @@ settings. A cluster node sets them in the env of its serial_audio_config file.
 SERIAL_AUDIO_COMFY_OUTPUT: ComfyUI's output folder. On a node without ComfyUI, the folder for Breeze takes and joined
     audio.
 SERIAL_AUDIO_AUDIO_PYTHON: the Python that runs fx.py and breeze_join.py, with numpy, scipy, librosa and soundfile.
+SERIAL_AUDIO_COMFY_MAIN: ComfyUI's main.py, which an image job starts under SERIAL_AUDIO_COMFY_PYTHON when no ComfyUI
+    answers. SERIAL_AUDIO_COMFY_PYTHON defaults to the audio Python, which is ComfyUI's own Python on the laptop.
 SERIAL_AUDIO_BREEZE_HOME: the Breeze-TTS-2.cpp folder, with bin/, models/, refs/ and voices/.
 SERIAL_AUDIO_PARAKEET_MODEL: the Parakeet TDT 0.6B v2 int8 folder for sherpa-onnx, with encoder.int8.onnx,
     decoder.int8.onnx, joiner.int8.onnx and tokens.txt. The audio Python needs sherpa-onnx to use it.
@@ -44,6 +46,8 @@ def _path(name: str, default: str) -> Path:
 
 COMFY_OUTPUT = _path("SERIAL_AUDIO_COMFY_OUTPUT", r"D:\comfy\ComfyUI\output")
 AUDIO_PYTHON = _path("SERIAL_AUDIO_AUDIO_PYTHON", r"D:\comfy\python_embeded\python.exe")
+COMFY_MAIN = _path("SERIAL_AUDIO_COMFY_MAIN", r"D:\comfy\ComfyUI\main.py")
+COMFY_PYTHON = _path("SERIAL_AUDIO_COMFY_PYTHON", str(AUDIO_PYTHON))
 BREEZE_HOME = _path("SERIAL_AUDIO_BREEZE_HOME", r"D:\comfy\breeze-cpp")
 BREEZE_SERVER_NAME = "breeze-server.exe" if WINDOWS else "breeze-server"
 PARAKEET_MODEL = _path("SERIAL_AUDIO_PARAKEET_MODEL", r"D:\comfy\models\parakeet-tdt-0.6b-v2-int8")
@@ -85,6 +89,25 @@ def listening(url: str) -> bool:
         return True
     except OSError:
         return False
+
+
+def accepts(host: str, port: int) -> bool:
+    """Whether host takes a connection on port within PROBE_TIMEOUT. Never raises."""
+    try:
+        socket.create_connection((host, port), timeout=PROBE_TIMEOUT).close()
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def local_addresses() -> list[str]:
+    """This machine's IPv4 addresses other than the loopback ones, sorted, or [] when they can't be listed.
+    Never raises."""
+    try:
+        found = {info[4][0] for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET)}
+    except (OSError, UnicodeError):
+        return []
+    return sorted(a for a in found if not a.startswith("127."))
 
 
 def breeze_server_pids() -> list[int]:

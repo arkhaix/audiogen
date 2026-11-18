@@ -10,10 +10,14 @@ TTS 2 render.
 library/<slug>/serial.yaml               title, source, narration, casting policy
 library/<slug>/bible/characters.yaml     id -> character (aliases, facts by chapter, voice brief, casting bio, voice id)
 library/<slug>/bible/pronunciations.yaml term -> respelling
+library/<slug>/bible/looks.yaml          character id -> the visual details the text gave, by chapter, each with its passage
+library/<slug>/bible/settings.yaml       id -> setting (name, aliases, description, chapters with a scene there, look)
+library/<slug>/images/                   the bible's images: the styles and the descriptions, and under each style's name one record per character or setting with its candidates
 library/<slug>/voices/                   designed voices: brief, clip (wav), encoded Drama 3 voice
 library/<slug>/chapters/0001/text.md     cleaned chapter text
 library/<slug>/chapters/0001/chapter.yaml status, characters present, pass provenance
 library/<slug>/chapters/0001/character_pass.json  raw pass output, for audit
+library/<slug>/chapters/0001/look_pass.json       the look pass's answer. A chapter that has it was read for looks
 library/<slug>/chapters/0001/author_notes.md      the author's notes around a web chapter (never narrated)
 library/<slug>/chapters/0001/breeze_takes.json    the Breeze take of each script line: key, file, voice, seed
 library/<slug>/chapters/0001/take_check.json      one entry per take: its evidence and its verdict
@@ -46,6 +50,10 @@ python -m serial_audio.cli check-takes <slug> <chapters> [--asr qwen3|parakeet] 
 python -m serial_audio.cli measure-takes <slug> <chapters> [--stored] [--json]   # each voice's take measures and what the check flags, read-only
 python -m serial_audio.cli backlog <slug> [chapters] [--all] [--json]   # the chapters a render would change, read-only
 python -m serial_audio.cli say-options <slug> <term> [--dry-run | --render-only | --add <spelling>]   # respellings of a term, each said in a line of the script and screened in seven more. It doesn't file any
+python -m serial_audio.cli look-pass <slug> <1|1-5|all> [--redo]   # what the characters and places of each chapter look like, into bible/looks.yaml and bible/settings.yaml
+python -m serial_audio.cli draw <slug> [--characters a,b] [--settings x,y] [--candidates 2] [--redraw] [--prompt "..."] [--style name] [--style-text "..."] [--image-model qwen21|krea2] [--dry-run]   # an image for each character and setting that needs one
+python -m serial_audio.cli pick-image <slug> <characters/id|settings/id> [--seed N] [--style name]   # after looking: file another candidate / approve
+python -m serial_audio.cli images <slug> [-v]            # the bible's images, and how far the look pass has read
 ```
 
 ## Web app
@@ -119,6 +127,11 @@ heading says when the last job ends. Each node's own jobs give its timings, so t
 pipeline within a few jobs (`deploy/README.md`, How a job runs). A queued job has no time until the app has counted
 its takes, while the queue is on hold, and while no ready node offers its class.
 
+On the cluster each node's row there has a Hold button and a Going offline button. Hold stops the app from sending the
+node jobs until Resume, for a machine whose card is busy with other work. Going offline does the same until the node
+has been away and is back, for a machine that is about to be turned off. The node finishes the job it has either way.
+A job whose node goes away before it ends is queued again (`deploy/README.md`, How a job runs, point 7).
+
 A queued job has buttons that move it to the top, up, down and to the bottom, and a handle to drag it. Select several
 jobs to move or cancel them together, and drag one of them to move them all. Backlog work stays behind every other
 job, so a job moves among its own kind of work. A job stays behind the jobs of its batch that it waits for, so a
@@ -130,11 +143,26 @@ Every chapter with audio has a download button on the serial page and the chapte
 sends the file as an attachment named `<serial> - <NNN> - <chapter title>.opus`, so an audiobook reader on a phone
 sorts the chapters in order.
 On a Royal Road serial, Import saved pages has a box named process the chapters after import. With it ticked, the
-import queues one batch: the imports, then each imported chapter's character pass with a cast of new voices after
-it, then the screenplays and the renders, with the Process dialog's defaults and the LLM settings last chosen in a dialog. Only a
+import queues one batch: the imports, then each imported chapter's character pass with a cast of new voices and a
+look pass after it, then the screenplays and the renders, with the Process dialog's defaults and the LLM settings last chosen in a dialog. Only a
 chapter that nothing has been made from yet is processed: a new chapter, or one on disk at status `fetched` whose text
 is replaced. A replaced chapter that has a character pass, a script or audio from its old text is left for the Process
 dialog and its redo boxes. The browser remembers the box.
+The bible page shows what each character looks like and its image. A bar at the top says how many chapters the look
+pass has read and has a button that queues a `look-pass` job for the rest. It also says how many main characters
+and common settings have no image, and Draw them queues a `draw` job for them. A serial with two image styles
+or more has a Style switch there, and the page shows, draws and picks the images of the style that is switched on.
+The dialog of Draw them has a box for background work, ticked by default: the draw then starts when the queue is
+empty and gives the laptop to any other job, and goes on afterwards with the subjects it has not painted. A character's row
+has its image, the candidates with Use this and Approve, which queue a quick `pick-image` job, its look details by
+chapter, each with the passage it comes from, and Draw or Redraw, which opens a dialog with the description to edit.
+An image lists the passages it was painted from. A second appearance of a character, such as a suit of armour, has
+its own image and its own details under the character. When the text has given more details
+than the image's description saw, the row says so. A Settings section lists the places where scenes happen in the
+same way, the ones with the most chapters first. The Process dialog has a Look pass stage. It is ticked when the
+batch has a character pass to run, and it reads the chapters that get one, with Sonnet unless the stage names
+another model. Two boxes add the selected chapters that have a character pass already: the ones without a look
+pass, and the ones to read again.
 The bible page lists the pronunciations with their say-as overrides first. Edit, Override and Add an override queue a
 quick `say-as` job, and the table refreshes when it finishes. `say-as <slug> <term> <spoken>` does the same from the
 command line, and `--clear` removes an override. A term added only for an override has no respelling, and clearing
@@ -331,6 +359,44 @@ checks it again.
    the file is written again when it misses either. `render.join` is the version of the join that made the audio,
    and `render.loudness`, `render.true_peak`, `render.pauses_cut` and `render.clicks_filled` say what it measured
    and did.
+6. `look-pass` reads a chapter that has a character pass for what its characters and its places look like. The
+   pass is sent the characters of the chapter, each with the look recorded so far, and the settings recorded so
+   far. It returns the visual details the chapter adds, each as a short statement with the passage of the chapter
+   that shows it, and marks a detail of one scene, such as a disguise. The record keeps a passage only when it is
+   the chapter's own words. A detail of a second appearance that the story returns to, such as armour that a Class
+   forms around a character, names that appearance with a slug, and the pass uses the slug again in later
+   chapters. A setting is a place where a scene
+   happens, and a known setting counts each chapter with a scene there. The details go to `bible/looks.yaml` and
+   `bible/settings.yaml`, and the chapter's `look_pass.json` holds the answer. `--redo` reads a chapter again and
+   replaces what its pass recorded. No other step reads these files, so the pass can run at any time after the
+   chapter's character pass. `reset-bible` deletes them with the bible. The pass runs with Sonnet unless `--model`
+   names another, where the other passes default to Opus.
+7. `draw` makes the bible's images. Without names it draws every major or recurring character, each second
+   appearance of one that has look details from two chapters, and every setting with scenes in two chapters and
+   a look detail, as far as they have no image, 24 at most in one run, the most important first. `image_policy`
+   in `serial.yaml` changes the three rules (`characters_for`, `appearance_chapters`, `setting_chapters`).
+   An image pass writes a description of each from its bible entry, with the facts the character pass kept, and
+   its look details, so a character is drawn before any look pass has read its chapters. A second appearance is a
+   subject of its own with the id `<character>--<appearance>`, such as `simon--overlord-armor`, and its
+   description is the character in that appearance. A serial has one image style or more. A style has a
+   name, such as `film`, and a text that goes in front of every description, and a subject has an image of its
+   own in each style, from the one description. `--style` names the style a draw paints in, and without it the
+   draw paints in the serial's first. A name the serial doesn't have makes a new style. `--style-text` sets the
+   style's text from that draw on, and the images that exist keep theirs until they are drawn again. For a style
+   without a text, the image pass chooses one. The Draw dialog has both fields. ComfyUI then paints the candidates, 2 by
+   default and one prompt each, from the style, a fixed framing for portraits or for places, and the description.
+   A character is 896 by 1152 and a setting 1344 by 768, saved as WebP with a small copy for the lists. The model
+   is Qwen Image 2.1, or Krea 2 turbo with `--image-model krea2` or `image_model` in `serial.yaml`. The prompts
+   go to the ComfyUI that is up on the machine: the one at `--comfy-url`, else one that answers on the same port
+   of another address of the machine. Only when none is up does `draw` start one, and it stops that one at the
+   end. It doesn't paint while a breeze-server runs, and it asks ComfyUI to unload its models when it is done.
+   The first candidate is filed with status `auto`, and `pick-image` files another one or approves it. `--redraw`
+   paints a named subject again and keeps the old round in its record. A candidate's file is named by its seed,
+   so a `--seed` that the subject has used starts at its first free seed instead. A description is asked for
+   again when the subject's look details are not the ones the cached description saw. An image's record keeps
+   the details and the passages its description saw. `--prompt` gives the
+   description for one subject, and a later draw keeps it. The candidates are library files under `images/`, so
+   a pick doesn't need the node that painted them.
 
 A Drama 3 render and a Qwen cast need ComfyUI (portable, `D:\comfy`) running with the ComfyUI-Drama3 and
 ComfyUI-Qwen-TTS node packs. A Breeze render under breeze-server and a Breeze cast don't. Every ComfyUI step runs as its own prompt with `POST /free` in between: on an 8 GB card the

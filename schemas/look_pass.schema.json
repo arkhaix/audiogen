@@ -1,0 +1,88 @@
+{
+  "type": "object",
+  "properties": {
+    "characters": {
+      "type": "array",
+      "description": "The characters this chapter shows something new about. Only ids from the list of characters.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string", "description": "The character id exactly as given."},
+          "look": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "text": {"type": "string", "description": "One visual detail in a short statement, with the author's words in quotation marks where they carry the image."},
+                "lasting": {"type": "boolean", "description": "False for a detail of this scene alone, such as a disguise, a costume or an injury that will heal."},
+                "appearance": {"type": "string", "description": "Empty for the everyday look. For a detail of a second appearance the story returns to, such as Class armour or another body, its kebab-case slug, e.g. overlord-armor."},
+                "quote": {"type": "string", "description": "The passage of this chapter that shows the detail, copied word for word: one to three sentences, with nothing left out and nothing changed."}
+              },
+              "required": ["text", "lasting", "appearance", "quote"],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": ["id", "look"],
+        "additionalProperties": false
+      }
+    },
+    "new_settings": {
+      "type": "array",
+      "description": "Places where a scene of this chapter happens that the list of settings does not have.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string", "description": "Stable kebab-case slug of the name, e.g. the-gilded-anchor. Never reuse an existing id."},
+          "name": {"type": "string", "description": "The place's name as the story most often uses it, or a short descriptive name when it has none."},
+          "aliases": {"type": "array", "items": {"type": "string"}, "description": "Every other way the text refers to the place."},
+          "description": {"type": "string", "description": "One sentence: what the place is."},
+          "look": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "text": {"type": "string", "description": "One visual detail in a short statement, with the author's words in quotation marks where they carry the image."},
+                "lasting": {"type": "boolean", "description": "False for a detail of this scene alone, such as the weather of one day."},
+                "quote": {"type": "string", "description": "The passage of this chapter that shows the detail, copied word for word: one to three sentences, with nothing left out and nothing changed."}
+              },
+              "required": ["text", "lasting", "quote"],
+              "additionalProperties": false
+            }
+          },
+          "evidence": {"type": "string", "description": "A short quote from the chapter that puts a scene in this place."}
+        },
+        "required": ["id", "name", "aliases", "description", "look", "evidence"],
+        "additionalProperties": false
+      }
+    },
+    "settings": {
+      "type": "array",
+      "description": "Every known setting where a scene of this chapter happens, with what the chapter adds to its look.",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {"type": "string", "description": "The setting id exactly as given."},
+          "new_aliases": {"type": "array", "items": {"type": "string"}},
+          "look": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "text": {"type": "string"},
+                "lasting": {"type": "boolean"},
+                "quote": {"type": "string", "description": "The passage of this chapter that shows the detail, copied word for word: one to three sentences, with nothing left out and nothing changed."}
+              },
+              "required": ["text", "lasting", "quote"],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": ["id", "new_aliases", "look"],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": ["characters", "new_settings", "settings"],
+  "additionalProperties": false
+}
