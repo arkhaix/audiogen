@@ -1362,8 +1362,8 @@ class NodeChoiceTest(unittest.TestCase):
         self.assertTrue(Client.calls[1][1].startswith(f"{j['id']}-0-"))
 
 
-class NodeAwayTest(unittest.TestCase):
-    """A node that goes away under its job, and a node the app holds: which job is queued again, and who gets none."""
+class ClusterJobsCase(unittest.TestCase):
+    """A manager with two Breeze nodes, whose jobs a test starts, stops and ends by hand."""
 
     def setUp(self):
         from unittest import mock
@@ -1424,6 +1424,15 @@ class NodeAwayTest(unittest.TestCase):
         self.assertEqual(job["status"], "running")
         self.m._apply_poll(job, seen, now + self.nomad.END_GRACE + 1)
 
+    def answers(self, job, **info):
+        """The job's worker sends the result of its stage: a stop that it confirms, unless info says otherwise."""
+        data = json.dumps({"exit_code": 1, "cancelled": True, "node": "laptop", **info}).encode()
+        return self.m.worker_result(job["id"], job["nomad"]["key"], str(job["nomad"]["stage"]), data)
+
+
+class NodeAwayTest(ClusterJobsCase):
+    """A node that goes away under its job, and a node the app holds: which job is queued again, and who gets none."""
+
     def test_a_job_whose_node_went_away_is_queued_again(self):
         a, b = self.running("a", 1, 1), self.render("b", 2, 1)
         # b waits for a: the take check of the chapter that a renders, in the same batch
@@ -1432,11 +1441,15 @@ class NodeAwayTest(unittest.TestCase):
         unknown = {"polled": 1.0, "allocs": [{"ID": "alloc-1", "NodeName": "laptop", "ClientStatus": "unknown",
                                               "CreateTime": 1}]}
 
-        # While the node is disconnected, the job waits for it and says what happens next.
+        # While the node is disconnected, the job waits for it and says what happens next. The time it names is
+        # the one the job spec gives Nomad.
         self.m._apply_poll(a, unknown, 1.0)
         self.assertEqual(a["status"], "running")
         self.assertEqual(a["nomad"]["wait"], "laptop is disconnected; the job carries on if it reconnects within "
-                                             "2 hours, and is queued again if it doesn't")
+                                             "30 minutes, and is queued again if it doesn't")
+        spec = (Path(__file__).resolve().parent.parent / "deploy" / "nomad" / "serial-audio.nomad.hcl").read_text(
+            encoding="utf-8")
+        self.assertIn(f'lost_after = "{self.nomad.LOST_AFTER_MINUTES}m"', spec)
 
         # Nomad gives the allocation up. The job waits out the grace for a late result and is then as it was before
         # it started, but for the count. The batch job that waits for it is not skipped, as it is when a job ends
@@ -1608,6 +1621,286 @@ class NodeAwayTest(unittest.TestCase):
                 self.mock.patch.object(self.m.nomad, "node", return_value=full):
             self.m._poll_nodes()
         self.assertEqual([(w["name"], w["held"], w["ready"]) for w in self.m.workers], [("laptop", True, False)])
+
+
+class PauseTest(ClusterJobsCase):
+    """A pause, and a stop that queues the job again: which job may pause, where it waits, and what a stop still
+    does."""
+
+    def checks(self, jid, seq, n):
+        """A queued take check of chapter n, which waits for a render of that chapter."""
+        job = self.render(jid, seq, n)
+        job.update({"kind": "check-takes", "title": f"Check takes · ch {n}", "args": ["check-takes", "demo", str(n)]})
+        return job
+
+    def test_only_a_job_that_keeps_its_work_can_pause(self):
+        can = self.m._pausable
+
+        # A Breeze render whose worker has its bundle keeps its takes, until its join starts.
+        r = self.running("r", 1, 1)
+        self.assertTrue(can(r))
+        for change, back in (({"marks": {"join": 1.0}}, {"marks": {}}), ({"contact": None}, {"contact": "t"}),
+                             ({"cancel": True}, {"cancel": False})):
+            r["nomad"].update(change)
+            self.assertFalse(can(r), change)
+            r["nomad"].update(back)
+        # A join of saved takes and a Drama 3 render would start over.
+        for change, back in (({"decode_only": True}, {"decode_only": False}), ({"engine": "drama3"}, {"engine": "breeze"})):
+            r["meta"].update(change)
+            self.assertFalse(can(r), change)
+            r["meta"].update(back)
+        self.assertTrue(can(r))
+
+        # A draw keeps the images it filed, in its images stage and unless it is a redraw.
+        d = self.running("d", 2, 2)
+        d.update({"kind": "draw", "title": "Draw", "args": ["draw", "demo"]})
+        d["nomad"].update({"stage": 1, "stages": [{"class": "llm", "args": []}, {"class": "comfyui", "args": []}]})
+        self.assertTrue(can(d))
+        d["nomad"]["stage"] = 0
+        self.assertFalse(can(d))
+        d["nomad"]["stage"] = 1
+        d["args"].append("--redraw")
+        self.assertFalse(can(d))
+
+        # A take check would hear its takes again, so it can't, and neither can a job that is not running.
+        c, q = self.running("c", 3, 3), self.render("q", 4, 4)
+        c["kind"] = "check-takes"
+        self.assertFalse(can(c))
+        for jid in ("c", "q"):
+            with self.assertRaises(ValueError):
+                self.m.pause(jid)
+        with self.assertRaises(ValueError):
+            self.m.resume("q")
+        with self.assertRaises(KeyError):
+            self.m.pause("nowhere")
+        self.assertEqual((c["status"], q["status"]), ("running", "queued"))
+
+        # The page gets the answer with each job, and learns that this app can queue a stopped job again.
+        self.m.jobs = {"r": r, "q": q}
+        for job in (r, q):
+            job.update({"created": "2026-11-18T15:00:00", "finished": None})
+        snap = self.m.snapshot()
+        self.assertEqual({j["id"]: j["pausable"] for j in snap["jobs"]}, {"r": True, "q": False})
+        self.assertIs(snap["requeue"], True)
+
+    def test_a_paused_job_waits_in_its_place_until_it_is_resumed(self):
+        a, b, c = self.running("a", 1, 1), self.checks("b", 2, 1), self.render("c", 3, 3)
+        a["batch"] = b["batch"] = "batch-1"
+
+        # The pause asks the worker to stop, and nothing of the batch is skipped. A second request is refused.
+        self.assertIs(self.m.pause("a"), a)
+        n = a["nomad"]
+        self.assertEqual((a["status"], n["cancel"], n["requeue"], a["stopping"], b["status"]),
+                         ("running", True, "hold", True, "queued"))
+        self.assertIn("pause requested", self.logged["a"][-1])
+        for ask in (lambda: self.m.pause("a"), lambda: self.m.cancel("a", requeue=True)):
+            with self.assertRaises(ValueError):
+                ask()
+
+        # The worker confirms: the job is as it was before it started, in its place, and marked as paused. Its
+        # log says how it got there, and it has no note, because its wait reason says the same.
+        report = self.answers(a)
+        self.assertEqual((a["status"], a.get("nomad"), a["started"], a["paused"], a["seq"], a["note"]),
+                         ("queued", None, None, True, 1, None))
+        self.assertNotIn("stopping", a)
+        self.assertIn("paused from the web app, with what it made", self.logged["a"][-1])
+        # A repeated upload of the stopped run gets the report the first one got.
+        again = self.m.worker_result("a", "key-a", "0", json.dumps({"exit_code": 1, "cancelled": True}).encode())
+        self.assertEqual(again, report)
+
+        # A pass starts neither the paused job nor the batch job that waits for it, and each says why. A job of
+        # another chapter runs.
+        self.m._schedule(10.0, [])
+        self.assertEqual((a["status"], b["status"], c["status"]), ("queued", "queued", "running"))
+        self.assertEqual(self.m.wait_reasons["a"], "paused until you resume it")
+        self.assertEqual(self.m.wait_reasons["b"], "waiting for Render · ch 1, queued ahead of it on the same serial")
+
+        # Resumed, it starts by the scheduler's rules, on the node that is free, under another key.
+        self.assertIs(self.m.resume("a"), a)
+        self.assertEqual((a["paused"], a["note"]), (False, None))
+        self.m._schedule(20.0, [])
+        self.assertEqual((a["status"], a["nomad"]["target"], a["note"]), ("running", "mac", None))
+        self.assertNotEqual(a["nomad"]["key"], "key-a")
+        with self.assertRaises(ValueError):
+            self.m.resume("a")
+
+    def test_a_stop_can_queue_the_job_again_at_once(self):
+        a, b = self.running("a", 1, 1), self.checks("b", 2, 1)
+        a["batch"] = b["batch"] = "batch-1"
+
+        # The stop is asked for with the job's way back, and the batch stays as it is.
+        self.m.cancel("a", requeue=True)
+        self.assertEqual((a["nomad"]["requeue"], a["nomad"]["cancel"], a["stopping"], b["status"]),
+                         ("now", True, True, "queued"))
+        self.answers(a)
+        self.assertEqual((a["status"], a.get("nomad"), a["paused"], a["note"], a["seq"], b["status"]),
+                         ("queued", None, False, "stopped and queued again", 1, "queued"))
+
+        # The next pass starts it again, under another key.
+        self.m._schedule(10.0, [])
+        self.assertEqual((a["status"], a["note"]), ("running", None))
+        self.assertNotEqual(a["nomad"]["key"], "key-a")
+
+        # A job that no worker has started is queued again at once, and the worker that comes late gets no bundle.
+        d = self.running("d", 3, 3, on="mac")
+        d["nomad"]["contact"] = None
+        self.m.cancel("d", requeue=True)
+        self.assertEqual((d["status"], d.get("nomad"), d["note"]), ("queued", None, "stopped and queued again"))
+        with self.assertRaises(self.nomad.WorkerError) as e:
+            self.m.worker_bundle("d", "key-d", "mac")
+        self.assertEqual(e.exception.status, 403)
+
+        # A job past its first stage keeps its record and the reports of its earlier stages. The stopped stage
+        # runs again: the stopped run's upload gets its own report again, and the new run's result is taken.
+        self.m.jobs.clear()
+        s = self.running("s", 4, 4)
+        n = s["nomad"]
+        n.update({"stage": 1, "stages": [{"class": "llm", "args": s["args"]}, {"class": "breeze", "args": s["args"]}],
+                  "reports": {"0": {"applied": []}}})
+        self.m.cancel("s", requeue=True)
+        first = self.answers(s)
+        self.assertEqual((s["status"], n["stage"], sorted(n["reports"]), n.get("cancel"), n.get("requeue"), n["contact"]),
+                         ("queued", 1, ["0"], None, None, None))
+        self.assertNotEqual(n["key"], "key-s")
+        late = self.m.worker_result("s", "key-s", "1", json.dumps({"exit_code": 1, "cancelled": True}).encode())
+        self.assertEqual(late, first)
+        self.m._schedule(20.0, [])
+        self.assertEqual(s["status"], "running")
+        self.m.worker_result("s", n["key"], "1", json.dumps({"exit_code": 0, "node": "laptop"}).encode())
+        self.assertEqual((s["status"], sorted(n["reports"])), ("done", ["0", "1"]))
+
+        # Only a job that runs on the cluster goes back into the queue.
+        q = self.render("q", 9, 9)
+        with self.assertRaises(ValueError):
+            self.m.cancel("q", requeue=True)
+        self.assertEqual(q["status"], "queued")
+
+        # A job that is queued again while its dispatch is on its way to Nomad. The answer belongs to the run
+        # that was stopped, so the next run keeps its own dispatch to make.
+        f = self.render("f", 5, 5)
+        self.m.jobs = {"f": f}
+        self.m._schedule(30.0, [])
+
+        def dispatch(target, meta, token):
+            self.m.cancel("f", requeue=True)
+            self.m._schedule(31.0, [])
+            return {"DispatchedJobID": "the-stopped-run"}
+
+        with self.mock.patch.object(self.m.nomad, "dispatch", dispatch):
+            self.m._dispatch("f")
+        self.assertEqual((f["status"], f["nomad"]["dispatched"], f["nomad"]["dispatching"]), ("running", None, True))
+
+    def test_a_plain_stop_still_wins_and_a_job_that_ends_by_itself_is_done(self):
+        # A stop after a pause: the job ends as stopped and its batch is skipped, as for any stop.
+        a, b = self.running("a", 1, 1), self.checks("b", 2, 1)
+        a["batch"] = b["batch"] = "batch-1"
+        self.m.pause("a")
+        self.m.cancel("a")
+        self.assertEqual((a["nomad"].get("requeue"), a["nomad"]["cancel"], b["status"]), (None, True, "skipped"))
+        self.assertIn("on its way back into the queue, so it is not queued again", self.logged["a"][-1])
+        self.answers(a)
+        self.assertEqual((a["status"], a.get("paused")), ("stopped", None))
+
+        # A job that finishes before the pause reaches its worker is done.
+        c = self.running("c", 3, 3)
+        self.m.pause("c")
+        self.answers(c, exit_code=0, cancelled=False)
+        self.assertEqual((c["status"], c.get("paused")), ("done", None))
+
+        # A task that ends without a result leaves the job paused in the queue all the same.
+        d = self.running("d", 4, 4)
+        self.m.pause("d")
+        self.ends(d, "complete", 10.0)
+        self.assertEqual((d["status"], d["paused"], d.get("nomad")), ("queued", True, None))
+        self.assertIn("no worker sent a result for the stopped run", self.logged["d"][-1])
+
+        # A worker that never confirms: the job ends as stopped, because its task may still run, and its batch is
+        # skipped as for a stop.
+        e, f = self.running("e", 5, 5), self.checks("f", 6, 5)
+        e["batch"] = f["batch"] = "batch-2"
+        self.m.pause("e")
+        self.m._check_stop(e, e["nomad"]["stop_at"] + self.nomad.STOP_GRACE + 1)
+        self.assertEqual((e["status"], f["status"]), ("stopped", "skipped"))
+        self.assertIn("that was to put it back into the queue", e["note"])
+
+        # A job whose node is disconnected has no worker to confirm, so it goes back into the queue at once, and
+        # the worker that comes back can't send anything for it.
+        g, h = self.running("g", 7, 7), self.running("h", 8, 8, on="mac")
+        for job in (g, h):
+            job["nomad"]["client_status"] = "unknown"
+        self.m.pause("g")
+        self.m.cancel("h", requeue=True)
+        self.assertEqual((g["status"], g["paused"], g.get("nomad")), ("queued", True, None))
+        self.assertEqual((h["status"], h["paused"], h["note"]), ("queued", False, "stopped and queued again"))
+        with self.assertRaises(self.nomad.WorkerError) as refused:
+            self.m.worker_log("g", "key-g", "0", 0, b"late\n")
+        self.assertEqual(refused.exception.status, 403)
+
+        # A second request on a job that is stopping says so, whichever button it comes from.
+        s = self.running("s", 9, 9)
+        self.m.cancel("s")
+        for ask in (lambda: self.m.pause("s"), lambda: self.m.cancel("s", requeue=True)):
+            with self.assertRaises(ValueError) as said:
+                ask()
+            self.assertEqual(str(said.exception), "the job is stopping already")
+
+    def test_a_stage_that_ends_by_itself_under_a_stop_that_queues_again_goes_on(self):
+        # The first of two stages finishes before the stop reaches its worker. The job goes on to its next stage
+        # without the request on it, so that stage's worker gets its bundle and no grace runs out on it.
+        a = self.running("a", 1, 1)
+        n = a["nomad"]
+        n["stages"] = [{"class": "breeze", "args": a["args"]}, {"class": "breeze", "args": a["args"]}]
+        self.m.cancel("a", requeue=True)
+        self.answers(a, exit_code=0, cancelled=False)
+        self.assertEqual((a["status"], n["stage"], a["paused"]), ("queued", 1, False))
+        self.assertEqual([k for k in ("cancel", "stop_at", "requeue") if n.get(k)] + [a.get("stopping")], [None])
+        self.m._schedule(10.0, [])
+        self.assertEqual(a["status"], "running")
+        with self.mock.patch.object(self.nomad.exchange, "build_bundle", lambda slug, info: b"zip"):
+            self.assertEqual(self.m.worker_bundle("a", n["key"], "laptop"), b"zip")
+        self.m._check_stop(a, 1e12)
+        self.assertEqual(a["status"], "running")
+
+        # Under a pause the job waits between its stages for the resume.
+        b = self.running("b", 2, 2)
+        m = b["nomad"]
+        m["stages"] = [{"class": "breeze", "args": b["args"]}, {"class": "breeze", "args": b["args"]}]
+        m["requeue"], m["cancel"], m["stop_at"] = "hold", True, 0.0
+        self.answers(b, exit_code=0, cancelled=False)
+        self.assertEqual((b["status"], m["stage"], b["paused"], m.get("cancel")), ("queued", 1, True, None))
+        self.m._schedule(20.0, [])
+        self.assertEqual((b["status"], self.m.wait_reasons["b"]), ("queued", "paused until you resume it"))
+        self.m.resume("b")
+        self.m._schedule(30.0, [])
+        self.assertEqual(b["status"], "running")
+
+    def test_a_paused_job_holds_no_backlog_work_back(self):
+        a = self.running("a", 1, 1)
+        self.m.pause("a")
+        self.answers(a)
+        k = self.render("k", 2, 2)
+        k["backlog"] = True
+
+        # Backlog work waits for every queued job that is not backlog work, but not for a paused one.
+        self.m._schedule(10.0, [])
+        self.assertEqual((a["status"], k["status"]), ("queued", "running"))
+
+        # Resumed, the job counts again: it starts, and the next backlog job waits for it.
+        self.m.resume("a")
+        k2 = self.render("k2", 3, 3)
+        k2["backlog"] = True
+        self.m._schedule(20.0, [])
+        self.assertEqual((a["status"], k2["status"]), ("running", "queued"))
+        self.assertTrue(self.m.wait_reasons["k2"].startswith("backlog work, waiting for"), self.m.wait_reasons["k2"])
+
+        # A paused backlog job says that it is paused, whatever else is queued.
+        self.m.jobs = {"k": k}
+        k["nomad"]["contact"] = "t"
+        self.m.pause("k")
+        self.answers(k)
+        self.render("x", 9, 9)
+        self.m._schedule(30.0, [])
+        self.assertEqual((k["status"], k["paused"], self.m.wait_reasons["k"]), ("queued", True, "paused until you resume it"))
 
 
 class EstimateTest(unittest.TestCase):
@@ -1901,6 +2194,40 @@ class EstimateTest(unittest.TestCase):
             got = self.m._forecast(0.0)
         self.assertEqual((reuse.call_count, changes.call_count), (0, 0))
         self.assertEqual((got["r0"].get("end_in"), got["r2"].get("end_in")), (None, None))
+
+    def test_the_forecast_gives_a_paused_job_and_the_job_that_waits_for_it_no_time(self):
+        from unittest import mock
+        self.render("r1", 1, 1, takes=10, paused=True)
+        self.queued("c1", 2, "check-takes", 1)
+        self.render("r2", 3, 2, takes=10)
+        with mock.patch.object(self.m, "_stage_seconds", lambda job, st, node: 100.0):
+            got = self.m._forecast(0.0)
+
+        # The paused render has no start and no end, and neither has the take check of its chapter. The render of
+        # another chapter is placed as if the paused one were not there.
+        self.assertEqual([(jid, got[jid].get("start_in"), got[jid].get("end_in")) for jid in ("r1", "c1", "r2")],
+                         [("r1", None, None), ("c1", None, None), ("r2", 0.0, 100.0)])
+
+        # Resumed, it is placed first, and the take check follows it.
+        self.m.jobs["r1"]["paused"] = False
+        with mock.patch.object(self.m, "_stage_seconds", lambda job, st, node: 100.0):
+            got = self.m._forecast(0.0)
+        self.assertEqual((got["r1"].get("start_in"), got["r1"].get("end_in"), got["c1"].get("start_in")),
+                         (0.0, 100.0, 100.0))
+
+        # Backlog work doesn't wait for a paused render, as the scheduler doesn't hold it back for one. It does
+        # wait for a queued job that is not backlog work, also for one that waits for the paused render.
+        self.m.jobs["r1"]["paused"] = True
+        for jid in ("c1", "r2"):
+            self.m.jobs.pop(jid)
+        self.render("k1", 4, 3, takes=10, backlog=True)
+        with mock.patch.object(self.m, "_stage_seconds", lambda job, st, node: 100.0):
+            got = self.m._forecast(0.0)
+        self.assertEqual((got["k1"].get("start_in"), got["k1"].get("end_in")), (0.0, 100.0))
+        self.m.jobs["c1"] = self.queued("c1", 2, "check-takes", 1)
+        with mock.patch.object(self.m, "_stage_seconds", lambda job, st, node: 100.0):
+            got = self.m._forecast(0.0)
+        self.assertEqual((got["k1"].get("start_in"), got["k1"].get("end_in")), (None, None))
 
     def test_the_snapshot_gives_each_waiting_job_its_place_in_the_forecast(self):
         import time
@@ -2524,6 +2851,739 @@ class MediaTransferTest(unittest.TestCase):
         self.assertEqual(self.m.worker_media_have("j1", "k", [])["have"], {})
 
 
+class LoopHealthTest(unittest.TestCase):
+    """What the app says of its own job loop and state files: a pass that fails, a file it can't read, the logs of
+    the records it dropped, and the files it is deployed with."""
+
+    A, B, C = "20260101-000001-aaaaaa", "20260101-000002-bbbbbb", "20260101-000003-cccccc"
+
+    def setUp(self):
+        import contextlib
+        import time
+        from unittest import mock
+        from serial_audio.web import jobs, nomad, server
+        self.contextlib, self.time, self.mock = contextlib, time, mock
+        self.jobs, self.nomad, self.server = jobs, nomad, server
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = Path(self.tmp.name) / "state"
+
+    def manager(self, cluster=False):
+        """A manager on the test's state folder, with what it printed to stderr while it loaded as m.said."""
+        said = io.StringIO()
+        with self.contextlib.redirect_stderr(said):
+            if cluster:
+                m = self.nomad.NomadJobManager(self.nomad.NomadClient("http://127.0.0.1:9", "token"),
+                                               state_dir=self.state, autostart=False)
+            else:
+                m = self.jobs.JobManager(state_dir=self.state, autostart=False)
+        self.addCleanup(m._lock_file.close)
+        m.said = said.getvalue()
+        return m
+
+    def record(self, jid, seq, status="queued", slug="demo"):
+        return {"id": jid, "kind": "screenplay", "status": status, "seq": seq, "heavy": True, "gpu": False,
+                "comfy": False, "title": f"Screenplay · ch {seq}", "slug": slug, "args": ["screenplay", slug, str(seq)],
+                "meta": {"chapters": [seq]}, "params": {}, "batch": None, "backlog": False,
+                "created": f"2026-01-01T00:00:{seq:02d}+00:00", "started": None, "finished": None, "note": None}
+
+    def test_a_pass_that_fails_shows_in_the_snapshot_until_one_completes(self):
+        m = self.manager()
+        seen = []
+
+        def tick():
+            seen.append(m.health(self.time.time()))
+            if len(seen) <= 3:
+                raise KeyError("seq")
+            m._stop.set()
+
+        said = io.StringIO()
+        with self.mock.patch.object(m, "tick", tick), self.mock.patch.object(self.jobs, "TICK_SECONDS", 0), \
+                self.contextlib.redirect_stderr(said):
+            m._loop()
+
+        # Before the first pass nothing has failed and no pass has completed. The age then counts from the start.
+        self.assertEqual((seen[0]["last_ok"], seen[0]["error"]), (None, None))
+        self.assertLess(seen[0]["age"], 60)
+
+        # A pass that fails is named in the snapshot, and it is not a pass that completed.
+        self.assertEqual((seen[1]["last_ok"], seen[1]["error"]), (None, "tick failed: KeyError: 'seq'"))
+        self.assertEqual(seen[3]["error"], "tick failed: KeyError: 'seq'")
+
+        # The failure is printed with its traceback once, not with each of the three passes.
+        self.assertEqual(said.getvalue().count("Traceback"), 1)
+        self.assertEqual(said.getvalue().count("[jobs] tick failed: KeyError: 'seq'"), 1)
+
+        # The pass that completes clears the failure and dates the loop.
+        health = m.snapshot()["tick"]
+        self.assertIsNone(health["error"])
+        self.assertIsNotNone(health["last_ok"])
+        self.assertLess(health["age"], 60)
+
+    def test_a_failure_that_cannot_say_itself_does_not_end_the_loop(self):
+        class Mute(Exception):
+            def __str__(self):
+                raise RuntimeError("no words")
+
+        m = self.manager()
+        seen = []
+
+        def tick():
+            seen.append(m.health(self.time.time())["error"])
+            if len(seen) == 1:
+                raise Mute()
+            m._stop.set()
+
+        # The failure is named by its type, and the loop goes on to its next pass.
+        said = io.StringIO()
+        with self.mock.patch.object(m, "tick", tick), self.mock.patch.object(self.jobs, "TICK_SECONDS", 0), \
+                self.contextlib.redirect_stderr(said):
+            m._loop()
+        self.assertEqual(seen, [None, "tick failed: Mute"])
+        self.assertEqual(self.jobs.said(Mute()), "Mute")
+        self.assertEqual(self.jobs.said(KeyError("seq")), "KeyError: 'seq'")
+
+    def test_a_job_that_fails_after_it_started_still_counts_as_running_in_its_pass(self):
+        m = self.manager(cluster=True)
+        m.workers = [worker("arch", ["llm"], "linux")]
+        m.nomad_state["up"] = True
+        ids = [self.A, self.B, self.C, "20260101-000004-dddddd"]
+        for seq, jid in enumerate(ids, 1):
+            m.jobs[jid] = self.record(jid, seq, slug=f"serial-{seq}")
+
+        def handed(job, node):
+            if job["id"] == self.A:
+                raise KeyError("target")
+            return False
+
+        # The first job is marked as started before the pass fails at it. It takes one of the places for Claude
+        # jobs, so the pass starts two more and the fourth waits.
+        dispatch = []
+        with self.mock.patch.object(m, "_handed", handed), self.contextlib.redirect_stderr(io.StringIO()):
+            m._schedule(1.0, dispatch)
+        self.assertEqual([m.jobs[jid]["status"] for jid in ids], ["running", "running", "running", "queued"])
+        self.assertEqual(m.wait_reasons[ids[3]], f"waiting for a running Claude job to finish, {self.nomad.LLM_SLOTS} "
+                                                 f"run at once")
+        self.assertEqual(dispatch, [self.B, self.C])
+        self.assertIn("the pass could not place", m.snapshot()["tick"]["error"])
+
+    def test_a_job_the_pass_cannot_place_waits_and_the_others_start(self):
+        m = self.manager(cluster=True)
+        m.workers = [worker("arch", ["llm"], "linux")]
+        m.nomad_state["up"] = True
+        bad, good = self.record(self.A, 1), self.record(self.B, 2, slug="other")
+        m.jobs.update({self.A: bad, self.B: good})
+        real = m._blocker_for
+
+        def blocker(job, lane, running):
+            if job is bad:
+                raise KeyError("stages")
+            return real(job, lane, running)
+
+        # The job that the pass fails at stays queued with the failure as its wait. Nothing fails for it, and the
+        # job after it starts.
+        said, dispatch = io.StringIO(), []
+        with self.mock.patch.object(m, "_blocker_for", blocker), self.contextlib.redirect_stderr(said):
+            m._schedule(1.0, dispatch)
+            m._schedule(2.0, [])
+        self.assertEqual((bad["status"], good["status"]), ("queued", "running"))
+        self.assertEqual(dispatch, [self.B])
+        self.assertEqual(m.wait_reasons[self.A], "the app could not work out whether it can start: KeyError: 'stages'")
+
+        # The snapshot names the failure, and two passes print one traceback.
+        self.assertEqual(m.snapshot()["tick"]["error"],
+                         "the pass could not place Screenplay · ch 1: KeyError: 'stages'")
+        self.assertEqual(said.getvalue().count("Traceback"), 1)
+
+        # A pass that places every job clears the failure, and the job starts.
+        m._schedule(3.0, dispatch)
+        self.assertIsNone(m.snapshot()["tick"]["error"])
+        self.assertEqual((bad["status"], dispatch), ("running", [self.B, self.A]))
+
+    def test_an_unreadable_job_list_is_kept_aside_and_its_copy_is_loaded(self):
+        m = self.manager()
+        m.jobs[self.A] = self.record(self.A, 1)
+        m.paused = True
+        m._save()
+        m._lock_file.close()
+        main, copy, aside = (self.state / name for name in ("jobs.json", "jobs.json.bak", "jobs.json.unreadable"))
+        self.assertEqual(copy.read_text(encoding="utf-8"), main.read_text(encoding="utf-8"))
+        log = self.state / "jobs" / f"{self.C}.log"
+        log.write_text("the log of a job whose record is gone", encoding="utf-8")
+
+        # A file that was cut short is kept aside. The app starts with its copy, says so in the snapshot and on
+        # stderr, and writes the file again. It removes no log on such a start.
+        main.write_text('{"paused": true, "jobs": [{"id": "2026', encoding="utf-8")
+        again = self.manager()
+        self.assertEqual((list(again.jobs), again.paused), ([self.A], True))
+        self.assertEqual(len(again.notices), 1)
+        self.assertIn("jobs.json could not be read (JSONDecodeError", again.notices[0])
+        self.assertIn("so the app loaded its copy of 20", again.notices[0])
+        self.assertTrue(again.notices[0].endswith("The file is kept as jobs.json.unreadable."))
+        self.assertIn(again.notices[0], again.said)
+        self.assertEqual(again.snapshot()["notices"], again.notices)
+        self.assertTrue(aside.read_text(encoding="utf-8").endswith('"2026'))
+        self.assertEqual([j["id"] for j in json.loads(main.read_text(encoding="utf-8"))["jobs"]], [self.A])
+        self.assertTrue(log.is_file())
+        again._lock_file.close()
+
+        # While the file that was kept aside is there, each later start says so and removes no log, because
+        # that file names jobs whose logs are the only other record of them.
+        later = self.manager()
+        self.assertEqual(later.notices, ["jobs.json.unreadable is still there from a start that could not read "
+                                         "jobs.json. Remove it when you have looked at it."])
+        self.assertEqual(list(later.jobs), [self.A])
+        self.assertTrue(log.is_file())
+        later._lock_file.close()
+
+        # With no copy that can be read either, the app starts with an empty queue, says so, and keeps the file
+        # and the logs.
+        main.write_text("", encoding="utf-8")
+        copy.write_text("[1, 2]", encoding="utf-8")
+        third = self.manager()
+        self.assertEqual(third.jobs, {})
+        self.assertIn("and no copy of it can, so the app started without it", third.notices[0])
+        self.assertEqual(aside.read_text(encoding="utf-8"), "")
+        self.assertTrue(log.is_file())
+        third._lock_file.close()
+
+        # A start that finds no job list beside the file that was kept aside still says that the file is there.
+        self.assertFalse(main.exists())
+        fourth = self.manager()
+        self.assertEqual((fourth.jobs, len(fourth.notices)), ({}, 1))
+        self.assertIn("jobs.json.unreadable is still there", fourth.notices[0])
+        fourth._lock_file.close()
+
+        # A state folder without either file is a new one, and the app says nothing.
+        aside.unlink()
+        fifth = self.manager()
+        self.assertEqual((fifth.jobs, fifth.notices, fifth.said), ({}, [], ""))
+
+    def test_an_unreadable_placement_file_gives_its_copy_with_the_holds(self):
+        m = self.manager(cluster=True)
+        m.workers = [worker("mac", ["breeze"], "darwin", "metal")]
+        m.hold_node("mac", True)
+        m._lock_file.close()
+        (self.state / "placement.json").write_text("{", encoding="utf-8")
+
+        again = self.manager(cluster=True)
+        self.assertEqual(list(again._holds()), ["mac"])
+        self.assertIn("placement.json could not be read", again.notices[0])
+        self.assertEqual((self.state / "placement.json.unreadable").read_text(encoding="utf-8"), "{")
+
+        # The file is written again from the copy at once, so the holds also stand after the next start.
+        self.assertEqual(list(json.loads((self.state / "placement.json").read_text(encoding="utf-8"))["held"]), ["mac"])
+        again._lock_file.close()
+        third = self.manager(cluster=True)
+        self.assertEqual(list(third._holds()), ["mac"])
+        self.assertIn("placement.json.unreadable is still there", third.notices[0])
+
+    def test_the_kept_copy_of_a_state_file_is_written_again_when_it_is_old(self):
+        path = Path(self.tmp.name) / "x.json"
+        copy = self.jobs.kept_copy(path)
+
+        # The first write makes the copy, and a write soon after leaves it, so the copy is of a file that the
+        # system has long written to its disk.
+        self.jobs.write_state(path, '{"n": 1}')
+        self.jobs.write_state(path, '{"n": 2}')
+        self.assertEqual((path.read_text(encoding="utf-8"), copy.read_text(encoding="utf-8")), ('{"n": 2}', '{"n": 1}'))
+
+        # A copy that is KEPT_EVERY seconds old is written again, and no temporary file stays.
+        old = self.time.time() - self.jobs.KEPT_EVERY - 1
+        os.utime(copy, (old, old))
+        self.jobs.write_state(path, '{"n": 3}')
+        self.assertEqual(copy.read_text(encoding="utf-8"), '{"n": 3}')
+        self.assertEqual(sorted(p.name for p in path.parent.iterdir() if p.is_file()), ["x.json", "x.json.bak"])
+
+        # What is in the file but is no object counts as unreadable, like a file that does not parse.
+        path.write_text("[]", encoding="utf-8")
+        data, note = self.jobs.read_state(path)
+        self.assertEqual(data, {"n": 3})
+        self.assertIn("x.json could not be read (ValueError: it does not hold a JSON object)", note)
+
+    def test_a_dropped_record_takes_its_log_and_a_start_sweeps_the_logs_without_one(self):
+        m = self.manager()
+        ids = [self.A, self.B, self.C]
+        for seq, jid in enumerate(ids, 1):
+            m.jobs[jid] = self.record(jid, seq, status="done")
+            m.log_path(m.jobs[jid]).write_text("log", encoding="utf-8")
+            m.log_path(m.jobs[jid]).with_suffix(".exit").write_text("{}", encoding="utf-8")
+
+        # The save that drops the oldest finished record removes its log and its exit file, and no other.
+        with self.mock.patch.object(self.jobs, "KEEP_FINISHED", 2):
+            m._save()
+        self.assertEqual(sorted(m.jobs), ids[1:])
+        self.assertEqual(sorted(p.name for p in m.log_dir.iterdir()),
+                         [f"{jid}{suffix}" for jid in ids[1:] for suffix in (".exit", ".log")])
+
+        # With SWEEP_LOGS off, a start leaves the log and the exit file that have no record, as older code left
+        # them.
+        left = ["20251231-235959-ffffff.exit", "20251231-235959-ffffff.log"]
+        for name in left + ["notes.txt"]:
+            (m.log_dir / name).write_text("x", encoding="utf-8")
+        m._lock_file.close()
+        with self.mock.patch.object(self.jobs, "SWEEP_LOGS", False):
+            off = self.manager()
+        self.assertEqual(off.said, "")
+        self.assertEqual(sorted(p.name for p in off.log_dir.iterdir())[:2], left)
+        off._lock_file.close()
+
+        # The switch is on, so a start removes them. A file that is not a job's stays, and so do the files of
+        # the records.
+        self.assertTrue(self.jobs.SWEEP_LOGS)
+        again = self.manager()
+        self.assertIn("removed 2 log and exit file(s) of jobs that have no record", again.said)
+        self.assertEqual(sorted(p.name for p in again.log_dir.iterdir()),
+                         [f"{jid}{suffix}" for jid in ids[1:] for suffix in (".exit", ".log")] + ["notes.txt"])
+
+        # Clearing the finished jobs removes their logs, as it did.
+        self.assertEqual(again.clear_finished(), 2)
+        self.assertEqual([p.name for p in again.log_dir.iterdir()], ["notes.txt"])
+
+    def test_the_save_keeps_the_jobs_that_finished_last(self):
+        m = self.manager()
+        # the job that was queued first finished last
+        for seq, (jid, finished) in enumerate(((self.A, "2026-01-02T10:00:00+00:00"),
+                                               (self.B, "2026-01-02T05:00:00+00:00"),
+                                               (self.C, "2026-01-02T06:00:00+00:00")), 1):
+            m.jobs[jid] = {**self.record(jid, seq, status="done"), "finished": finished}
+            m.log_path(m.jobs[jid]).write_text("log", encoding="utf-8")
+
+        # The record that goes is the one that finished first, so a job that waited long keeps its record and
+        # its log past the save of its own end.
+        with self.mock.patch.object(self.jobs, "KEEP_FINISHED", 2):
+            m._save()
+        self.assertEqual(sorted(m.jobs), [self.A, self.C])
+        self.assertEqual(sorted(p.name for p in m.log_dir.iterdir()), [f"{self.A}.log", f"{self.C}.log"])
+
+    def test_a_record_of_older_code_gets_the_fields_the_loop_reads(self):
+        self.state.mkdir(parents=True)
+        (self.state / "jobs.json").write_text(json.dumps({"paused": False, "jobs": [
+            {"id": self.A, "kind": "screenplay", "status": "queued"}, {"kind": "render", "status": "queued"},
+            "not a record"]}), encoding="utf-8")
+        m = self.manager(cluster=True)
+
+        # The record without the later fields has them, and what is no job record is left out and counted.
+        job = m.jobs[self.A]
+        self.assertEqual((job["seq"], job["heavy"], job["args"], job["meta"], job["title"], job["batch"]),
+                         (0, False, [], {}, "screenplay", None))
+        self.assertEqual(list(m.jobs), [self.A])
+        self.assertEqual(m.notices, ["2 record(s) in jobs.json are not jobs and were left out"])
+
+        # A pass and a snapshot read the record without a failure.
+        m.workers = [worker("arch", ["llm"], "linux")]
+        m.nomad_state["up"] = True
+        m._schedule(1.0, [])
+        self.assertEqual((job["status"], m.snapshot()["tick"]["error"]), ("running", None))
+
+    def test_a_dropped_connection_prints_no_traceback_and_a_fault_of_the_app_does(self):
+        srv = self.server.Server.__new__(self.server.Server)
+        said = io.StringIO()
+        with self.contextlib.redirect_stderr(said):
+            # A client that resets, closes or lets its connection time out is no fault of the app.
+            for gone in (ConnectionResetError(104, "Connection reset by peer"), BrokenPipeError(32, "Broken pipe"),
+                         ConnectionAbortedError(10053, "aborted"), TimeoutError("timed out")):
+                try:
+                    raise gone
+                except OSError:
+                    srv.handle_error(None, ("100.64.0.1", 40000))
+            self.assertEqual(said.getvalue(), "")
+
+            # Any other exception of a request is printed as before.
+            try:
+                raise ValueError("a fault")
+            except ValueError:
+                srv.handle_error(None, ("100.64.0.1", 40000))
+            self.assertIn("ValueError: a fault", said.getvalue())
+
+            # A connection that times out before its first request has no command, and logging that is quiet.
+            before = said.getvalue()
+            self.server.Handler.__new__(self.server.Handler).log_message("Request timed out: %r", "x")
+            self.assertEqual(said.getvalue(), before)
+
+    def test_the_app_lists_the_files_it_is_deployed_with(self):
+        root = make_root(Path(self.tmp.name) / "root")
+        cache = root / "serial_audio" / "__pycache__"
+        cache.mkdir()
+        (cache / "x.cpython-313.pyc").write_bytes(b"x")
+
+        # Every file of the code, the prompts and the schemas is listed by its hash, with the front end, and
+        # without caches and AppleDouble files.
+        files = exchange.deployed_files(root)
+        self.assertEqual(sorted(files), ["prompts/p.md", "schemas/s.json", "serial_audio/__init__.py",
+                                         "serial_audio/web/static/app.js"])
+        self.assertEqual(files["prompts/p.md"], hashlib.sha256(b"p").hexdigest())
+
+        # The code a worker gets still leaves the front end out, so a change to the page ends no worker's task.
+        self.assertNotIn("serial_audio/web/static/app.js", [rel for rel, _ in exchange.code_files(root)])
+
+        # GET /api/version answers with the code's version and that list.
+        sent = []
+        handler = type("H", (), {"_send_json": lambda self, data: sent.append(data)})()
+        with self.mock.patch.object(exchange, "code_version", lambda: "c0de"), \
+                self.mock.patch.object(exchange, "deployed_files", lambda: {"a.py": "hash"}):
+            self.server.get_version(handler, {})
+        self.assertEqual(sent, [{"code": "c0de", "files": {"a.py": "hash"}}])
+        self.assertIn((r"/api/version", self.server.get_version), self.server.GET_ROUTES)
+
+
+class MediaPruneTest(unittest.TestCase):
+    """The prune of the app's media mirror: which copies go, which stay, and when it removes nothing."""
+
+    DAY = 86400.0
+
+    def setUp(self):
+        import time
+        self.now = time.time()
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        base = Path(self.tmp.name)
+        self.library, self.media = base / "library", base / "state" / "media"
+        serial = self.library / "demo"
+        self.takes = serial / "chapters" / "0001" / exchange.TAKES_FILE
+        files = {
+            serial / "serial.yaml": "title: Demo\n",
+            # the takes of chapter 1 moved from the laptop to the Mac, so the record names the Mac's files
+            self.takes: json.dumps({"takes": {"0": {"file": "/Users/aj/out/breeze/demo/ch0001/000.wav"},
+                                              "1": {"file": "/Users/aj/out/breeze/demo/ch0001/001.wav"}}}),
+            serial / "voices" / "hero.yaml": (
+                "candidates:\n- {seed: 2, clip: 'D:\\out\\cast\\demo\\hero_2.flac'}\n"
+                "history:\n- candidates:\n  - {seed: 1, clip: 'D:\\out\\cast\\demo\\hero_1.flac', "
+                "voice_file: 'D:\\out\\cast\\demo\\hero_1.safetensors'}\n"),
+            serial / "voices" / "_briefs.yaml": "hero: a brief\n",
+            serial / "bible" / "pronunciations.yaml": (
+                "Aeol:\n  options:\n    candidates:\n    - {say: Ay-ohl, clip: /home/aj/out/say/demo/aeol_1.wav}\n"),
+        }
+        for path, text in files.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        self.named = ["Users/aj/out/breeze/demo/ch0001/000.wav", "Users/aj/out/breeze/demo/ch0001/001.wav",
+                      "D/out/cast/demo/hero_2.flac", "D/out/cast/demo/hero_1.flac", "D/out/cast/demo/hero_1.safetensors",
+                      "home/aj/out/say/demo/aeol_1.wav"]
+        # the laptop's copies of the takes that moved, a take a worker sent ahead of its result, an upload that
+        # was cut short long ago, and the audio of a serial that is gone
+        self.left = ["D/out/breeze/demo/ch0001/000.wav", "D/out/breeze/demo/ch0001/001.wav",
+                     "D/out/cast/demo/hero_0.flac.123.part", "D/out/breeze/gone/ch0002/000.wav"]
+        self.young = ["Users/aj/out/breeze/demo/ch0002/000.wav"]
+        # a file that is no audio of the mirror, which a prune leaves whatever its age
+        self.other = ["D/out/cast/demo/notes.txt"]
+        for rel in self.named + self.left + self.young + self.other:
+            path = self.media / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"audio" * 10)
+            age = 1 if rel in self.young else 30
+            os.utime(path, (self.now - age * self.DAY, self.now - age * self.DAY))
+
+    def held(self):
+        return sorted(p.relative_to(self.media).as_posix() for p in self.media.rglob("*") if p.is_file())
+
+    def test_the_prune_removes_the_old_copies_that_no_serial_names(self):
+        before = self.now - 7 * self.DAY
+
+        # A dry run counts what a run would remove, and removes nothing.
+        report = exchange.prune_media(self.media, self.library, before=before, dry_run=True)
+        self.assertEqual(report, {"removed": 4, "bytes": 200, "named": 6, "young": 1, "other": 1, "folders": 0})
+        self.assertEqual(self.held(), sorted(self.named + self.left + self.young + self.other))
+
+        # A run removes the copies that no record names, and keeps every file a voice record, its history, a
+        # takes file or an option names, the file that is too young to go, and the file that is no audio.
+        report = exchange.prune_media(self.media, self.library, before=before)
+        self.assertEqual({k: report[k] for k in ("removed", "bytes", "named", "young", "other")},
+                         {"removed": 4, "bytes": 200, "named": 6, "young": 1, "other": 1})
+        self.assertEqual(self.held(), sorted(self.named + self.young + self.other))
+
+        # The folders it emptied are gone, up to the first that still holds something, and no other.
+        self.assertEqual(report["folders"], 5)
+        self.assertFalse((self.media / "D" / "out" / "breeze").exists())
+        self.assertTrue((self.media / "D" / "out" / "cast" / "demo").is_dir())
+
+        # A second run finds nothing to remove.
+        self.assertEqual(exchange.prune_media(self.media, self.library, before=before)["removed"], 0)
+
+    def test_the_prune_leaves_a_copy_that_a_worker_was_told_the_app_holds(self):
+        from serial_audio.web import nomad
+        before = self.now - 7 * self.DAY
+        state = self.media.parent
+        m = nomad.NomadJobManager(nomad.NomadClient("http://127.0.0.1:9", "token"), state_dir=state, autostart=False)
+        self.addCleanup(m._lock_file.close)
+        m.jobs["j1"] = {"id": "j1", "kind": "render", "slug": "demo", "status": "running",
+                        "nomad": {"key": "k", "stage": 0, "stages": [{"class": "breeze", "args": []}]}}
+
+        # Chapter 1 is back on the laptop, whose worker asks which of its takes the app holds. The app holds
+        # both, with the audio the laptop has, so the worker sends neither and the copies keep their contents.
+        back = self.left[:2]
+        was = {rel: hashlib.sha256((self.media / rel).read_bytes()).hexdigest() for rel in back}
+        self.assertEqual(m.worker_media_have("j1", "k", back + ["D/out/breeze/demo/ch0001/999.wav"])["have"], was)
+
+        # The app dated the two as of now when it answered, so a prune that runs before the result names them
+        # counts them as young and leaves them. The copies nobody asked about still go.
+        for rel in back:
+            self.assertGreater((self.media / rel).stat().st_mtime, self.now - 60)
+        report = exchange.prune_media(self.media, self.library, before=before)
+        self.assertEqual((report["removed"], report["young"]), (2, 3))
+        self.assertEqual(self.held(), sorted(self.named + back + self.young + self.other))
+
+        # The hash the app keeps for a dated file is still the file's, and a file of the last hours keeps its
+        # date, which no prune reaches.
+        self.assertEqual({rel: exchange.sha256_file(self.media / rel) for rel in back}, was)
+        fresh = self.media / self.young[0]
+        os.utime(fresh, (self.now - 3600, self.now - 3600))
+        dated = fresh.stat().st_mtime
+        exchange.confirm_held(fresh)
+        self.assertEqual(fresh.stat().st_mtime, dated)
+
+    def test_the_prune_removes_nothing_when_it_cannot_tell_what_is_named(self):
+        before, everything = self.now - 7 * self.DAY, sorted(self.named + self.left + self.young + self.other)
+
+        # A takes file that does not parse names nothing that can be trusted, so the whole prune is refused.
+        good = self.takes.read_text(encoding="utf-8")
+        self.takes.write_text(good[:40], encoding="utf-8")
+        with self.assertRaises(exchange.ExchangeError) as raised:
+            exchange.prune_media(self.media, self.library, before=before)
+        self.assertIn("breeze_takes.json can't be read", str(raised.exception))
+        self.assertEqual(self.held(), everything)
+        self.takes.write_text(good, encoding="utf-8")
+
+        # So is it for a voice record that does not parse, while a worker that asks what to send passes it over.
+        voice = self.library / "demo" / "voices" / "hero.yaml"
+        good = voice.read_text(encoding="utf-8")
+        voice.write_text("candidates: [", encoding="utf-8")
+        with self.assertRaises(exchange.ExchangeError):
+            exchange.prune_media(self.media, self.library, before=before)
+        self.assertEqual(self.held(), everything)
+        self.assertEqual(len(exchange.named_media(self.library / "demo")), 3)
+        voice.write_text(good, encoding="utf-8")
+
+        # A record that parses and is built another way than the prune reads it is refused too, where a worker
+        # reads what it can of it.
+        options = self.library / "demo" / "bible" / "pronunciations.yaml"
+        for path, text, why in ((voice, "candidates: abc\n", "the candidates of the voice are not a list"),
+                                (voice, "history: [null]\n", "a batch of its history is not a mapping"),
+                                (options, "Aeol:\n  options: [1]\n", "the options of Aeol are not a mapping"),
+                                (self.takes, '{"takes": {"0": {"file": 7}}}', "the file of take 0 is not text")):
+            kept = path.read_text(encoding="utf-8")
+            path.write_text(text, encoding="utf-8")
+            with self.assertRaises(exchange.ExchangeError) as raised:
+                exchange.prune_media(self.media, self.library, before=before)
+            self.assertIn(why, str(raised.exception))
+            exchange.named_media(self.library / "demo")
+            path.write_text(kept, encoding="utf-8")
+        self.assertEqual(self.held(), everything)
+
+        # A library folder without a serial is one whose disk is not there, and nothing is removed for it.
+        empty = Path(self.tmp.name) / "empty"
+        empty.mkdir()
+        for library in (empty, Path(self.tmp.name) / "missing"):
+            with self.assertRaises(exchange.ExchangeError):
+                exchange.prune_media(self.media, library, before=before)
+        self.assertEqual(self.held(), everything)
+
+        # A mirror that is the library, holds it or lies in it is refused, so a wrong folder loses no record.
+        for media in (self.library, self.library.parent, self.library / "demo"):
+            with self.assertRaises(exchange.ExchangeError) as raised:
+                exchange.prune_media(media, self.library, before=before, dry_run=True)
+            self.assertIn("are not apart", str(raised.exception))
+
+    def test_the_prune_runs_as_a_job_of_the_app(self):
+        import contextlib
+        from unittest import mock
+        from serial_audio import cli, library, machine
+        from serial_audio.web import jobs
+
+        # The request becomes a quick job on the app's machine, for no serial, that keeps a week by default.
+        built = jobs.build("prune-media", {"dry_run": True})
+        self.assertEqual((built["args"], built["heavy"], built["slug"]), (["prune-media", "--days", "7", "--dry-run"],
+                                                                         False, None))
+        self.assertEqual(jobs.build("prune-media", {"days": 30})["args"], ["prune-media", "--days", "30"])
+        self.assertIsNone(job_stages({"kind": "prune-media", "args": built["args"]}))
+        with self.assertRaises(ValueError):
+            jobs.build("prune-media", {"days": 0})
+
+        # The command reads the mirror the app names for its jobs, and its log says what went and what stayed.
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(machine, "MEDIA_MIRROR", self.media), mock.patch.object(library, "LIBRARY", self.library), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(cli.main(["prune-media", "--dry-run"]), 0)
+            self.assertEqual(cli.main(["prune-media"]), 0)
+            self.assertEqual(cli.main(["prune-media", "--days", "0"]), 2)
+        self.assertIn("would remove 4 file(s) that no serial names", out.getvalue())
+        self.assertIn("removed 4 file(s) that no serial names", out.getvalue())
+        self.assertIn("kept 6 that the library names, and 1 that it doesn't name", out.getvalue())
+        self.assertIn("left 1 file(s) that are not audio of the mirror", out.getvalue())
+        self.assertEqual(self.held(), sorted(self.named + self.young + self.other))
+        self.assertIn("--days must be 1 or more", err.getvalue())
+
+        # Without a mirror the command removes nothing and says why.
+        with mock.patch.object(machine, "MEDIA_MIRROR", None), contextlib.redirect_stderr(err):
+            self.assertEqual(cli.main(["prune-media"]), 2)
+        self.assertIn("keeps no media mirror", err.getvalue())
+
+
+class KindsTest(unittest.TestCase):
+    """The one entry of each job kind: the groups the queue's rules read from it, its marker and its builder."""
+
+    def test_each_group_of_kinds_has_the_members_the_rules_were_written_for(self):
+        from serial_audio.web import jobs, kinds, nomad
+        # The sets that jobs.py and nomad.py read are made from the entries. These are the members each had
+        # when it was a list of its own, so a changed entry shows here as the rule it changes.
+        self.assertEqual(jobs.HEAVY, {"render", "cast", "bios", "check-takes", "character-pass", "screenplay",
+                                      "say-options", "look-pass", "draw"})
+        self.assertEqual(jobs.BIBLE_WRITERS, {"character-pass", "cast", "bios"})
+        self.assertEqual(jobs.STARTS_COMFY, {"draw"})
+        self.assertEqual(jobs.SERIAL_WRITERS, {"voice-effect"})
+        self.assertEqual(jobs.RENDER_NEUTRAL, {"render", "say-options"})
+        self.assertEqual(jobs.BACKLOG_BESIDE, frozenset({"render", "check-takes"}))
+        self.assertEqual(nomad.LLM_KINDS, {"character-pass", "screenplay", "bios", "look-pass"})
+        self.assertEqual(nomad.LOOK_KINDS, {"look-pass", "draw", "pick-image"})
+        self.assertEqual(nomad.SERIAL_WIDE, {"character-pass", "cast", "bios", "reset-bible", "pick-voice", "fetch",
+                                             "say-as", "voice-effect", "say-options"})
+        self.assertEqual(nomad.CONFIG_WRITERS, {"cast", "bios", "pick-voice", "say-as", "voice-effect", "say-options"})
+        self.assertEqual(nomad.CHAPTER_KINDS, {"render", "screenplay", "check-takes"})
+        self.assertEqual(nomad.NO_CHAPTER_INPUT, {"say-options", "look-pass", "draw", "pick-image"})
+        self.assertEqual(nomad.NO_SCRIPT_INPUT, {"cast", "bios", "pick-voice", "voice-effect"})
+        self.assertEqual(nomad.VOICE_READERS, {"render", "check-takes"})
+        self.assertEqual(nomad.SYNC_KIND, kinds.SYNC)
+        for no_flag in ("no_such_flag", "marker", "stages", "__doc__"):
+            with self.assertRaises(AttributeError):
+                kinds.having(no_flag)
+
+    def test_every_kind_has_an_entry_and_a_builder(self):
+        from serial_audio.web import jobs, kinds, nomad
+        # A kind the app can queue has an entry and a builder. The sync job is built by the cluster's manager,
+        # which knows the nodes, so it has an entry alone.
+        self.assertEqual(set(jobs.BUILDERS), set(kinds.KINDS) - {kinds.SYNC})
+        with self.assertRaises(ValueError) as raised:
+            jobs.build("no-such-kind", {})
+        self.assertEqual(str(raised.exception), "unknown job kind 'no-such-kind'")
+        with self.assertRaises(ValueError):
+            jobs.build(kinds.SYNC, {"slug": "demo", "node": "laptop"})
+
+        # A kind without stages runs on the app's machine, and a kind that no entry names has none either.
+        on_the_app = {name for name, kind in kinds.KINDS.items() if kind.stages is None}
+        self.assertEqual(on_the_app, {"pick-image", "pick-voice", "say-as", "voice-effect", "fetch", "add-royalroad",
+                                      "add-epub", "reset-bible", "prune-media"})
+        for name in sorted(on_the_app) + ["no-such-kind"]:
+            self.assertIsNone(nomad.job_stages({"kind": name, "args": [name]}), name)
+        with self.assertRaises(KeyError):
+            nomad.job_stages({"kind": "render"})
+
+    def test_a_kinds_marker_names_its_prompts_for_the_app_and_for_a_worker(self):
+        from serial_audio import worker
+        from serial_audio.web import kinds
+        expected = {"render": "demo/ch0007", "check-takes": "breeze/demo/ch0007/", "cast": "cast/demo/",
+                    "draw": "images/demo/"}
+        for name in kinds.KINDS:
+            # The app and the worker of a job get the same text, and None for a kind that queues no prompt.
+            self.assertEqual(kinds.comfy_marker(name, "demo", [7, 8]), expected.get(name), name)
+            self.assertEqual(worker.comfy_marker({"kind": name, "slug": "demo", "chapters": [7, 8]}),
+                             expected.get(name), name)
+
+        # A marker that names a chapter needs one, and a kind that nobody declared has no marker.
+        self.assertIsNone(kinds.comfy_marker("render", "demo", []))
+        self.assertIsNone(worker.comfy_marker({"kind": "check-takes", "slug": "demo"}))
+        self.assertEqual(worker.comfy_marker({"kind": "cast", "slug": "demo"}), "cast/demo/")
+        self.assertIsNone(kinds.comfy_marker(None, "demo", [7]))
+        self.assertIsNone(kinds.comfy_marker("no-such-kind", "demo", [7]))
+
+
+class RecordFieldsTest(unittest.TestCase):
+    """The fields the app's code reads or writes on a job record are declared in records.py. The scan knows a
+    record by the names in JOBS, and its nomad part by the name n, in the modules of FILES."""
+
+    JOBS = {"job", "j", "other", "o", "first", "twin", "waiting", "gave", "old", "last", "earlier", "writer", "same",
+            "later", "asked"}
+    FILES = ("jobs.py", "nomad.py", "server.py")
+
+    def kind(self, node, ast):
+        """"job" or "nomad" for an expression that is a job record or its nomad part by its name, else None."""
+        if isinstance(node, ast.Name):
+            return "job" if node.id in self.JOBS else "nomad" if node.id == "n" else None
+        if isinstance(node, ast.Subscript) and self.kind(node.value, ast) == "job" and self.text(node.slice, ast) == "nomad":
+            return "nomad"
+        if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get"
+                and self.kind(node.func.value, ast) == "job" and node.args and self.text(node.args[0], ast) == "nomad"):
+            return "nomad"
+        if isinstance(node, ast.BoolOp):
+            return self.kind(node.values[0], ast)
+        return None
+
+    @staticmethod
+    def text(node, ast):
+        return node.value if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+    def used(self, tree, ast):
+        """{"job" or "nomad": {field: the first line that uses it}} for one module's syntax tree."""
+        found = {"job": {}, "nomad": {}}
+
+        def note(kind, key, line):
+            if kind and key:
+                found[kind].setdefault(key, line)
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Subscript):
+                note(self.kind(node.value, ast), self.text(node.slice, ast), node.lineno)
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+                kind = self.kind(node.func.value, ast)
+                if node.func.attr in ("get", "pop", "setdefault") and node.args:
+                    note(kind, self.text(node.args[0], ast), node.lineno)
+                elif node.func.attr == "update" and node.args and isinstance(node.args[0], ast.Dict):
+                    for key in node.args[0].keys:
+                        note(kind, key is not None and self.text(key, ast), node.lineno)
+            elif isinstance(node, ast.Assign) and isinstance(node.value, ast.Dict):
+                for target in node.targets:
+                    for key in node.value.keys:
+                        note(self.kind(target, ast), key is not None and self.text(key, ast), node.lineno)
+        return found
+
+    def test_the_code_uses_no_field_of_a_job_record_that_is_not_declared(self):
+        import ast
+        from serial_audio.web import records
+        web = Path(records.__file__).parent
+        # a name of JOBS also holds the kept attempt of a job that gave way, and n also holds a node's summary
+        declared = {"job": set(records.Job.__annotations__) | set(records.GaveWay.__annotations__),
+                    "nomad": set(records.NomadPart.__annotations__) | set(records.NodeSummary.__annotations__)}
+        undeclared = []
+        for name in self.FILES:
+            found = self.used(ast.parse((web / name).read_text(encoding="utf-8")), ast)
+            undeclared += [f"{name}:{line} {kind} field {key!r}" for kind in found
+                           for key, line in sorted(found[kind].items()) if key not in declared[kind]]
+        self.assertEqual(undeclared, [], "declare the field in serial_audio/web/records.py with what it means")
+
+        # The scan reads the fields that the modules do use, so an empty answer above means what it says.
+        found = self.used(ast.parse((web / "nomad.py").read_text(encoding="utf-8")), ast)
+        self.assertLessEqual({"status", "kind", "nomad", "seq", "backlog"}, set(found["job"]))
+        self.assertLessEqual({"key", "stage", "stages", "cancel", "contact", "target"}, set(found["nomad"]))
+        made = self.used(ast.parse('job["one"] = 1\nn.update({"two": 2})\njob["nomad"].get("three")\n'
+                                   'other = {"four": 4}\nprint(f"{j.get(\'five\')}")\n'), ast)
+        self.assertEqual((sorted(made["job"]), sorted(made["nomad"])), (["five", "four", "nomad", "one"],
+                                                                        ["three", "two"]))
+
+    def test_the_snapshot_shows_a_job_with_declared_fields_only(self):
+        from serial_audio.web import nomad, records
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        m = nomad.NomadJobManager(nomad.NomadClient("http://127.0.0.1:9", "token"), state_dir=Path(tmp.name),
+                                  autostart=False)
+        self.addCleanup(m._lock_file.close)
+        m.workers = [worker("arch", ["llm"], "linux")]
+        m.nomad_state["up"] = True
+        for seq, jid in enumerate(("a", "b"), 1):
+            m.jobs[jid] = {"id": jid, "kind": "screenplay", "status": "queued", "seq": seq, "heavy": True,
+                           "gpu": False, "comfy": False, "title": jid, "slug": f"s{seq}", "meta": {"chapters": [1]},
+                           "args": ["screenplay", f"s{seq}", "1"], "params": {}, "batch": None, "backlog": False,
+                           "created": "2026-01-01T00:00:00+00:00", "started": None, "finished": None, "note": None}
+        m._schedule(1.0, [])
+
+        # A job that a pass started has its nomad part, and the snapshot shows it without the key.
+        shown = m.snapshot()
+        for item in shown["jobs"]:
+            self.assertEqual(set(item) - set(records.JobView.__annotations__), set(), item["id"])
+            self.assertEqual(set(item["nomad"]) - set(records.NomadPart.__annotations__), set(), item["id"])
+            self.assertNotIn("key", item["nomad"])
+        for node in shown["workers"]:
+            self.assertEqual(set(node) - set(records.NodeSummary.__annotations__), set())
+
+
 class KeyAndLockTest(unittest.TestCase):
     def test_a_strange_key_is_refused_without_raising(self):
         from serial_audio.web.nomad import _key_ok
@@ -3037,6 +4097,180 @@ class BiosJobTest(unittest.TestCase):
         self.assertFalse(conflicts(job("bios"), job("fetch")))
         self.assertFalse(conflicts(job("fetch"), job("bios")))
         self.assertTrue(conflicts(job("cast"), job("fetch")))
+
+
+class PagePayloadTest(unittest.TestCase):
+    """What the app sends the page: gzip for a client that takes it, a validator on a serial's pages and the
+    slim state."""
+
+    def setUp(self):
+        import threading
+
+        from serial_audio.web import server
+
+        record = {"node": "dev-arch", "target": "dev-arch", "dispatched_at": "2026-11-18T14:36:00-05:00",
+                  "requeue": "hold", "stages": [{"class": "breeze", "args": ["render"] * 40}], "reports": ["r"] * 40}
+        self.jobs = [
+            {"id": "a", "kind": "render", "status": "running", "title": "Render", "args": ["render", "demo", "7"],
+             "params": {"slug": "demo", "chapter": 7}, "meta": {"chapters": [7]}, "pausable": True, "nomad": record},
+            {"id": "b", "kind": "render", "status": "queued", "title": "Render", "args": ["x"], "params": {},
+             "backlog": True, "nomad": {}},
+            {"id": "c", "kind": "fetch", "status": "done", "title": "Fetch", "args": ["x"], "params": {}, "nomad": None},
+        ]
+        jobs = self.jobs
+
+        class Manager:
+            def snapshot(self):
+                return {"jobs": [dict(j) for j in jobs], "external": [], "tick": {"age": 1.0, "error": None}}
+
+        class Handler(server.Handler):
+            manager = Manager()
+            mirror = None
+            allowed_names = {"127.0.0.1"}
+
+        self.server = server
+        self.httpd = server.Server(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(self.httpd.server_close)
+        self.addCleanup(self.httpd.shutdown)
+
+    def get(self, path, **headers):
+        import http.client
+
+        conn = http.client.HTTPConnection("127.0.0.1", self.httpd.server_address[1], timeout=10)
+        try:
+            conn.request("GET", path, headers={k.replace("_", "-"): v for k, v in headers.items()})
+            resp = conn.getresponse()
+            return resp.status, {k.lower(): v for k, v in resp.getheaders()}, resp.read()
+        finally:
+            conn.close()
+
+    def test_slim_state_keeps_what_the_page_reads(self):
+        # The plain state is every job as the app holds it, which sessions and tests read.
+        status, _, body = self.get("/api/state")
+        self.assertEqual(status, 200)
+        full = json.loads(body)
+        self.assertEqual([j["args"] for j in full["jobs"]], [j["args"] for j in self.jobs])
+        self.assertEqual(full["jobs"][0]["nomad"]["stages"], self.jobs[0]["nomad"]["stages"])
+
+        # slim=1 drops a job's command and its parameters, and keeps of the nomad record what the page reads.
+        slim = json.loads(self.get("/api/state?slim=1")[2])
+        first = slim["jobs"][0]
+        self.assertNotIn("args", first)
+        self.assertNotIn("params", first)
+        self.assertEqual(first["nomad"], {"node": "dev-arch", "target": "dev-arch",
+                                          "dispatched_at": "2026-11-18T14:36:00-05:00", "requeue": "hold"})
+
+        # Every other field of a job passes, so a new field reaches the page without a change here.
+        self.assertEqual({k: first[k] for k in ("id", "kind", "status", "title", "meta", "pausable")},
+                         {k: self.jobs[0][k] for k in ("id", "kind", "status", "title", "meta", "pausable")})
+
+        # The page tells a queued job that has started once from one that has not by whether it has a record,
+        # so an empty record stays a record and a missing one stays missing.
+        self.assertEqual(slim["jobs"][1]["nomad"], {})
+        self.assertIsNone(slim["jobs"][2]["nomad"])
+
+        # The rest of the state is the same, and only slim=1 asks for the slim jobs.
+        self.assertEqual({k: v for k, v in slim.items() if k != "jobs"}, {k: v for k, v in full.items() if k != "jobs"})
+        self.assertIn("args", json.loads(self.get("/api/state?slim=0")[2])["jobs"][0])
+
+    def test_json_is_zipped_and_a_serial_page_has_a_validator(self):
+        import gzip
+        from unittest import mock
+
+        with mock.patch.object(self.server.views, "serials", return_value=[{"title": "The Hundred Reigns " * 200}]):
+            # A client that names no encoding gets the plain body, as a worker does.
+            status, plain_head, plain = self.get("/api/serials")
+            self.assertEqual(status, 200)
+            self.assertNotIn("content-encoding", plain_head)
+            self.assertEqual(json.loads(plain)["serials"][0]["title"], "The Hundred Reigns " * 200)
+
+            # A client that takes gzip gets the same body zipped.
+            status, head, body = self.get("/api/serials", Accept_Encoding="gzip, deflate, br")
+            self.assertEqual((status, head["content-encoding"], head["vary"]), (200, "gzip", "Accept-Encoding"))
+            self.assertEqual(gzip.decompress(body), plain)
+            self.assertLess(len(body), len(plain) // 10)
+            self.assertEqual(int(head["content-length"]), len(body))
+
+            # A serial's page may be kept and asked about again, and each encoding has its own validator.
+            self.assertEqual(head["cache-control"], "no-cache")
+            self.assertTrue(head["etag"].endswith('-gz"'))
+            self.assertNotEqual(head["etag"], plain_head["etag"])
+
+            # The same body again is a 304 without a body.
+            status, again, body = self.get("/api/serials", Accept_Encoding="gzip", If_None_Match=head["etag"])
+            self.assertEqual((status, body, again["etag"]), (304, b"", head["etag"]))
+            status, _, body = self.get("/api/serials", If_None_Match=plain_head["etag"])
+            self.assertEqual((status, body), (304, b""))
+
+            # A validator of the other encoding, or of an older body, gets the body.
+            self.assertEqual(self.get("/api/serials", Accept_Encoding="gzip", If_None_Match=plain_head["etag"])[0], 200)
+            self.assertEqual(self.get("/api/serials", Accept_Encoding="gzip", If_None_Match='"0000"')[0], 200)
+
+        # A changed page has another validator, so the old one gets the new body.
+        with mock.patch.object(self.server.views, "serials", return_value=[{"title": "Another " * 400}]):
+            status, changed, _ = self.get("/api/serials", Accept_Encoding="gzip", If_None_Match=head["etag"])
+            self.assertEqual(status, 200)
+            self.assertNotEqual(changed["etag"], head["etag"])
+
+        # The state differs in every answer, so it is zipped and never kept.
+        status, head, body = self.get("/api/state", Accept_Encoding="gzip")
+        self.assertEqual((status, head["content-encoding"], head["cache-control"]), (200, "gzip", "no-store"))
+        self.assertNotIn("etag", head)
+        self.assertEqual(len(json.loads(gzip.decompress(body))["jobs"]), 3)
+
+        # A refusal of gzip is honoured, and a short body is sent as it is.
+        self.assertNotIn("content-encoding", self.get("/api/state", Accept_Encoding="gzip;q=0, identity")[1])
+        self.assertNotIn("content-encoding", self.get("/api/state", Accept_Encoding="br, gzip; q=0.00")[1])
+        self.assertEqual(self.get("/api/state", Accept_Encoding="br;q=1, gzip; q=0.5")[1]["content-encoding"], "gzip")
+        status, head, body = self.get("/api/nothing", Accept_Encoding="gzip")
+        self.assertEqual(status, 404)
+        self.assertNotIn("content-encoding", head)
+        self.assertIn("error", json.loads(body))
+
+    def test_static_text_is_zipped_and_audio_is_not(self):
+        import gzip
+        from unittest import mock
+
+        script = (self.server.STATIC / "app.js").read_bytes()
+
+        # A text file goes zipped to a client that takes gzip, with a validator of its own.
+        status, head, body = self.get("/static/app.js", Accept_Encoding="gzip")
+        self.assertEqual((status, head["content-encoding"], head["vary"]), (200, "gzip", "Accept-Encoding"))
+        self.assertEqual(gzip.decompress(body), script)
+        self.assertTrue(head["etag"].endswith('-gz"'))
+        self.assertEqual(self.get("/static/app.js", Accept_Encoding="gzip", If_None_Match=head["etag"])[0], 304)
+
+        # Without gzip it is the file's bytes, and the plain validator answers 304 too.
+        status, plain_head, body = self.get("/static/app.js")
+        self.assertEqual((status, body), (200, script))
+        self.assertNotIn("content-encoding", plain_head)
+        self.assertNotEqual(plain_head["etag"], head["etag"])
+        self.assertEqual(self.get("/static/app.js", If_None_Match=plain_head["etag"])[0], 304)
+
+        # A byte range is cut from the file itself, so it is never zipped.
+        status, head, body = self.get("/static/app.js", Accept_Encoding="gzip", Range="bytes=10-19")
+        self.assertEqual((status, body, head["content-range"]), (206, script[10:20], f"bytes 10-19/{len(script)}"))
+        self.assertNotIn("content-encoding", head)
+
+        # A file under a kilobyte is sent as it is.
+        status, head, body = self.get("/static/icon.svg", Accept_Encoding="gzip")
+        self.assertEqual((status, body), (200, (self.server.STATIC / "icon.svg").read_bytes()))
+        self.assertNotIn("content-encoding", head)
+
+        # A take is audio: never zipped, served in ranges, and asked about again before each play, because a
+        # retake replaces the file under the same address.
+        with tempfile.TemporaryDirectory() as tmp:
+            take = Path(tmp) / "take.wav"
+            take.write_bytes(wav_bytes(b"\x00\x01" * 4000))
+            with mock.patch.object(self.server.views, "MEDIA_MIRROR", Path(tmp)):
+                status, head, body = self.get("/media/mirror/take.wav", Accept_Encoding="gzip")
+                self.assertEqual((status, body), (200, take.read_bytes()))
+                self.assertNotIn("content-encoding", head)
+                self.assertEqual((head["cache-control"], head["accept-ranges"]), ("no-cache", "bytes"))
+                self.assertEqual(self.get("/media/mirror/take.wav", If_None_Match=head["etag"])[0], 304)
 
 
 if __name__ == "__main__":

@@ -83,20 +83,39 @@ def _save_index(slug: str, info: dict) -> None:
         "volumes": info["volumes"], "chapters": info["chapters"]})
 
 
-def _fetch_chapters(slug: str, index: list[dict], numbers: list[int], *, force: bool, html: str | None = None) -> int:
-    """Fetch the numbered chapters from the source index, or parse `html` for a single one. Returns how many were written."""
+def _source_id(slug: str, by_number: dict[int, dict], n: int) -> int | None:
+    """The id that chapter n has at its source, from the index or else from the chapter on disk. None when neither
+    has the chapter."""
+    if n in by_number:
+        return by_number[n].get("id")
+    return (lib.load_yaml(lib.chapter_dir(slug, n) / "chapter.yaml", {}) or {}).get("source_id")
+
+
+def _fetch_chapters(slug: str, index: list[dict], numbers: list[int], *, force: bool, html: str | None = None,
+                    fiction: int = 0) -> int:
+    """Fetch the numbered chapters, or parse a saved page for a single one.
+
+    slug: the serial.
+    index: the entries of the source index.
+    numbers: the chapters to fetch.
+    force: replace the text of a chapter that is on disk.
+    html: a saved chapter page, for the one chapter of `numbers`. A chapter that the index doesn't have takes its
+        entry from the page.
+    fiction: the id of the serial's fiction, which a page of a chapter beyond the index has to be of.
+    Returns how many chapters were written.
+    """
     by_number = {c["number"]: c for c in index}
     done = 0
     for n in numbers:
         entry = by_number.get(n)
-        if entry is None:
+        if entry is None and html is None:
             print(f"chapter {n}: not in the source index", file=sys.stderr)
             continue
         if (lib.chapter_dir(slug, n) / "text.md").exists() and not force:
             print(f"chapter {n}: already fetched, skipping (use --force)")
             continue
         try:
-            ch = rr.chapter(entry, html)
+            ch = rr.chapter(entry or rr.page_entry(html, n, fiction, index, _source_id(slug, by_number, n - 1)), html)
         except (rr.RoyalRoadError, OSError) as e:
             print(f"chapter {n}: {e}", file=sys.stderr)
             continue
@@ -148,14 +167,14 @@ def cmd_fetch(args) -> int:
     index = lib.load_yaml(lib.serial_dir(args.slug) / "source_index.yaml", {}) or {}
     html = None
     if args.html:
-        if not args.chapters.isdigit():
+        if not args.chapters.isdigit() or int(args.chapters) < 1:
             print("--html needs exactly one chapter number", file=sys.stderr)
             return 1
         if not index.get("chapters"):
             print(f"{args.slug}: no saved chapter index; --html needs one", file=sys.stderr)
             return 1
         html = Path(args.html).read_text(encoding="utf-8", errors="replace")
-    if not (args.no_refresh or html) or not index.get("chapters"):
+    if not (args.no_refresh or args.html) or not index.get("chapters"):
         info = rr.fiction(source.get("url") or str(source["fiction_id"]))
         _save_index(args.slug, info)
         index = {"chapters": info["chapters"]}
@@ -178,7 +197,8 @@ def cmd_fetch(args) -> int:
         print(f"{args.slug}: nothing to fetch ({len(available)} chapters known, {len(have)} on disk)")
         return 0
     print(f"{args.slug}: fetching {len(numbers)} of {len(available)} known chapters")
-    done = _fetch_chapters(args.slug, chapters, numbers, force=args.force, html=html)
+    done = _fetch_chapters(args.slug, chapters, numbers, force=args.force, html=html,
+                           fiction=source.get("fiction_id") or 0)
     return 0 if done == len(numbers) else 1
 
 
@@ -587,6 +607,33 @@ def cmd_voice_effect(args) -> int:
     return 0
 
 
+def cmd_prune_media(args) -> int:
+    import time
+    from . import machine
+    from .web import exchange
+    if machine.MEDIA_MIRROR is None:
+        print(f"prune-media: this machine keeps no media mirror ({machine.MEDIA_MIRROR_ENV} is not set)", file=sys.stderr)
+        return 2
+    if args.days < 1:
+        print("prune-media: --days must be 1 or more, so the audio of a job that is running stays", file=sys.stderr)
+        return 2
+    try:
+        report = exchange.prune_media(machine.MEDIA_MIRROR, lib.LIBRARY, before=time.time() - args.days * 86400,
+                                      dry_run=args.dry_run)
+    except exchange.ExchangeError as e:
+        print(f"prune-media: nothing removed: {e}", file=sys.stderr)
+        return 1
+    print(f"{'would remove' if args.dry_run else 'removed'} {report['removed']:,} file(s) that no serial names, "
+          f"{report['bytes'] / 1e9:.2f} GB")
+    print(f"   kept {report['named']:,} that the library names, and {report['young']:,} that it doesn't name and "
+          f"that changed in the last {args.days} day(s)")
+    if report["other"]:
+        print(f"   left {report['other']:,} file(s) that are not audio of the mirror")
+    if report["folders"]:
+        print(f"   removed {report['folders']:,} folder(s) that this left empty")
+    return 0
+
+
 def main(argv=None) -> int:
     for stream in (sys.stdout, sys.stderr):   # UTF-8 and line-buffered even when redirected to a log file
         if hasattr(stream, "reconfigure"):
@@ -616,7 +663,8 @@ def main(argv=None) -> int:
     p.add_argument("chapters", nargs="?", default="new", help="new (default), 1, 1-5, all")
     p.add_argument("--limit", type=int, help="with 'new': fetch at most this many")
     p.add_argument("--no-refresh", action="store_true", help="use the saved index without asking the site")
-    p.add_argument("--html", help="parse this saved chapter page instead of downloading it (one chapter; uses the saved index)")
+    p.add_argument("--html", help="parse this saved chapter page instead of downloading it, for one chapter. A chapter "
+                                  "that the saved index doesn't have takes its address, id and date from the page")
     p.add_argument("--force", action="store_true")
     p.set_defaults(fn=cmd_fetch)
 
@@ -854,6 +902,12 @@ def main(argv=None) -> int:
                    help="whisper: how much of the dry voice stays under the effect, 0 to 1 (default 0.35)")
     p.add_argument("--clear", action="store_true", help="remove the voice's effect")
     p.set_defaults(fn=cmd_voice_effect)
+
+    p = sub.add_parser("prune-media", help="remove the files of the web app's media mirror that no serial names: the "
+                                           "copies a chapter's takes left behind when they moved to another node")
+    p.add_argument("--days", type=int, default=7, help="keep a file that changed in the last DAYS days (default 7)")
+    p.add_argument("--dry-run", action="store_true", help="count the files, and remove none")
+    p.set_defaults(fn=cmd_prune_media)
 
     args = ap.parse_args(argv)
     return args.fn(args)

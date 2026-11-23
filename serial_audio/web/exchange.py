@@ -16,6 +16,7 @@ import hashlib
 import io
 import json
 import os
+import time
 import zipfile
 from pathlib import Path, PurePosixPath
 
@@ -27,7 +28,8 @@ CODE_DIRS = ("serial_audio", "prompts", "schemas")
 IMAGE_SUFFIXES = {".webp", ".png", ".jpg", ".jpeg"}
 # a worker makes audio and images and reads neither, so a bundle leaves them out
 NOT_SHIPPED = ("audio/*", *(f"images/*{suffix}" for suffix in sorted(IMAGE_SUFFIXES)))
-NOT_CODE = ("*/__pycache__/*", "*.pyc", "serial_audio/web/static/*", "*/._*")
+NOT_DEPLOYED = ("*/__pycache__/*", "*.pyc", "*/._*")
+NOT_CODE = (*NOT_DEPLOYED, "serial_audio/web/static/*")
 # the looks and the images are here because each of their files is written whole, with library.replace_yaml
 RESUMABLE = ("chapters/*/breeze_takes.json", "chapters/*/*.log", "voices/_briefs.yaml", "images/_briefs.yaml",
              "images/*/*.yaml", *NOT_SHIPPED[1:], "bible/looks.yaml", "bible/settings.yaml",
@@ -35,6 +37,10 @@ RESUMABLE = ("chapters/*/breeze_takes.json", "chapters/*/*.log", "voices/_briefs
 MEDIA_SUFFIXES = {".flac", ".wav", ".opus", ".ogg", ".mp3", ".m4a"}
 # what the mirror keeps: audio, and the Drama 3 voice file of a Qwen cast candidate
 MIRROR_SUFFIXES = MEDIA_SUFFIXES | {".safetensors"}
+# what a prune of the mirror removes: what the mirror keeps, and the part of an upload that was cut short
+PRUNED_SUFFIXES = MIRROR_SUFFIXES | {".part", ".incoming"}
+# seconds a mirror file can be old before confirm_held() dates it again. A prune keeps a day's files at the least
+HELD_YOUNG = 12 * 3600.0
 TAKES_FILE = "breeze_takes.json"
 MAX_FILES = 20_000
 
@@ -58,6 +64,25 @@ def sha256_file(path: Path) -> str:
             h.update(chunk)
     digest = h.hexdigest()
     _hash_cache[key] = (st.st_mtime_ns, st.st_size, digest)
+    return digest
+
+
+def confirm_held(path: Path) -> str:
+    """The SHA-256 of a mirror file that a worker is about to be told the app holds.
+
+    path: the file.
+    Returns the hash. Dates a file that is older than HELD_YOUNG as of now. The worker doesn't send a file the
+    app holds, so a file it was told of would keep its old date until the result that names it lands, and a
+    prune in between would remove it. Raises OSError when the file can't be read.
+    """
+    before = path.stat()
+    digest = sha256_file(path)
+    if time.time() - before.st_mtime > HELD_YOUNG:
+        os.utime(path)
+        after = path.stat()
+        # the hash stands for the dated file only when no upload replaced the file meanwhile
+        if (after.st_ino, after.st_size) == (before.st_ino, before.st_size):
+            _hash_cache[str(path)] = (after.st_mtime_ns, after.st_size, digest)
     return digest
 
 
@@ -127,6 +152,180 @@ def take_files(chapter: Path) -> dict[str, str]:
         return {}
 
 
+def named_media(folder: Path, changed: dict | None = None, strict: bool = False) -> set[str]:
+    """The audio a serial's records name, by its path on the node that made it.
+
+    folder: a copy of the serial's folder.
+    changed: the files a job changed. The answer then covers the candidates of each changed voice record, with
+        their Drama 3 voice files, every take of each chapter that has a changed file, and the pronunciation
+        options when the pronunciations changed. None covers every voice record, every chapter and every option.
+    strict: raise on a record that is there and can't be read, or that is not built the way this function reads
+        it. Otherwise such a record, or the part of it that is built another way, names nothing.
+    Returns the paths as the records hold them, whether or not they are files on this machine. Raises
+    ExchangeError only when strict.
+    """
+    import yaml
+
+    said = folder / "bible" / "pronunciations.yaml"
+    if changed is None:
+        voices = sorted((folder / "voices").glob("*.yaml"))
+        chapters = sorted(p.parent for p in (folder / "chapters").glob(f"*/{TAKES_FILE}"))
+    else:
+        voices = [folder / rel for rel in changed if rel.startswith("voices/") and rel.endswith(".yaml")]
+        chapters = sorted({folder / "chapters" / rel.split("/")[1] for rel in changed
+                           if rel.startswith("chapters/") and rel.count("/") >= 2})
+    options_read = changed is None or "bible/pronunciations.yaml" in changed
+    if strict:
+        _records_built(said if options_read else None, voices, chapters)
+    out = set()
+    if options_read and said.is_file():
+        try:
+            entries = yaml.safe_load(said.read_text(encoding="utf-8"))
+        except (OSError, ValueError, yaml.YAMLError):
+            entries = None
+        for entry in entries.values() if isinstance(entries, dict) else []:
+            options = entry.get("options") if isinstance(entry, dict) else None
+            candidates = options.get("candidates") if isinstance(options, dict) else None
+            for c in candidates if isinstance(candidates, list) else []:
+                if isinstance(c, dict) and isinstance(c.get("clip"), str):
+                    out.add(c["clip"])
+    for path in voices:
+        if path.name == "_briefs.yaml" or not path.is_file():
+            continue
+        try:
+            rec = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+            for batch in [rec] + list(rec.get("history") or []):
+                for c in batch.get("candidates") or []:
+                    if isinstance(c, dict):
+                        out.update(v for v in (c.get("clip"), c.get("voice_file")) if isinstance(v, str))
+        except (OSError, ValueError, AttributeError, TypeError, yaml.YAMLError):
+            continue
+    for chapter in chapters:
+        out.update(take_files(chapter).values())
+    return out
+
+
+def _records_built(said: Path | None, voices: list[Path], chapters: list[Path]) -> None:
+    """Checks that the records named_media reads can be read and are built the way it reads them.
+
+    said: the serial's pronunciations file, or None to leave it out.
+    voices: its voice records.
+    chapters: its chapter folders with a takes file.
+    Returns nothing. A file that is not there passes. Raises ExchangeError for the first record that does not
+    parse, or that holds something else where named_media looks for a mapping, a list or a path.
+    """
+    import yaml
+
+    def need(ok: bool, path: Path, what: str) -> None:
+        if not ok:
+            raise ExchangeError(f"{path} can't be read: {what}")
+
+    def parsed(path: Path, load):
+        try:
+            return load(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError, RecursionError, yaml.YAMLError) as e:
+            raise ExchangeError(f"{path} can't be read: {type(e).__name__}: {e}") from None
+
+    def candidates(holder: dict, path: Path, whose: str) -> None:
+        found = holder.get("candidates")
+        need(found is None or isinstance(found, list), path, f"the candidates of {whose} are not a list")
+        for c in found or []:
+            need(isinstance(c, dict), path, f"a candidate of {whose} is not a mapping")
+            for field in ("clip", "voice_file"):
+                need(c.get(field) is None or isinstance(c[field], str), path, f"a {field} of {whose} is not text")
+
+    if said is not None and said.is_file():
+        entries = parsed(said, yaml.safe_load)
+        need(entries is None or isinstance(entries, dict), said, "it is not a mapping of terms")
+        for term, entry in (entries or {}).items():
+            need(isinstance(entry, dict), said, f"the entry of {term} is not a mapping")
+            options = entry.get("options")
+            need(options is None or isinstance(options, dict), said, f"the options of {term} are not a mapping")
+            candidates(options or {}, said, f"{term}'s options")
+    for path in voices:
+        if path.name == "_briefs.yaml" or not path.is_file():
+            continue
+        rec = parsed(path, yaml.safe_load)
+        need(rec is None or isinstance(rec, dict), path, "it is not a mapping")
+        history = (rec or {}).get("history")
+        need(history is None or isinstance(history, list), path, "its history is not a list")
+        for batch in [rec or {}] + list(history or []):
+            need(isinstance(batch, dict), path, "a batch of its history is not a mapping")
+            candidates(batch, path, "the voice")
+    for chapter in chapters:
+        path = chapter / TAKES_FILE
+        if not path.is_file():
+            continue
+        data = parsed(path, json.loads)
+        need(isinstance(data, dict), path, "it is not a mapping")
+        takes = data.get("takes")
+        need(takes is None or isinstance(takes, dict), path, "its takes are not a mapping")
+        for line, take in (takes or {}).items():
+            need(isinstance(take, dict), path, f"take {line} is not a mapping")
+            need(take.get("file") is None or isinstance(take["file"], str), path, f"the file of take {line} is not text")
+
+
+def prune_media(media_dir: Path, library: Path, *, before: float, dry_run: bool = False) -> dict:
+    """Removes the media mirror's files that no serial of the library names.
+
+    media_dir: the mirror.
+    library: the library folder, whose serials say which audio they use.
+    before: a file that changed at this time or later stays, whoever names it. A worker sends its audio ahead of
+        the result that names it, and confirm_held() dates a copy the worker was told the app has, so this has
+        to lie before the start of every job that is running.
+    dry_run: count, and remove nothing.
+    Returns {"removed", "bytes", "named", "young", "other", "folders"}: the files removed, their size, the files
+    the library names, the files it doesn't name that are too young to go, the files that are not a mirror's
+    audio or a part of an upload, which stay, and the folders removed because they were left empty. A dry run
+    counts the files a run would remove, and no folders.
+    Raises ExchangeError, before it removes anything, when the library holds no serial, when a record of a
+    serial can't be read, because what such a record names is unknown, and when one of the two folders is the
+    other or lies inside it.
+    """
+    here, there = media_dir.resolve(), library.resolve()
+    if here == there or here in there.parents or there in here.parents:
+        raise ExchangeError(f"{media_dir} and {library} are not apart, so a prune of one would take files of the other")
+    serials = [p for p in sorted(library.iterdir()) if (p / "serial.yaml").is_file()] if library.is_dir() else []
+    if not serials:
+        raise ExchangeError(f"{library} holds no serial, so nothing says which audio is in use")
+    named = set()
+    for serial in serials:
+        named.update(rel for raw in named_media(serial, strict=True) if (rel := mirror_rel(raw)))
+    report = {"removed": 0, "bytes": 0, "named": 0, "young": 0, "other": 0, "folders": 0}
+    # the folders this run took something out of, which are the only ones it removes when they are empty
+    thinned: set[str] = set()
+    for root, dirs, files in os.walk(media_dir, topdown=False):
+        for name in files:
+            path = Path(root) / name
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            if path.relative_to(media_dir).as_posix() in named:
+                report["named"] += 1
+            elif path.suffix.lower() not in PRUNED_SUFFIXES:
+                report["other"] += 1
+            elif st.st_mtime >= before:
+                report["young"] += 1
+            else:
+                if not dry_run:
+                    try:
+                        path.unlink()
+                    except OSError:
+                        continue
+                    thinned.add(root)
+                report["removed"] += 1
+                report["bytes"] += st.st_size
+        if root in thinned and Path(root) != media_dir:
+            try:
+                os.rmdir(root)
+                report["folders"] += 1
+                thinned.add(os.path.dirname(root))
+            except OSError:
+                pass
+    return report
+
+
 def _matches(rel: str, patterns: tuple[str, ...]) -> bool:
     return any(fnmatch.fnmatchcase(rel, p) for p in patterns)
 
@@ -164,6 +363,23 @@ def code_version(root: Path = lib.ROOT) -> str:
     for rel, path in code_files(root):
         h.update(rel.encode() + b"\0" + sha256_file(path).encode() + b"\0")
     return h.hexdigest()[:16]
+
+
+def deployed_files(root: Path = lib.ROOT) -> dict[str, str]:
+    """{path under root: SHA-256} for every file of the app as it is deployed: the code a worker gets, and the
+    front end, which a worker doesn't. A file that is gone by the time it is read is left out."""
+    out = {}
+    for top in CODE_DIRS:
+        for path in sorted((root / top).rglob("*")):
+            rel = path.relative_to(root).as_posix()
+            if _matches(rel, NOT_DEPLOYED):
+                continue
+            try:
+                if path.is_file():
+                    out[rel] = sha256_file(path)
+            except OSError:
+                continue
+    return out
 
 
 def build_bundle(slug: str, info: dict, root: Path = lib.ROOT) -> bytes:

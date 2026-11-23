@@ -14,6 +14,7 @@ const DL_ICON = `<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="tr
 const downloadUrl = (slug, n) => `/download/${encodeURIComponent(slug)}/${n}`;
 const STATUSES = ["fetched", "characters", "scripted", "rendered"];
 const FINISHED = new Set(["done", "failed", "cancelled", "stopped", "skipped", "lost"]);
+const FAILED = new Set(["failed", "lost"]);
 const IMPORTANCE = ["major", "recurring", "minor", "one_off"];
 const NEXT = {
   fetched: { label: "Characters", kind: "character-pass" },
@@ -84,6 +85,12 @@ function chip(id, label) {
   return `<span class="chip" style="--h:${hue(id)}" title="${esc(id)}">${esc(label || id)}</span>`;
 }
 
+// How many chapters something is in, for a row that has no room for the list.
+function chapterSpan(nums) {
+  if (nums.length <= 3) return nums.length ? `ch ${rangeText(nums)}` : "";
+  return `${nums.length} chapters, ${Math.min(...nums)} to ${Math.max(...nums)}`;
+}
+
 function rangeText(nums) {
   const out = [];
   let start = null, prev = null;
@@ -94,6 +101,11 @@ function rangeText(nums) {
   }
   if (start !== null) out.push(start === prev ? `${start}` : `${start}-${prev}`);
   return out.join(", ");
+}
+
+// An explanation that stays folded until it is asked for.
+function how(key, html) {
+  return `<details class="more how" data-key="how:${key}"><summary>How this works</summary><div class="small muted">${html}</div></details>`;
 }
 
 function options(list, selected) {
@@ -135,7 +147,7 @@ async function api(path, opts = {}) {
   return data;
 }
 
-const get = (path) => api(path);
+const get = (path, signal) => api(path, signal ? { signal } : {});
 const post = (path, body) => api(path, {
   method: "POST", headers: { "Content-Type": "application/json", "X-Serial-Audio": "1" }, body: JSON.stringify(body || {}),
 });
@@ -244,6 +256,13 @@ const S = {
   pronDraft: {},
   sig: "",
   allHistory: false,
+  stale: new Set(),
+  told: new Set(),
+  fetched: null,
+  folds: {},
+  finished: "all",
+  bibleText: false,
+  bibleArt: "all",
 };
 
 const selFor = (slug) => (S.sel[slug] ||= new Set());
@@ -265,61 +284,177 @@ function routeKey(r) {
   return r.view;
 }
 
-async function fetchFor(r) {
-  if (r.view === "library") return get("/api/serials");
+async function fetchFor(r, signal) {
+  if (r.view === "library") return get("/api/serials", signal);
   if (r.view === "jobs") return {};
-  if (r.view === "chapter") return get(`/api/serials/${r.slug}/chapters/${r.n}`);
+  if (r.view === "chapter") return get(`/api/serials/${r.slug}/chapters/${r.n}`, signal);
   const base = `/api/serials/${r.slug}`;
-  const extra = r.tab === "cast" ? get(`${base}/voices`) : r.tab === "bible" ? get(`${base}/bible`)
-    : r.tab === "names" ? get(`${base}/names`) : null;
-  const [serial, more] = await Promise.all([get(base), extra]);
+  const extra = r.tab === "cast" ? get(`${base}/voices`, signal) : r.tab === "bible" ? get(`${base}/bible`, signal)
+    : r.tab === "names" ? get(`${base}/names`, signal) : null;
+  const [serial, more] = await Promise.all([get(base, signal), extra]);
   return { serial, extra: more };
 }
 
 let showToken = 0;
+// The page that is being fetched, and whether it is owed one more fetch when that one ends
+const LOAD = { key: null, again: false, ctl: null };
+const KEEP_PAGES = 12;
 
-async function show() {
-  const r = parseRoute();
-  const key = routeKey(r);
-  if (key !== routeKey(S.route)) S.spk = null;
-  S.route = r;
-  const token = ++showToken;
-  $$("[data-nav]").forEach((a) => a.classList.toggle("on", a.dataset.nav === (r.view === "jobs" ? "jobs" : "library")));
-  if (S.data[key]) paint();
-  else $("#view").innerHTML = `<div class="empty">Loading…</div>`;
-  try {
-    const data = await fetchFor(r);
-    if (token !== showToken) return;
-    S.data[key] = data;
-    paint();
-  } catch (e) {
-    if (token === showToken && !S.data[key]) $("#view").innerHTML = `<div class="notice bad">${esc(e.message)}</div>`;
+// Keeps a fetched page, and drops the pages that were fetched longest ago.
+function keepPage(key, data) {
+  delete S.data[key];
+  S.data[key] = data;
+  for (const old of Object.keys(S.data)) {
+    if (Object.keys(S.data).length <= KEEP_PAGES) break;
+    if (old !== key) { delete S.data[old]; S.stale.delete(old); }
   }
 }
 
-function paint() {
+function setView(html) {
+  $("#view").innerHTML = html;
+  PAINTED.key = null;
+}
+
+// Shows the page the address names. With refresh, fetches the page that is shown again, once at a time: a
+// refresh that comes while a fetch is under way is answered by one more fetch when that one ends.
+async function show(refresh = false) {
+  const r = parseRoute();
+  const key = routeKey(r);
+  if (refresh && LOAD.key === key) {
+    LOAD.again = true;
+    return;
+  }
+  if (key !== routeKey(S.route)) {
+    S.spk = null;
+    OPEN.clear();
+    BUILT.clear();
+    PAINTED.key = null;
+    if (r.view === "serial" && r.tab === "chapters") delete S.folds[r.slug];
+  }
+  S.route = r;
+  const token = ++showToken;
+  if (LOAD.ctl) LOAD.ctl.abort();
+  const ctl = new AbortController();
+  Object.assign(LOAD, { key, again: false, ctl });
+  $$("[data-nav]").forEach((a) => a.classList.toggle("on", a.dataset.nav === (r.view === "jobs" ? "jobs" : "library")));
+  if (!refresh) {
+    if (S.data[key]) paint();
+    else setView(`<div class="empty">Loading…</div>`);
+  }
+  $("#view").classList.toggle("stale", S.stale.has(key));
+  try {
+    const data = await fetchFor(r, ctl.signal);
+    if (token !== showToken) return;
+    keepPage(key, data);
+    S.told.delete(key);
+    // the page stops being one from before a change when this data is on it, which a press can delay
+    S.fetched = key;
+    paint(true);
+  } catch (e) {
+    if (token !== showToken) return;
+    if (!S.data[key]) setView(`<div class="notice bad">${esc(e.message)}</div>`);
+    else if (S.stale.has(key) && !S.told.has(key)) {
+      // the poll tries the fetch again, and one message is enough
+      S.told.add(key);
+      toast(`This page could not be fetched again, so it is tried again: ${e.message}`, true);
+    }
+  } finally {
+    if (token === showToken) {
+      LOAD.key = null;
+      if (LOAD.again) show(true);
+    }
+  }
+}
+
+// The keys of the details that are open on the page that is shown. A key stays while the body that holds its
+// details is not built.
+const OPEN = new Set();
+// The keys of the details whose body has been built on the page that is shown
+const BUILT = new Set();
+// What builds the body of each details whose body is built when it opens. Each paint sets them anew.
+const LAZY = new Map();
+// What the last paint wrote, so a paint that would write the same again is skipped
+const PAINTED = { key: null, html: null };
+// A paint that the poll or a fetch asks for waits while a finger or the mouse is down in the view, and a moment
+// after, so it can't take a button from under a tap.
+const HOLD = { down: 0, until: 0, owed: false, timer: null, selected: 0 };
+const HOLD_AFTER = 400;
+const HOLD_LONGEST = 10000;
+const HOLD_SELECTED = 20000;
+
+function holding() {
+  if (Date.now() - HOLD.down < HOLD_LONGEST || Date.now() < HOLD.until) return true;
+  // selected text is kept long enough to copy it, and not for as long as it stays selected
+  const sel = getSelection();
+  return !!sel && !sel.isCollapsed && $("#view").contains(sel.anchorNode) && Date.now() - HOLD.selected < HOLD_SELECTED;
+}
+
+// The body of a details, which is built when the details first opens. From then on every paint writes it, open or
+// closed, so a closed body has the page's newest data and keeps what was typed into it.
+function lazyBody(key, fn, cls = "body") {
+  LAZY.set(key, fn);
+  if (!OPEN.has(key) && !BUILT.has(key)) return `<div class="${cls}" data-body></div>`;
+  BUILT.add(key);
+  return `<div class="${cls}" data-body data-built="1">${fn()}</div>`;
+}
+
+function buildBody(d) {
+  const body = d.querySelector(":scope > [data-body]");
+  const fn = LAZY.get(d.dataset.key);
+  if (!body || !fn || body.dataset.built || !d.isConnected) return;
+  body.innerHTML = fn();
+  body.dataset.built = "1";
+  BUILT.add(d.dataset.key);
+  $$("details[data-key]", body).forEach((x) => { x.open = OPEN.has(x.dataset.key); });
+  $$("[data-act=expand][data-key]", body).forEach((x) => x.classList.toggle("open", OPEN.has(x.dataset.key)));
+  applyFilters();
+  markPlaying();
+}
+
+// Writes the page from its data. A soft paint is one nobody on the page asked for: it waits for a press to end,
+// and it writes nothing when the page would come out the same.
+function paint(soft = false) {
   const r = S.route;
-  const data = S.data[routeKey(r)];
+  const key = routeKey(r);
+  const data = S.data[key];
   if (!data) return;
+  if (soft && holding()) {
+    HOLD.owed = true;
+    renderHeader();
+    return;
+  }
+  HOLD.owed = false;
   const view = $("#view");
-  const opened = new Set($$("details[data-key]", view).filter((d) => d.open).map((d) => d.dataset.key));
-  const closed = new Set($$("details[data-key]", view).filter((d) => !d.open).map((d) => d.dataset.key));
+  // until this page's first paint the view holds what was written for another page
+  for (const d of PAINTED.key === key ? $$("details[data-key]", view) : []) {
+    if (d.open) OPEN.add(d.dataset.key);
+    else OPEN.delete(d.dataset.key);
+  }
+  LAZY.clear();
+  const html = VIEWS[r.view](data, r);
+  if (S.fetched === key) {
+    S.fetched = null;
+    S.stale.delete(key);
+    view.classList.remove("stale");
+  }
+  if (soft && PAINTED.key === key && PAINTED.html === html) {
+    updateLive();
+    return;
+  }
   const focus = document.activeElement && view.contains(document.activeElement) ? document.activeElement : null;
   const focusId = focus && focus.id;
   const caret = focus && "selectionStart" in focus ? focus.selectionStart : null;
   const typed = $$("input[id], select[id], textarea[id]", view).filter((el) => el.type !== "file")
     .map((el) => [el.id, el.type === "checkbox" ? el.checked : el.value]);
-  view.innerHTML = VIEWS[r.view](data, r);
+  view.innerHTML = html;
+  Object.assign(PAINTED, { key, html });
   for (const [id, value] of typed) {
     const el = document.getElementById(id);
     if (!el || !view.contains(el)) continue;
     if (el.type === "checkbox") el.checked = value;
     else el.value = value;
   }
-  $$("details[data-key]", view).forEach((d) => {
-    if (opened.has(d.dataset.key)) d.open = true;
-    else if (closed.has(d.dataset.key)) d.open = false;
-  });
+  $$("details[data-key]", view).forEach((d) => { d.open = OPEN.has(d.dataset.key); });
   if (focusId) {
     const el = document.getElementById(focusId);
     if (el) {
@@ -337,8 +472,9 @@ function paint() {
 // Live state
 
 async function poll() {
+  const lost = !!S.stateError;
   try {
-    S.state = await get(`/api/state${S.allHistory ? "?all=1" : ""}`);
+    S.state = await get(`/api/state?slim=1${S.allHistory ? "&all=1" : ""}`);
     S.stateError = null;
   } catch (e) {
     S.stateError = e.message;
@@ -347,17 +483,23 @@ async function poll() {
     const sig = S.state.jobs.filter((j) => j.status !== "queued").map((j) => j.id + j.status).join()
       + "|" + S.state.external.map((e) => `${e.pid}`).join();
     const first = !S.sig;
-    const changed = S.sig && sig !== S.sig;
+    // the app was away, so the page may have missed a change
+    const changed = (S.sig && sig !== S.sig) || (lost && !S.stateError);
     S.sig = sig;
-    if (first && S.route.view !== "jobs") paint();
+    if (first && S.route.view !== "jobs") paint(true);
     if (changed) {
+      // A page that was fetched before the change is shown at once on the next visit and fetched again.
       const current = routeKey(S.route);
-      for (const key of Object.keys(S.data)) if (key !== current) delete S.data[key];
-      if (S.route.view !== "jobs") show();
+      for (const key of Object.keys(S.data)) if (key !== current && key !== "jobs") S.stale.add(key);
+      if (S.route.view !== "jobs") show(true);
+    } else if (S.stale.has(routeKey(S.route)) && !LOAD.key) {
+      // the fetch of a page that is shown from before a change failed, so each poll tries it again
+      show(true);
     }
   }
   // a repaint would take the dragged rows from under the pointer
-  if (S.route.view === "jobs") { if (!DRAG.ids) paint(); else renderHeader(); }
+  if (S.route.view === "jobs") { if (!DRAG.ids) paint(true); else renderHeader(); }
+  else if (HOLD.owed) paint(true);
   else updateLive();
 }
 
@@ -422,6 +564,17 @@ function updateLive() {
 function renderHeader() {
   const a = $("#activity");
   const st = S.state;
+  // an app that runs older code sends no tick, and says nothing here
+  const tick = !S.stateError && st?.tick;
+  const alerts = S.stateError ? [] : [...(st?.notices || [])];
+  if (tick && tick.error) {
+    alerts.unshift(`The app's job loop failed on its last pass${tick.age > 30 ? `, and has not completed one for ${span(tick.age)}` : ""}: ${tick.error}`);
+  } else if (tick && tick.age > 30) {
+    alerts.unshift(`The app's job loop has not completed a pass for ${span(tick.age)}. Queued jobs are not started until it does.`);
+  }
+  const alertHTML = alerts.map((t) => `<div>${esc(t)}</div>`).join("");
+  if ($("#alert").innerHTML !== alertHTML) $("#alert").innerHTML = alertHTML;
+  $("#alert").hidden = !alerts.length;
   if (!st) {
     a.innerHTML = `<span class="dot down"></span><span class="txt">${S.stateError ? "web app not reachable" : "connecting…"}</span>`;
     return;
@@ -432,6 +585,12 @@ function renderHeader() {
   const qc = $("#queue-count");
   qc.hidden = !queued;
   qc.textContent = queued;
+  // The jobs that failed since the Jobs page was last looked at
+  if (S.route.view === "jobs" && !document.hidden) store.set("jobsSeen", Date.now());
+  const seen = store.get("jobsSeen", 0);
+  const failed = st.jobs.filter((j) => FAILED.has(j.status) && Date.parse(j.finished || j.created) > seen).length;
+  $("#fail-count").hidden = !failed;
+  $("#fail-count").textContent = failed;
   let text, p = null;
   if (run.length) {
     text = run[0].title;
@@ -451,6 +610,8 @@ function renderHeader() {
   const pb = st.mirror?.publish;
   if (bk && !bk.ok) text += " · backup failing";
   if (pb && !pb.ok) text += " · audiobook folders failing";
+  const held = st.executor === "nomad" ? (st.workers || []).filter((w) => w.held).length : 0;
+  if (held) text += ` · ${plural(held, "node")} on hold`;
   if (S.stateError) text = "web app not reachable";
   const c = st.comfy || {};
   const cluster = st.executor === "nomad";
@@ -485,12 +646,20 @@ function initPlayer() {
   a.addEventListener("play", markPlaying);
   a.addEventListener("ended", () => {
     if (P.resume) store.set(`pos:${P.url}`, 0);
+    const ch = P.resume && chapterOf(P.url);
+    if (ch) store.set(`last:${ch.slug}`, { ...store.get(`last:${ch.slug}`, {}), n: ch.n, done: true });
     markPlaying();
   });
   if ("mediaSession" in navigator) {
     navigator.mediaSession.setActionHandler("seekbackward", () => { a.currentTime = Math.max(0, a.currentTime - 15); });
     navigator.mediaSession.setActionHandler("seekforward", () => { a.currentTime += 30; });
   }
+}
+
+// The serial and the chapter whose audio an address names, or null for any other clip.
+function chapterOf(url) {
+  const m = String(url).match(/^\/media\/lib\/([^/]+)\/audio\/ch(\d+)\./);
+  return m ? { slug: decodeURIComponent(m[1]), n: Number(m[2]) } : null;
 }
 
 function savePos(force) {
@@ -511,6 +680,8 @@ function play(url, title, resume, artist) {
   savePos(true);
   P.url = url;
   P.resume = resume;
+  const ch = resume && chapterOf(url);
+  if (ch) store.set(`last:${ch.slug}`, { n: ch.n, url, title, artist });
   $("#pl-title").textContent = title;
   $("#player").hidden = false;
   document.body.classList.add("playing");
@@ -543,25 +714,29 @@ function playBtn(url, title, resume = false, big = false, artist = "") {
 
 // Dialogs
 
-function openDialog({ title, body, submit, onSubmit, onInput, wide }) {
+// submit is the text of the one submit button, or a list of [value, label, class] for several. onSubmit gets the
+// form and the value of the button that was pressed.
+function openDialog({ title, body, submit, onSubmit, onInput, wide, cancel = "Cancel" }) {
+  const submits = Array.isArray(submit) ? submit : [["", submit, "primary"]];
   const dlg = $("#dlg");
   dlg.classList.toggle("wide", !!wide);
   $("#dlg-title").textContent = title;
   $("#dlg-body").innerHTML = body;
   $("#dlg-foot").innerHTML = `<span class="grow" id="dlg-note"></span>`
-    + `<button type="button" data-act="dlg-close">Cancel</button>`
-    + `<button type="submit" class="primary" id="dlg-submit">${esc(submit)}</button>`;
+    + `<button type="button" data-act="dlg-close">${esc(cancel)}</button>`
+    + submits.map(([value, label, cls], i) => `<button type="submit" class="${cls || ""}" value="${esc(value)}"`
+      + `${i === submits.length - 1 ? ` id="dlg-submit"` : ""}>${esc(label)}</button>`).join("");
   const form = $("#dlg-form");
   form.onsubmit = async (e) => {
     e.preventDefault();
-    const btn = $("#dlg-submit");
-    btn.disabled = true;
+    const btns = $$("#dlg-foot button[type=submit]");
+    btns.forEach((b) => { b.disabled = true; });
     try {
-      if ((await onSubmit(form)) !== false) dlg.close();
+      if ((await onSubmit(form, e.submitter ? e.submitter.value : "")) !== false) dlg.close();
     } catch (err) {
       toast(err.message, true);
     } finally {
-      btn.disabled = false;
+      btns.forEach((b) => { b.disabled = false; });
     }
   };
   form.oninput = onInput ? () => onInput(form) : null;
@@ -644,7 +819,12 @@ VIEWS.library = (d) => {
     const seg = STATUSES.map((st) => (s.status[st]
       ? `<i class="${st}" style="width:${(s.status[st] / total) * 100}%" title="${st}: ${s.status[st]}"></i>` : "")).join("");
     const legend = STATUSES.filter((st) => s.status[st]).map((st) => `<span><i class="${st}"></i>${s.status[st]} ${st}</span>`).join("");
-    return `<a class="panel card" href="#/s/${esc(s.slug)}">
+    // The chapter last played on this device. The one after a chapter that ended is only known on the serial's page.
+    const last = store.get(`last:${s.slug}`, null);
+    const pos = last && last.url ? store.get(`pos:${last.url}`, 0) : 0;
+    const going = last && last.url && !last.done ? `<div class="card-continue">${playBtn(last.url, last.title, true, false, s.title)}
+        <a class="grow" href="#/s/${esc(s.slug)}/c/${esc(last.n)}">Continue chapter ${esc(last.n)}</a>${pos > 5 ? `<span class="resume nowrap">at ${clock(pos)}</span>` : ""}</div>` : "";
+    return `<div class="panel card"><a class="card-link" href="#/s/${esc(s.slug)}">
       <h2>${esc(s.title)}</h2>
       <div class="sub small">${esc([s.subtitle, s.author].filter(Boolean).join(" · "))}</div>
       <div class="segbar">${seg}</div>
@@ -654,7 +834,7 @@ VIEWS.library = (d) => {
         <div class="stat"><b>${hours(s.audio_seconds)}</b><span>of audio</span></div>
         ${s.voices_pending ? `<div class="stat"><b>${s.voices_pending}</b><span>voices to review</span></div>` : ""}
       </div>
-    </a>`;
+    </a>${going}</div>`;
   }).join("");
   return `<div class="page-head"><div><h1>Library</h1>
       <div class="sub">Serials, their chapters on the way to audio, and the voices that read them.</div></div></div>
@@ -713,27 +893,95 @@ function serialHead(sd, tab) {
     </nav>`;
 }
 
+// The chapter to go on with: the one last played on this device, the one after it when that one ended, or without
+// a record the last chapter that was started. null when there is none.
+function continueAt(sd, slug) {
+  const heard = sd.chapters.filter((c) => c.audio);
+  const last = store.get(`last:${slug}`, null);
+  let c = null;
+  if (last) {
+    c = last.done ? heard.find((x) => x.number > last.n) : heard.find((x) => x.number === last.n);
+  } else {
+    const n = listeningAt(sd);
+    c = n ? heard.find((x) => x.number === n) : null;
+  }
+  return c ? { c, pos: store.get(`pos:${c.audio.url}`, 0) } : null;
+}
+
+// The volumes that are folded in a serial's chapter list. A volume starts folded when every chapter of it is
+// rendered, unless it is the last one or has the chapter to go on with. That is decided once a visit, so a volume
+// doesn't fold while it is looked at, and a volume that was opened or folded by hand stays as it was left.
+function foldsFor(sd, slug) {
+  if (S.folds[slug]) return S.folds[slug];
+  const byHand = store.get(`folds:${slug}`, {});
+  const at = continueAt(sd, slug);
+  const parts = new Map();
+  for (const c of sd.chapters) {
+    if (!c.part_title) continue;
+    const part = String(c.part);
+    if (!parts.has(part)) parts.set(part, []);
+    parts.get(part).push(c);
+  }
+  const last = [...parts.keys()].pop();
+  const folds = new Set();
+  for (const [part, chapters] of parts) {
+    const whole = chapters.every((c) => c.status === "rendered") && part !== last
+      && !(at && chapters.includes(at.c));
+    if (part in byHand ? byHand[part] : whole) folds.add(part);
+  }
+  S.folds[slug] = folds;
+  return folds;
+}
+
+// The chapters the list shows: those of the status filter, without the unselected ones of a folded volume.
+function shownChapters(sd, slug) {
+  const f = S.filter[slug] || "all";
+  if (f !== "all") return sd.chapters.filter((c) => c.status === f);
+  const folds = foldsFor(sd, slug);
+  const sel = selFor(slug);
+  return sd.chapters.filter((c) => !c.part_title || !folds.has(String(c.part)) || sel.has(c.number));
+}
+
+function continueBar(sd, slug) {
+  const at = continueAt(sd, slug);
+  if (!at) return "";
+  const { c, pos } = at;
+  const title = `${c.label}: ${c.title}`;
+  return `<div class="panel pad continue">${playBtn(c.audio.url, title, true, false, sd.serial.title)}
+      <div class="grow"><div class="small muted">Continue</div>
+        <a href="#/s/${esc(slug)}/c/${c.number}">${c.number}. ${esc(c.title || c.label)}</a>${pos > 5 ? ` <span class="resume nowrap">at ${clock(pos)}</span>` : ""}</div>
+      <button class="sm ghost" data-act="ch-jump" data-n="${c.number}">Show in the list</button></div>`;
+}
+
 function chaptersTab(sd, slug) {
   const sel = selFor(slug);
   const f = S.filter[slug] || "all";
   const counts = {};
   for (const c of sd.chapters) counts[c.status] = (counts[c.status] || 0) + 1;
-  const rows = sd.chapters.filter((c) => f === "all" || c.status === f);
+  const rows = shownChapters(sd, slug);
+  const folds = f === "all" ? foldsFor(sd, slug) : new Set();
+  const shown = new Set(rows);
   let lastPart = null;
   let html = "";
-  for (const c of rows) {
-    if (c.part_title && c.part_title !== lastPart) {
-      lastPart = c.part_title;
-      html += `<tr class="part"><td colspan="7">${esc(c.part_title)}</td></tr>`;
+  for (const c of sd.chapters) {
+    if (c.part_title && c.part !== lastPart && (f === "all" || shown.has(c))) {
+      lastPart = c.part;
+      const all = sd.chapters.filter((x) => x.part === c.part);
+      const done = all.filter((x) => x.status === "rendered");
+      const facts = `ch ${all[0].number} to ${all[all.length - 1].number} · ${done.length === all.length ? "all rendered" : `${done.length} of ${all.length} rendered`}`
+        + ` · ${hours(done.reduce((t, x) => t + (x.audio?.seconds || 0), 0))}`;
+      html += f !== "all" ? `<tr class="part"><td colspan="7">${esc(c.part_title)}</td></tr>`
+        : `<tr class="part"><td colspan="7"><button type="button" class="fold" data-act="part" data-part="${esc(c.part)}" aria-expanded="${!folds.has(String(c.part))}">`
+          + `<span class="mark">${folds.has(String(c.part)) ? "▸" : "▾"}</span><span>${esc(c.part_title)} <span class="facts-line">· ${esc(facts)}</span></span></button></td></tr>`;
     }
-    html += chapterRow(c, slug, sel, sd.serial.title);
+    if (shown.has(c)) html += chapterRow(c, slug, sel, sd.serial.title);
   }
   const allOn = rows.length > 0 && rows.every((c) => sel.has(c.number));
   const filters = ["all", ...STATUSES].map((st) => `<button class="${f === st ? "on" : ""}" data-act="filter" data-status="${st}">${st}${st === "all" ? "" : ` ${counts[st] || 0}`}</button>`).join("");
   const fresh = canSaveToFolder ? unsaved(slug, sd).length : 0;
   const saveBtn = canSaveToFolder && sd.chapters.some((c) => c.audio)
     ? `<button class="sm ghost" data-act="save-folder" ${fresh ? "" : "disabled"} title="Write the rendered chapters into a folder on this device, for an audiobook player that reads one folder per book">${fresh ? `Save ${fresh} to this device` : "All saved to this device"}</button>` : "";
-  return `<div class="panel">
+  return `${continueBar(sd, slug)}<div class="panel">
       <div class="toolbar">
         <label class="inline"><input type="checkbox" data-change="sel-all" ${allOn ? "checked" : ""} aria-label="Select all shown"> <span class="small">${sel.size ? `${sel.size} selected` : "Select"}</span></label>
         <button class="sm ghost" data-act="sel-next" data-count="5">Next 5 to render</button>
@@ -768,11 +1016,11 @@ function chapterRow(c, slug, sel, serialTitle) {
     const est = c.estimate_minutes ? `<span class="muted small nowrap hide-sm">~${span(c.estimate_minutes * 60)}</span>` : "";
     audio = `<div class="audio-cell">${next ? `<button class="sm" data-act="next-step" data-n="${c.number}">${next.label}</button>` : ""}${est}</div>`;
   }
-  return `<tr class="${sel.has(c.number) ? "sel" : ""}">
+  return `<tr class="${sel.has(c.number) ? "sel" : ""}" data-row="${c.number}">
     <td><input type="checkbox" data-change="sel" data-n="${c.number}" ${sel.has(c.number) ? "checked" : ""} aria-label="Select chapter ${c.number}"></td>
     <td class="num hide-sm">${c.number}</td>
     <td class="ch-title"><a href="#/s/${esc(slug)}/c/${c.number}"><span class="show-sm muted">${c.number}. </span>${esc(c.title || c.label)}</a>${hints.join("")}
-      <div class="show-sm"><span class="pill ${esc(c.status)}">${esc(c.status)}</span><span class="live" data-live="${esc(slug)}:${c.number}"></span></div></td>
+      <div class="show-sm">${c.status === "rendered" ? "" : `<span class="pill ${esc(c.status)}">${esc(c.status)}</span>`}<span class="live" data-live="${esc(slug)}:${c.number}"></span></div></td>
     <td class="num right hide-sm">${(c.words || 0).toLocaleString()}</td>
     <td class="hide-sm"><span class="pill ${esc(c.status)}">${esc(c.status)}</span><span class="live" data-live="${esc(slug)}:${c.number}"></span></td>
     <td class="num right hide-sm">${c.lines ?? ""}</td>
@@ -834,7 +1082,8 @@ async function detectChapter(file) {
 
 async function voicesFor(slug) {
   const cached = S.data[`s:${slug}:cast`];
-  if (cached && cached.extra) return cached.extra;
+  // a cast since the page was fetched has moved the next free seed
+  if (cached && cached.extra && !S.stale.has(`s:${slug}:cast`)) return cached.extra;
   return get(`/api/serials/${slug}/voices`);
 }
 
@@ -1101,14 +1350,13 @@ function takeCheck(d) {
     c.retaken?.length ? `${c.retaken.length} taken again after a flag` : ""].filter(Boolean).join(" · ");
   const why = (t) => t.verdict === "out_of_range" ? `${clock(t.seconds || 0)} for ${t.said.split(/\s+/).length} words, kept after retakes`
     : `${t.ins} inserted, ${t.del} dropped, ${t.sub} changed`;
-  const row = (t) => `<div class="stack"><div class="row tight"><span class="pill ${listen.includes(t) ? "failed" : "auto"}">${esc(t.verdict.replace("_", " "))}</span><b>line ${t.line + 1}</b>${chip(t.speaker, t.name || t.speaker)}${t.direction ? `<span class="dir small">${esc(t.direction)}</span>` : ""}<span class="small muted">${why(t)}</span></div>
+  const row = (t) => `<div class="stack"><div class="row tight">${t.media ? playBtn(t.media.url, `${d.meta.label}, line ${t.line + 1}`) : ""}<span class="pill ${listen.includes(t) ? "failed" : "auto"}">${esc(t.verdict.replace("_", " "))}</span><b>line ${t.line + 1}</b>${chip(t.speaker, t.name || t.speaker)}${t.direction ? `<span class="dir small">${esc(t.direction)}</span>` : ""}<span class="small muted">${why(t)}</span></div>
       <div class="small"><span class="muted">script:</span> ${esc(t.said)}</div>
-      ${t.heard != null ? `<div class="small"><span class="muted">heard:</span> ${esc(t.heard || "(nothing)")}</div>` : ""}
-      ${t.media ? `<audio controls preload="none" src="${esc(t.media.url)}"></audio>` : ""}</div>`;
+      ${t.heard != null ? `<div class="small"><span class="muted">heard:</span> ${esc(t.heard || "(nothing)")}</div>` : ""}</div>`;
   return `<div class="stack">
       <div class="small${listen.length ? "" : " muted"}">${head}${listen.length ? ` · ${plural(listen.length, "take")} to listen to` : ""}</div>
       ${listen.map(row).join("")}
-      ${rest.length ? `<details><summary class="small muted">${rest.length} suspect or unreadable ${rest.length === 1 ? "take" : "takes"}, usually a name the recognizer spelled its own way</summary>${rest.map(row).join("")}</details>` : ""}
+      ${rest.length ? `<details data-key="takes:${esc(S.route.slug)}:${d.meta.number}"><summary class="small muted">${rest.length} suspect or unreadable ${rest.length === 1 ? "take" : "takes"}, usually a name the recognizer spelled its own way</summary>${rest.map(row).join("")}</details>` : ""}
     </div>`;
 }
 
@@ -1228,7 +1476,7 @@ function castTab(sd, v, slug) {
     ${bioNote}
     ${pending.length ? `<div class="section-head"><h2>To review</h2></div><div class="voices">${pending.map((x) => voiceCard(x, slug)).join("")}</div>` : ""}
     <div class="section-head"><h2>Approved</h2><span class="muted small">${approved.length ? "" : "none yet"}</span></div>
-    <div class="voices">${approved.map((x) => voiceCard(x, slug)).join("")}</div>
+    ${approved.length ? `<div class="panel">${approved.map((x) => voiceRow(x, slug)).join("")}</div>` : ""}
     <div class="section-head"><h2>No voice yet</h2>
       <div class="row tight">
         <button class="sm" data-act="cast-open" data-mode="sel" ${usel.size ? "" : "disabled"}>Cast selected…</button>
@@ -1239,6 +1487,18 @@ function castTab(sd, v, slug) {
       <tbody>${uncastRows || `<tr><td colspan="5" class="empty">Everyone in the bible has a voice.</td></tr>`}</tbody>
     </table></div>
     <p class="muted small">Casting everyone covers major and recurring characters who have spoken. The narrator reads the lines of anyone without a voice. The next free seed range starts at ${v.next_seed}.</p>`;
+}
+
+// An approved voice as one row that opens to its card.
+function voiceRow(x, slug) {
+  return `<details class="char" data-key="voice:${esc(x.id)}">
+      <summary>${x.media ? playBtn(x.media.url, `${x.name}, filed voice`) : ""}<span class="name">${esc(x.name)}</span>
+        ${x.importance ? `<span class="tag">${esc(x.importance)}</span>` : ""}
+        <span class="small muted">${x.chapters ? `in ${plural(x.chapters, "chapter")}` : ""}</span>
+        <span class="grow"></span>
+        ${(x.findings || []).length ? `<span class="pill review">takes flagged</span>` : ""}
+      </summary>
+      ${lazyBody(`voice:${x.id}`, () => voiceCard(x, slug), "body voice-body")}</details>`;
 }
 
 function voiceCard(x, slug) {
@@ -1252,7 +1512,7 @@ function voiceCard(x, slug) {
     x.effect && `<span class="tag">${esc(x.effect.effect)} effect</span>`,
   ].filter(Boolean).join(" · ");
   const bio = x.bio || [x.role, x.description].filter(Boolean).join(" ");
-  const rounds = x.history.slice().reverse().map((h) => `<div class="round">
+  const rounds = () => x.history.slice().reverse().map((h) => `<div class="round">
       <div class="small muted">Earlier round${h.replaced_at ? `, replaced ${esc(when(h.replaced_at))}` : ""}${h.why_replaced ? `: ${esc(h.why_replaced)}` : ""}</div>
       <div class="instruct small">${esc(h.instruct)}</div>
       ${candidates(x, h.candidates, null)}</div>`).join("");
@@ -1263,11 +1523,11 @@ function voiceCard(x, slug) {
         <span class="pill ${esc(x.status)}">${esc(x.status)}</span></div>
       <div class="small muted">${facts}</div>
       ${(x.findings || []).length ? `<div class="notice warn small">The take check flags many of this voice's takes for one reason, so the cause may be the voice, and those takes are not taken again: ${x.findings.map((f) => `chapter ${esc(f.chapter)} (${esc(f.reason)}, ${esc(f.takes)} of ${esc(f.of)} takes)`).join(", ")}.</div>` : ""}
-      ${x.bio ? `<div class="bio open">${esc(bio)}</div>` : bio ? `<div class="bio" data-act="expand" title="Click to expand">${esc(bio)}</div>` : ""}
-      <div class="instruct" data-act="expand" title="Click to expand">${esc(x.instruct)}</div>
+      ${x.bio ? `<div class="bio open">${esc(bio)}</div>` : bio ? `<div class="bio${OPEN.has(`bio:${x.id}`) ? " open" : ""}" data-act="expand" data-key="bio:${esc(x.id)}" title="Click to expand">${esc(bio)}</div>` : ""}
+      <div class="instruct${OPEN.has(`instruct:${x.id}`) ? " open" : ""}" data-act="expand" data-key="instruct:${esc(x.id)}" title="Click to expand">${esc(x.instruct)}</div>
       <div class="sample">“${esc(x.sample_text)}”</div>
       <details class="cands" data-key="cands:${esc(x.id)}"><summary>${plural(count, "candidate")}${x.history.length ? ` across ${x.history.length + 1} rounds` : ""}</summary>
-        ${candidates(x, x.candidates, x.seed)}${rounds}
+        ${lazyBody(`cands:${x.id}`, () => candidates(x, x.candidates, x.seed) + rounds(), "")}
       </details>
       <div class="actions">
         ${x.status !== "approved" ? `<button class="sm primary" data-act="pick" data-id="${esc(x.id)}" data-seed="${esc(x.seed)}" data-approve="1">Approve</button>` : ""}
@@ -1401,7 +1661,7 @@ function picks(key, image, list, current) {
     const btn = !filed ? `<button class="sm" data-act="pick-image" data-key="${esc(key)}" data-seed="${esc(c.seed)}">Use this</button>`
       : image.status !== "approved" ? `<button class="sm primary" data-act="pick-image" data-key="${esc(key)}" data-seed="${esc(c.seed)}">Approve</button>`
         : `<span class="small muted">filed</span>`;
-    return `<figure class="${filed ? "chosen" : ""}"><a href="${esc(c.url)}" target="_blank" rel="noopener"><img src="${esc(c.thumb)}" alt="Candidate, seed ${esc(c.seed)}" loading="lazy"></a><figcaption>${btn}</figcaption></figure>`;
+    return `<figure class="${filed ? "chosen" : ""}"><a href="${esc(c.url)}" target="_blank" rel="noopener" data-act="zoom" data-caption="Seed ${esc(c.seed)}"><img src="${esc(c.thumb)}" alt="Candidate, seed ${esc(c.seed)}" loading="lazy"></a><figcaption>${btn}</figcaption></figure>`;
   }).join("")}</div>`;
 }
 
@@ -1415,7 +1675,7 @@ function imageBlock(slug, key, name, image, look, models, style) {
       <div class="small muted">Earlier round${h.replaced_at ? `, replaced ${esc(when(h.replaced_at))}` : ""}${h.why_replaced ? `: ${esc(h.why_replaced)}` : ""}</div>
       ${picks(key, image, h.candidates, null)}</div>`).join("");
   return `<div class="art">
-      ${image.url ? `<a href="${esc(image.url)}" target="_blank" rel="noopener"><img class="main" src="${esc(image.url)}" alt="${esc(name)}" loading="lazy"></a>` : ""}
+      ${image.url ? `<a href="${esc(image.url)}" target="_blank" rel="noopener" data-act="zoom" data-caption="${esc(name)}"><img class="main" src="${esc(image.url)}" alt="${esc(name)}" loading="lazy"></a>` : ""}
       <div class="stack">
         <div class="row tight"><span class="pill ${esc(image.status)}">${esc(image.status)}</span>
           <span class="small muted">seed ${esc(image.seed)} · ${esc(models[image.model] || image.model)}</span>${drawBtn}</div>
@@ -1531,6 +1791,23 @@ function openDraw(slug, key, b) {
   });
 }
 
+// The images of one subject, shown large one at a time
+const ZOOM = { list: [], at: 0 };
+
+function showZoom() {
+  const it = ZOOM.list[ZOOM.at];
+  $("#zoom-img").src = it.url;
+  $("#zoom-open").href = it.url;
+  $("#zoom-cap").textContent = `${it.caption}${ZOOM.list.length > 1 ? ` · ${ZOOM.at + 1} of ${ZOOM.list.length}` : ""}`;
+  $$("[data-act=zoom-step]").forEach((b) => { b.hidden = ZOOM.list.length < 2; });
+}
+
+function zoomStep(by) {
+  if (ZOOM.list.length < 2) return;
+  ZOOM.at = (ZOOM.at + by + ZOOM.list.length) % ZOOM.list.length;
+  showZoom();
+}
+
 // Bible
 
 function bibleTab(b) {
@@ -1539,47 +1816,52 @@ function bibleTab(b) {
   const imps = ["all", ...IMPORTANCE];
   const style = shownStyle(b, slug);
   const art = (x) => x.images?.[style] || null;
+  // what the image filter reads of a row: the state of its image in the style, and whether the text has moved on
+  const artOf = (x) => ` data-art="${art(x) ? esc(art(x).status) : "none"}"${art(x) && (art(x).new_facts || art(x).changed) ? " data-fresh" : ""}`;
   const chars = b.characters.map((c) => {
     const ch = c.chapters_present || [];
     const search = [c.id, c.name, ...(c.aliases || []), c.role].join(" ").toLowerCase();
-    const facts = (c.facts || []).map((f) => `<li><b>ch ${esc(f.chapter)}</b><span>${esc(f.text)}</span></li>`).join("");
-    return `<details class="char" data-key="char:${esc(c.id)}" data-search="${esc(search)}" data-imp="${esc(c.importance)}">
-      <summary>${thumb(art(c))}<span class="name">${esc(c.name)}</span><span class="tag">${esc(c.importance)}</span>
-        <span class="small muted">${esc(c.gender)}, ${esc(String(c.age_group || "").replace("_", " "))}</span>
-        <span class="small muted">${ch.length ? `ch ${esc(rangeText(ch))}` : ""}</span>
-        <span class="grow"></span>
-        ${c.voice_id ? `<span class="pill ${esc(c.voice_status || "")}">${esc(c.voice_status || "voiced")}</span>` : c.speaks === false ? `<span class="tag">silent</span>` : `<span class="small muted">no voice</span>`}
-      </summary>
-      <div class="body">
-        ${imageBlock(slug, `characters/${c.id}`, c.name, art(c), c.look, b.draw.models, style)}
+    const body = () => {
+      const facts = (c.facts || []).map((f) => `<li><b>ch ${esc(f.chapter)}</b><span>${esc(f.text)}</span></li>`).join("");
+      return `${imageBlock(slug, `characters/${c.id}`, c.name, art(c), c.look, b.draw.models, style)}
         ${lookList(c.look)}
         ${(c.appearances || []).map((a) => `<div class="appearance"><div><b>${esc(titled(a.appearance))}.</b> <span class="small muted">A second appearance, with an image of its own.</span></div>
           ${imageBlock(slug, `characters/${a.id}`, a.name, art(a), a.look, b.draw.models, style)}
           ${lookList(a.look)}</div>`).join("")}
         <div><span class="mono small muted">${esc(c.id)}</span>${c.aliases?.length ? ` · also ${esc(c.aliases.join(", "))}` : ""}</div>
+        ${ch.length > 3 ? `<div><b>Chapters.</b> ${esc(rangeText(ch))}</div>` : ""}
         ${c.bio ? `<div><b>Casting bio.</b> ${esc(c.bio)}</div>` : ""}
         <div><b>Role.</b> ${esc(c.role)}</div>
         ${c.description ? `<div><b>Description.</b> ${esc(c.description)}</div>` : ""}
         <div><b>Voice brief.</b> ${esc(c.voice_brief)}</div>
-        ${facts ? `<div><b>Facts</b><ul class="facts">${facts}</ul></div>` : ""}
-      </div></details>`;
+        ${facts ? `<div><b>Facts</b><ul class="facts">${facts}</ul></div>` : ""}`;
+    };
+    return `<details class="char" data-key="char:${esc(c.id)}" data-search="${esc(search)}" data-imp="${esc(c.importance)}"${artOf(c)}>
+      <summary>${thumb(art(c))}<span class="name">${esc(c.name)}</span><span class="tag">${esc(c.importance)}</span>
+        <span class="small muted">${esc(c.gender)}, ${esc(String(c.age_group || "").replace("_", " "))}</span>
+        <span class="small muted">${esc(chapterSpan(ch))}</span>
+        <span class="grow"></span>
+        ${c.voice_id ? `<span class="pill ${esc(c.voice_status || "")}">voice ${esc(c.voice_status || "filed")}</span>` : c.speaks === false ? `<span class="tag">silent</span>` : `<span class="small muted">no voice</span>`}
+      </summary>
+      ${lazyBody(`char:${c.id}`, body)}</details>`;
   }).join("");
   const places = b.settings.map((s) => {
     const ch = s.chapters_present || [];
     const search = [s.id, s.name, ...(s.aliases || []), s.description].join(" ").toLowerCase();
-    return `<details class="char" data-key="place:${esc(s.id)}" data-search="${esc(search)}">
-      <summary>${thumb(art(s))}<span class="name">${esc(s.name)}</span>
-        <span class="small muted">${ch.length ? `ch ${esc(rangeText(ch))}` : ""}</span>
-        <span class="grow"></span>
-        ${art(s) ? `<span class="pill ${esc(art(s).status)}">${esc(art(s).status)}</span>` : `<span class="small muted">no image</span>`}
-      </summary>
-      <div class="body">
-        ${s.description ? `<div>${esc(s.description)}</div>` : ""}
+    const body = () => `${s.description ? `<div>${esc(s.description)}</div>` : ""}
         ${imageBlock(slug, `settings/${s.id}`, s.name, art(s), s.look, b.draw.models, style)}
         ${lookList(s.look)}
-        <div><span class="mono small muted">${esc(s.id)}</span>${s.aliases?.length ? ` · also ${esc(s.aliases.join(", "))}` : ""}</div>
-      </div></details>`;
+        ${ch.length > 3 ? `<div><b>Chapters.</b> ${esc(rangeText(ch))}</div>` : ""}
+        <div><span class="mono small muted">${esc(s.id)}</span>${s.aliases?.length ? ` · also ${esc(s.aliases.join(", "))}` : ""}</div>`;
+    return `<details class="char" data-key="place:${esc(s.id)}" data-search="${esc(search)}"${artOf(s)}>
+      <summary>${thumb(art(s))}<span class="name">${esc(s.name)}</span>
+        <span class="small muted">${esc(chapterSpan(ch))}</span>
+        <span class="grow"></span>
+        ${art(s) ? `<span class="pill ${esc(art(s).status)}">image ${esc(art(s).status)}</span>` : `<span class="small muted">no image</span>`}
+      </summary>
+      ${lazyBody(`place:${s.id}`, body)}</details>`;
   }).join("");
+  const arts = [["all", "all"], ["none", "no image"], ["review", "not approved"], ["fresh", "new details"]];
   const prons = [...b.pronunciations].sort((x, y) => (y.say ? 1 : 0) - (x.say ? 1 : 0));
   const overrides = prons.filter((p) => p.say).length;
   const busy = new Set((S.state?.jobs || []).filter((j) => j.kind === "say-as" && j.slug === S.route.slug
@@ -1595,7 +1877,11 @@ function bibleTab(b) {
   const pron = (S.pronEdit === "" ? pronEditRow({ term: "" }) : "") + prons.map(pronRow).join("");
   return `${looksBar(b, slug)}<div class="row" style="margin-bottom:12px">
       <input type="search" id="bible-q" data-input="bible-q" placeholder="Search names, aliases, roles, places" value="${esc(S.bibleQ)}" class="grow" style="min-width:200px">
+      <label class="inline small" title="A row's facts, looks and descriptions are built when it opens, so the browser's own search doesn't find them"><input type="checkbox" id="bible-text" data-change="bible-text"${S.bibleText ? " checked" : ""}> in facts and looks too</label>
+    </div>
+    <div class="row" style="margin-bottom:12px">
       <div class="filters">${imps.map((i) => `<button class="${S.bibleImp === i ? "on" : ""}" data-act="bible-imp" data-imp="${i}">${i.replace("_", " ")}</button>`).join("")}</div>
+      <div class="filters"><span class="small muted">Image</span>${arts.map(([v, label]) => `<button class="${S.bibleArt === v ? "on" : ""}" data-act="bible-art" data-art="${v}">${label}</button>`).join("")}</div>
     </div>
     <div class="panel">${chars || `<div class="empty">The bible is empty. Run the character pass.</div>`}</div>
     <div class="section-head"><h2>Settings</h2><span class="muted small grow">${b.settings.length || ""}</span></div>
@@ -1603,7 +1889,7 @@ function bibleTab(b) {
     <div class="panel">${places || `<div class="empty">None yet. The look pass adds them.</div>`}</div>
     <div class="section-head"><h2>Pronunciations</h2><span class="muted small grow">${prons.length}${overrides ? ` · ${plural(overrides, "override")}` : ""}</span>
       <button class="sm" data-act="pron-edit" data-term="">Add an override</button></div>
-    <p class="small muted">An override replaces the term with its spoken form in every line a voice reads, as a whole word with the same capitals. The text and the script keep the original spelling. A change applies from the next render, which regenerates only the lines that name the term.</p>
+    ${how("pron", "An override replaces the term with its spoken form in every line a voice reads, as a whole word with the same capitals. The text and the script keep the original spelling. A change applies from the next render, which regenerates only the lines that name the term.")}
     <div class="panel table-wrap"><table class="list pron"><thead><tr><th>Term</th><th class="hide-sm">Respelling</th><th>Say as</th><th class="hide-sm">Note</th><th class="hide-sm right">Ch</th><th></th></tr></thead>
       <tbody>${pron || `<tr><td colspan="6" class="empty">None yet.</td></tr>`}</tbody></table></div>`;
 }
@@ -1687,15 +1973,13 @@ function namesTab(nm, sd, slug) {
         <span class="grow"></span>
         ${t.say ? `<span class="pill ${unsteady ? "review" : "approved"}">${esc(t.say)}${unsteady ? " · unsteady" : ""}</span>` : t.options ? `<span class="pill auto">options</span>` : ""}
       </summary>
-      <div class="body">
-        ${warn ? `<div class="notice warn small">${warn}</div>` : ""}
+      ${lazyBody(`name:${t.term}`, () => `${warn ? `<div class="notice warn small">${warn}</div>` : ""}
         ${w ? `<div class="small"><b>Said as.</b> ${sounds}${w.count > w.ways.length ? ` · and ${w.count - w.ways.length} more` : ""}</div>` : ""}
         ${t.heard ? `<div class="small"><b>Written as.</b> ${top}${t.spellings > t.top.length ? ` · and ${t.spellings - t.top.length} more` : ""}</div>` : ""}
         ${t.held ? `<div class="small muted">The take check holds every take of this name to its spelling. A take in which both recognizers hear a sound the spelling doesn't have, such as an added syllable, is taken again by a render.${adds ? ` ${adds[0]} of ${adds[1]} takes add one` : " No take has been judged by this rule yet"}${waiting > 0 ? `, and ${plural(waiting, "chapter")} ${waiting === 1 ? "is" : "are"} still to be judged by it.` : "."}</div>` : ""}
         ${t.respelling ? `<div class="small"><b>Bible.</b> <span class="mono">${esc(t.respelling)}</span></div>` : ""}
         ${nameOptions(t, slug, working.has(t.term), nm.screens)}
-        <div class="row tight" style="margin-top:8px"><input id="name-say-${i}" data-name-say placeholder="or type a spelling to hear or save" value="${esc(t.say)}" maxlength="120" class="grow" style="min-width:160px">${said}</div>
-      </div></details>`;
+        <div class="row tight" style="margin-top:8px"><input id="name-say-${i}" data-name-say placeholder="or type a spelling to hear or save" value="${esc(t.say)}" maxlength="120" class="grow" style="min-width:160px">${said}</div>`)}</details>`;
   }).join("");
   const picked = Object.keys(S.namePicks[slug] || {});
   const chapters = [...new Set(picked.flatMap((term) => S.namePicks[slug][term]))];
@@ -1709,7 +1993,8 @@ function namesTab(nm, sd, slug) {
         <button class="sm primary" data-act="names-render" data-heard="${heard}" data-chapters="${esc(JSON.stringify(order))}">Render them when the queue is empty</button>` : ""}
       <button class="sm ghost" data-act="names-forget">Not now</button></div></div>` : "";
   const missing = nm.chapters.without.length;
-  return `${pass}<p class="small muted">How the takes said each name, over ${plural(nm.chapters.with.length, "chapter")}. The ways are sorted by sound, in phonetic letters, and a name whose takes have not been heard for sound yet shows how the recognizer wrote it. The sorting is a hint: in a listening check it agreed with the ear on about six clips in ten, so listen before you change a name. A name with a spelling of yours also shows how many takes add a sound to that spelling, and that count held up in a listening check: 23 of 25 such takes sounded wrong.${missing ? ` ${plural(missing, "chapter")} ${missing === 1 ? "has" : "have"} takes that an older check heard without names: ${esc(rangeText(nm.chapters.without))}.` : ""}</p>
+  return `${pass}<p class="small muted">How the takes said each name, over ${plural(nm.chapters.with.length, "chapter")}.${missing ? ` ${plural(missing, "chapter")} ${missing === 1 ? "has" : "have"} takes that an older check heard without names: ${esc(rangeText(nm.chapters.without))}.` : ""}</p>
+    ${how("names", "The ways are sorted by sound, in phonetic letters, and a name whose takes have not been heard for sound yet shows how the recognizer wrote it. The sorting is a hint: in a listening check it agreed with the ear on about six clips in ten, so listen before you change a name. A name with a spelling of yours also shows how many takes add a sound to that spelling, and that count held up in a listening check: 23 of 25 such takes sounded wrong.")}
     <div class="row" style="margin-bottom:12px"><span class="muted small grow">${shown.length} of ${plural(nm.terms.length, "name")}</span>
       <div class="filters"><button class="${S.namesAll ? "" : "on"}" data-act="names-all" data-all="0">${NAMES_UNSTABLE} ways or more</button><button class="${S.namesAll ? "on" : ""}" data-act="names-all" data-all="1">all</button></div></div>
     <div class="panel">${cards || `<div class="empty">No name has been heard yet. A render or a take check records them.</div>`}</div>`;
@@ -1730,11 +2015,33 @@ function pronEditRow(p) {
       </div></div></td></tr>`;
 }
 
+// What a row of the Bible tab says in its body, by the row's key, for a search that reads the bodies too
+const BIBLE_TEXT = new WeakMap();
+
+function bibleText(b) {
+  let text = BIBLE_TEXT.get(b);
+  if (text) return text;
+  text = new Map();
+  const looks = (x) => (x.look || []).map((f) => `${f.text} ${f.quote || ""}`);
+  for (const c of b.characters) {
+    text.set(`char:${c.id}`, [c.role, c.description, c.bio, c.voice_brief, ...(c.facts || []).map((f) => f.text),
+      ...looks(c), ...(c.appearances || []).flatMap(looks)].join(" ").toLowerCase());
+  }
+  for (const s of b.settings) text.set(`place:${s.id}`, [s.description, ...looks(s)].join(" ").toLowerCase());
+  BIBLE_TEXT.set(b, text);
+  return text;
+}
+
 function applyFilters() {
   const q = S.bibleQ.toLowerCase().trim();
-  $$("details.char").forEach((d) => {
-    // a setting has no importance, so only the search hides it
-    d.hidden = (q && !d.dataset.search.includes(q)) || (S.bibleImp !== "all" && "imp" in d.dataset && d.dataset.imp !== S.bibleImp);
+  const b = S.route.tab === "bible" ? S.data[routeKey(S.route)]?.extra : null;
+  const text = q && S.bibleText && b ? bibleText(b) : null;
+  const art = (d) => S.bibleArt === "all" || (S.bibleArt === "fresh" ? "fresh" in d.dataset
+    : S.bibleArt === "none" ? d.dataset.art === "none" : !["none", "approved"].includes(d.dataset.art));
+  $$("details.char[data-search]").forEach((d) => {
+    const found = !q || d.dataset.search.includes(q) || !!(text && (text.get(d.dataset.key) || "").includes(q));
+    // a setting has no importance, so the importance filter leaves it
+    d.hidden = !found || !art(d) || (S.bibleImp !== "all" && "imp" in d.dataset && d.dataset.imp !== S.bibleImp);
   });
   $$(".line[data-speaker]").forEach((l) => { l.hidden = !!S.spk && l.dataset.speaker !== S.spk; });
   $$("button.chip[data-act=spk]").forEach((b) => b.classList.toggle("off", !!S.spk && b.dataset.id !== S.spk));
@@ -1767,10 +2074,12 @@ VIEWS.jobs = () => {
         <button class="sm" data-act="queue-move" data-to="bottom">Move to bottom</button>
         <button class="sm danger" data-act="queue-cancel">Cancel ${picked}</button>` : `<span class="small muted">Drag a job by its handle, or select several and move them together.</span>`}
     </div>`;
+  const failed = done.filter((j) => FAILED.has(j.status));
+  const shown = S.finished === "failed" ? failed : done;
   return `<div class="page-head"><div><h1>Jobs</h1>
-      <div class="sub">${st.executor === "nomad"
+      ${how("jobs", st.executor === "nomad"
         ? "Renders, casting and the Claude passes run on the Nomad cluster, on whichever worker offers them. Jobs on different chapters or workers run side by side, and a worker runs one GPU job at a time. Quick library jobs run here."
-        : "Heavy jobs run one at a time and wait for anything else using the pipeline, including runs started outside the app. Quick jobs, such as picking a voice or importing a page, run straight away."}</div></div></div>
+        : "Heavy jobs run one at a time and wait for anything else using the pipeline, including runs started outside the app. Quick jobs, such as picking a voice or importing a page, run straight away.")}</div></div>
     ${st.executor === "nomad" ? workersPanel(st) : `<div class="panel pad machine">
       <div class="stat"><b><span class="pill ${c.up ? "done" : "down"}">${c.up ? "up" : "down"}</span></b><span>ComfyUI${c.version ? ` ${esc(c.version)}` : ""}</span></div>
       <div class="stat"><b>${c.up ? `${c.running || 0} running, ${c.pending || 0} waiting` : "not reachable"}</b><span>ComfyUI prompts</span></div>
@@ -1786,10 +2095,11 @@ VIEWS.jobs = () => {
     <div class="panel" id="queue">${bar}${rows.join("") || `<div class="empty">The queue is empty.</div>`}</div>
     <div class="section-head"><h2>Finished</h2>
       <div class="row tight">
+        ${failed.length || S.finished === "failed" ? `<div class="filters"><button class="${S.finished === "all" ? "on" : ""}" data-act="finished" data-show="all">all</button><button class="${S.finished === "failed" ? "on" : ""}" data-act="finished" data-show="failed">failed ${failed.length}</button></div>` : ""}
         ${st.finished_total > done.length ? `<button class="sm ghost" data-act="history-all">Show all ${st.finished_total}</button>` : ""}
         ${done.length ? `<button class="sm ghost" data-act="jobs-clear">Clear finished</button>` : ""}
       </div></div>
-    <div class="panel">${done.map(jobRow).join("") || `<div class="empty">No finished jobs yet.</div>`}</div>`;
+    <div class="panel">${shown.map(jobRow).join("") || `<div class="empty">${done.length ? "None of these jobs failed." : "No finished jobs yet."}</div>`}</div>`;
 };
 
 function progressRow(p) {
@@ -1851,21 +2161,29 @@ function jobRow(j) {
     if (j.exit_code != null && j.exit_code !== 0) meta.push(`exit code ${esc(j.exit_code)}`);
     if (j.note) meta.push(esc(j.note));
   }
+  if (j.status === "running" && j.stopping) {
+    const how = j.nomad?.requeue === "hold" ? "pausing" : j.nomad?.requeue === "now" ? "stopping, then queued again" : "stopping";
+    meta.push(`<span class="wait">${how}</span>`);
+  }
   const id = esc(j.id);
+  const paused = j.status === "queued" && !!j.paused;
   const log = `<button class="sm" data-act="job-log" data-id="${id}" data-title="${esc(j.title)}">Log</button>`;
   let btns = "";
-  if (j.status === "running") btns = log + `<button class="sm danger" data-act="job-stop" data-id="${id}" data-kind="${esc(j.kind)}" data-comfy="${j.comfy ? 1 : 0}" data-engine="${esc(j.meta?.engine || "")}">Stop</button>`;
-  else if (j.status === "queued") {
+  if (j.status === "running") {
+    const pause = j.pausable && !j.stopping ? `<button class="sm" data-act="job-pause" data-id="${id}" title="Stop this job where it is and keep it in the queue until you resume it. It keeps what it has made.">Pause</button>` : "";
+    btns = log + pause + `<button class="sm danger" data-act="job-stop" data-id="${id}" data-title="${esc(j.title)}" data-kind="${esc(j.kind)}" data-comfy="${j.comfy ? 1 : 0}" data-engine="${esc(j.meta?.engine || "")}" data-nomad="${j.nomad ? 1 : 0}" data-batch="${j.batch ? 1 : 0}" data-stopping="${j.stopping ? 1 : 0}">Stop</button>`;
+  } else if (j.status === "queued") {
     const move = (to, label, icon) => `<button class="icon" data-act="queue-move" data-to="${to}" data-id="${id}" title="${label}" aria-label="${label}">${icon}</button>`;
-    btns = move("top", "Move to the top", TOP_ICON) + move("up", "Move up", "▲") + move("down", "Move down", "▼")
+    btns = (paused ? `<button class="sm primary" data-act="job-resume" data-id="${id}">Resume</button>` : "")
+      + move("top", "Move to the top", TOP_ICON) + move("up", "Move up", "▲") + move("down", "Move down", "▼")
       + move("bottom", "Move to the bottom", BOTTOM_ICON)
       + `<button class="sm" data-act="job-cancel" data-id="${id}">Cancel</button>`;
   } else btns = (j.started ? log : "") + `<button class="sm" data-act="job-retry" data-id="${id}">Run again</button>`;
   const pick = j.status !== "queued" ? "" : `<div class="pick"><span class="grip" data-grip title="Drag to move">${GRIP_ICON}</span>`
     + `<input type="checkbox" data-change="qsel" data-id="${id}" ${S.qsel.has(j.id) ? "checked" : ""} aria-label="Select ${esc(j.title)}"></div>`;
-  return `<div class="job${pick ? ` queued${S.qsel.has(j.id) ? " sel" : ""}` : ""}" data-id="${id}" data-late="${lateJob(j) ? 1 : 0}">
+  return `<div class="job${pick ? ` queued${S.qsel.has(j.id) ? " sel" : ""}` : ""}${j.status === "running" ? " running" : ""}" data-id="${id}" data-late="${lateJob(j) ? 1 : 0}">
       ${pick}
-      <div><div class="row tight"><span class="pill ${esc(j.status)}">${esc(j.status)}</span><span class="title">${esc(j.title)}</span>${j.backlog ? `<span class="tag" title="Backlog work starts only when no job that is not backlog work runs or waits.">backlog</span>` : ""}</div>
+      <div><div class="row tight"><span class="pill ${paused ? "stopped" : esc(j.status)}">${paused ? "paused" : esc(j.status)}</span><span class="title">${esc(j.title)}</span>${j.backlog ? `<span class="tag" title="Backlog work starts only when no job that is not backlog work runs or waits.">backlog</span>` : ""}</div>
         <div class="meta">${meta.join(" · ")}</div></div>
       <div class="btns">${btns}</div>
       ${j.status === "running" && j.progress ? progressRow(j.progress) : ""}
@@ -1930,6 +2248,25 @@ const ACT = {
     paint();
   },
   filter: (el) => { S.filter[S.route.slug] = el.dataset.status; paint(); },
+  part: (el) => {
+    const slug = S.route.slug;
+    const folds = foldsFor(S.data[routeKey(S.route)].serial, slug);
+    const part = el.dataset.part;
+    if (folds.has(part)) folds.delete(part);
+    else folds.add(part);
+    store.set(`folds:${slug}`, { ...store.get(`folds:${slug}`, {}), [part]: folds.has(part) });
+    paint();
+  },
+  "ch-jump": (el) => {
+    const slug = S.route.slug;
+    const sd = S.data[routeKey(S.route)].serial;
+    const c = sd.chapters.find((x) => x.number === Number(el.dataset.n));
+    if (!c) return;
+    S.filter[slug] = "all";
+    foldsFor(sd, slug).delete(String(c.part));
+    paint();
+    $(`tr[data-row="${c.number}"]`)?.scrollIntoView({ block: "center" });
+  },
   process: () => openProcess(S.route.slug),
   "next-step": (el) => nextStep(S.route.slug, Number(el.dataset.n)),
   job: async (el) => {
@@ -1938,7 +2275,12 @@ const ACT = {
   },
   "ch-tab": (el) => { S.chTab = el.dataset.tab; store.set("chTab", S.chTab); paint(); },
   spk: (el) => { S.spk = el.dataset.id && S.spk !== el.dataset.id ? el.dataset.id : null; applyFilters(); },
-  expand: (el) => el.classList.toggle("open"),
+  expand: (el) => {
+    const open = el.classList.toggle("open");
+    if (!el.dataset.key) return;
+    if (open) OPEN.add(el.dataset.key);
+    else OPEN.delete(el.dataset.key);
+  },
   pick:(el) => queue([{ kind: "pick-voice", params: {
     slug: S.route.slug, character: el.dataset.id, seed: Number(el.dataset.seed), approve: el.dataset.approve === "1",
   } }]),
@@ -1951,6 +2293,17 @@ const ACT = {
     openCast(S.route.slug, el.dataset.mode === "sel" ? [...uselFor(S.route.slug)] : [], v);
   },
   "bible-imp": (el) => { S.bibleImp = el.dataset.imp; paint(); },
+  "bible-art": (el) => { S.bibleArt = el.dataset.art; paint(); },
+  zoom: (el) => {
+    const seen = new Set();
+    ZOOM.list = $$("[data-act=zoom]", el.closest(".art") || el.parentElement).map((a) => ({ url: a.getAttribute("href"), caption: a.dataset.caption || "" }))
+      .filter((it) => !seen.has(it.url) && seen.add(it.url));
+    ZOOM.at = Math.max(0, ZOOM.list.findIndex((it) => it.url === el.getAttribute("href")));
+    showZoom();
+    $("#zoomdlg").showModal();
+  },
+  "zoom-step": (el) => zoomStep(Number(el.dataset.by)),
+  "zoom-close": () => $("#zoomdlg").close(),
   "draw-open": (el) => openDraw(S.route.slug, el.dataset.key, S.data[routeKey(S.route)].extra),
   "bible-style": (el) => { store.set(`style:${S.route.slug}`, el.dataset.style); paint(); },
   "pick-image": (el) => queue([{ kind: "pick-image", params: { slug: S.route.slug, subject: el.dataset.key, seed: Number(el.dataset.seed),
@@ -2074,14 +2427,28 @@ const ACT = {
   },
   "job-log": (el) => openLog(el.dataset.id, el.dataset.title),
   "job-stop": async (el) => {
-    const d = el.dataset;
+    const d = { ...el.dataset };
     const extra = [];
     if (d.comfy === "1") extra.push("Its ComfyUI prompt is cancelled too.");
     if (d.kind === "render") extra.push(d.engine === "breeze" ? "Finished takes are kept for the next render." : "The render loses the progress it has made.");
-    if (!confirm(["Stop this job?", ...extra].join(" "))) return;
-    await post(`/api/jobs/${el.dataset.id}/cancel`);
-    await poll();
+    // An app without the flag would take the request for a plain stop, and a job that is stopping can't be asked
+    // back a second time.
+    const again = d.nomad === "1" && d.stopping !== "1" && !!S.state?.requeue;
+    if (d.batch === "1") extra.push("Stop also skips the queued jobs of its batch.");
+    if (again) extra.push("Stop and queue again keeps the job's place in the queue.");
+    openDialog({
+      title: "Stop this job?",
+      body: `<p><b>${esc(d.title)}</b></p>${extra.length ? `<p class="small muted">${esc(extra.join(" "))}</p>` : ""}`,
+      cancel: "Keep running",
+      submit: [...(again ? [["requeue", "Stop and queue again", ""]] : []), ["", "Stop", "danger"]],
+      onSubmit: async (form, how) => {
+        await post(`/api/jobs/${d.id}/cancel`, how === "requeue" ? { requeue: true } : {});
+        await poll();
+      },
+    });
   },
+  "job-pause": async (el) => { await post(`/api/jobs/${el.dataset.id}/pause`); await poll(); },
+  "job-resume": async (el) => { await post(`/api/jobs/${el.dataset.id}/resume`); await poll(); },
   "job-cancel": async (el) => { await post(`/api/jobs/${el.dataset.id}/cancel`); await poll(); },
   // A row's button moves that job, and a button of the selection bar moves every selected job.
   "queue-move": async (el) => {
@@ -2106,6 +2473,7 @@ const ACT = {
   },
   "jobs-clear": async () => { await post("/api/jobs/clear"); await poll(); },
   "history-all": async () => { S.allHistory = true; await poll(); },
+  finished: (el) => { S.finished = el.dataset.show; paint(); },
   "queue-hold": async (el) => { await post("/api/queue/pause", { paused: el.dataset.paused === "1" }); await poll(); },
   "node-hold": async (el) => {
     const d = el.dataset;
@@ -2128,9 +2496,9 @@ const CHANGE = {
   },
   "sel-all": (el) => {
     const sd = S.data[routeKey(S.route)].serial;
-    const f = S.filter[S.route.slug] || "all";
     const sel = selFor(S.route.slug);
-    sd.chapters.filter((c) => f === "all" || c.status === f).forEach((c) => (el.checked ? sel.add(c.number) : sel.delete(c.number)));
+    // only what the list shows, so nothing in a folded volume is selected unseen
+    shownChapters(sd, S.route.slug).forEach((c) => (el.checked ? sel.add(c.number) : sel.delete(c.number)));
     paint();
   },
   usel: (el) => {
@@ -2158,6 +2526,7 @@ const CHANGE = {
     paint();
   },
   "epub-pick": (el) => { S.epubFile = el.files[0] || null; },
+  "bible-text": (el) => { S.bibleText = el.checked; applyFilters(); },
   "import-process": (el) => store.set("importProcess", el.checked),
   "import-n": (el) => {
     const it = (S.imports[el.dataset.slug] || [])[Number(el.dataset.i)];
@@ -2165,17 +2534,30 @@ const CHANGE = {
   },
 };
 
+// The actions that read nothing a fetch could change, so a page that is shown from before a change allows them
+const LOCAL = new Set(["play", "pl-skip", "pl-close", "dlg-close", "log-close", "sel-none", "filter", "ch-tab", "spk",
+  "expand", "bible-imp", "bible-style", "bible-text", "bible-art", "names-all", "names-forget", "pron-edit",
+  "pron-cancel", "import-clear", "job-log", "history-all", "goto-log", "part", "ch-jump", "finished", "zoom",
+  "zoom-close", "zoom-step"]);
+
 document.addEventListener("click", async (e) => {
   const el = e.target.closest("[data-act]");
   if (!el || el.disabled) return;
   const fn = ACT[el.dataset.act];
   if (!fn) return;
+  // a link that is opened in a new tab on purpose stays a link
+  if (el.tagName === "A" && (e.ctrlKey || e.metaKey || e.shiftKey)) return;
   e.preventDefault();
+  if (S.stale.has(routeKey(S.route)) && $("#view").contains(el) && !LOCAL.has(el.dataset.act)) {
+    toast("This page is being fetched again. Try in a moment.");
+    return;
+  }
   try {
     await fn(el, e);
   } catch (err) {
     toast(err.message, true);
   }
+  owedNow();
 });
 
 document.addEventListener("change", async (e) => {
@@ -2198,6 +2580,49 @@ document.addEventListener("input", (e) => {
     (S.pronDraft[key] ||= {})[e.target.dataset.pron] = e.target.value;
   }
 });
+
+// A press in the view holds the paints nobody asked for, and the one that is owed comes a moment after it ends.
+document.addEventListener("pointerdown", (e) => {
+  if ($("#view").contains(e.target)) HOLD.down = Date.now();
+}, true);
+
+// What was asked for on the page is done, so a paint that waited for the press comes now.
+function owedNow() {
+  HOLD.until = 0;
+  if (HOLD.owed && !HOLD.down && !DRAG.ids) paint(true);
+}
+
+function pressEnded() {
+  if (!HOLD.down) return;
+  HOLD.down = 0;
+  HOLD.until = Date.now() + HOLD_AFTER;
+  clearTimeout(HOLD.timer);
+  HOLD.timer = setTimeout(() => {
+    if (HOLD.owed && !DRAG.ids) paint(true);
+  }, HOLD_AFTER + 20);
+}
+
+document.addEventListener("pointerup", pressEnded, true);
+document.addEventListener("pointercancel", pressEnded, true);
+document.addEventListener("selectionchange", () => { HOLD.selected = Date.now(); });
+
+// A details that opens gets its body before it shows, on the press and, for any other way of opening, on the event.
+document.addEventListener("click", (e) => {
+  const summary = e.target.closest ? e.target.closest("summary") : null;
+  const d = summary && summary.parentElement;
+  if (d && d.dataset.key && !d.open && $("#view").contains(d)) buildBody(d);
+}, true);
+
+document.addEventListener("toggle", (e) => {
+  const d = e.target;
+  if (!d.dataset || !d.dataset.key || !d.isConnected || !$("#view").contains(d)) return;
+  if (d.open) {
+    OPEN.add(d.dataset.key);
+    buildBody(d);
+  } else {
+    OPEN.delete(d.dataset.key);
+  }
+}, true);
 
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) poll();
@@ -2281,6 +2706,7 @@ document.addEventListener("pointerup", async () => {
     toast(err.message, true);
   }
   await poll();
+  owedNow();
 });
 
 document.addEventListener("pointercancel", () => {
@@ -2290,16 +2716,19 @@ document.addEventListener("pointercancel", () => {
 });
 
 document.addEventListener("keydown", (e) => {
+  if ($("#zoomdlg").open && (e.key === "ArrowLeft" || e.key === "ArrowRight")) zoomStep(e.key === "ArrowLeft" ? -1 : 1);
   if (e.key !== "Escape" || !DRAG.ids) return;
   dragEnd();
   paint();
 });
 
 $("#logdlg").addEventListener("close", () => { L.id = null; clearTimeout(L.timer); });
+// a press beside the image closes it
+$("#zoomdlg").addEventListener("click", (e) => { if (e.target.id === "zoomdlg" || e.target.classList.contains("zoom-body")) e.currentTarget.close(); });
 
 // Start
 
 initPlayer();
-window.addEventListener("hashchange", show);
+window.addEventListener("hashchange", () => show());
 show();
 poll().then(schedulePoll);

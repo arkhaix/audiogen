@@ -5,6 +5,8 @@ Origin, an allowed origin. That keeps other web pages in a local browser from dr
 """
 from __future__ import annotations
 
+import gzip
+import hashlib
 import json
 import os
 import re
@@ -19,7 +21,7 @@ from pathlib import Path
 
 from .. import library as lib
 from ..render import COMFY_OUTPUT
-from . import views
+from . import exchange, views
 from .jobs import FINISHED, INCOMING, JobManager, read_tail
 from .nomad import WorkerError
 
@@ -38,6 +40,13 @@ TYPES = {".html": "text/html; charset=utf-8", ".js": "text/javascript; charset=u
          ".webp": "image/webp", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
          ".opus": "audio/ogg; codecs=opus", ".flac": "audio/flac", ".wav": "audio/wav", ".mp3": "audio/mpeg", ".ogg": "audio/ogg", ".m4a": "audio/mp4",
          ".json": "application/json", ".txt": "text/plain; charset=utf-8", ".log": "text/plain; charset=utf-8"}
+GZIP_SUFFIXES = {".html", ".js", ".css", ".svg", ".json"}
+GZIP_MIN = 1024
+GZIP_LEVEL = 6
+GZIP_MAX_FILE = 4 * 1024 * 1024
+SLIM_DROP = ("args", "params")
+SLIM_NOMAD = ("node", "target", "dispatched_at", "requeue")
+_zipped_files: dict[Path, tuple[str, bytes]] = {}
 
 
 class HTTPError(Exception):
@@ -65,7 +74,8 @@ class Handler(BaseHTTPRequestHandler):
     # Plumbing
 
     def log_message(self, fmt, *args):
-        if self.command != "GET":
+        # a connection that times out before its first request has no command yet
+        if getattr(self, "command", "GET") != "GET":
             sys.stderr.write(f"{self.address_string()} {fmt % args}\n")
 
     def log_request(self, code="-", size="-"):
@@ -88,12 +98,56 @@ class Handler(BaseHTTPRequestHandler):
         if origin is not None and (origin == "null" or not self._name_ok(_host_name(urllib.parse.urlsplit(origin).netloc))):
             raise HTTPError(403, "cross-site request refused")
 
+    def _takes_gzip(self) -> bool:
+        """Whether the request's Accept-Encoding allows a gzip body."""
+        for part in (self.headers.get("Accept-Encoding") or "").lower().split(","):
+            name, _, params = part.partition(";")
+            if name.strip() != "gzip":
+                continue
+            weight = [p.partition("=")[2] for p in params.split(";") if p.partition("=")[0].strip() == "q"]
+            try:
+                return not weight or float(weight[0]) > 0
+            except ValueError:
+                return False
+        return False
+
+    def _not_modified(self, etag: str, vary: bool) -> bool:
+        """Answers 304 when the request already holds the body that etag names.
+
+        etag: the validator of the body that would be sent.
+        vary: whether the body depends on the request's Accept-Encoding.
+        Returns whether it answered. The caller sends nothing more when it did.
+        """
+        if etag not in (self.headers.get("If-None-Match") or ""):
+            return False
+        self.send_response(304)
+        self.send_header("ETag", etag)
+        if vary:
+            self.send_header("Vary", "Accept-Encoding")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return True
+
     def _send_json(self, data, status: int = 200) -> None:
         body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+        zipped = len(body) >= GZIP_MIN and self._takes_gzip()
+        # the state differs in every answer, so only a serial's pages get a validator
+        etag = None
+        if status == 200 and self.command == "GET" and self.path.startswith("/api/serials"):
+            etag = f'"{hashlib.blake2s(body, digest_size=8).hexdigest()}{"-gz" if zipped else ""}"'
+            if self._not_modified(etag, True):
+                return
+        if zipped:
+            body = gzip.compress(body, compresslevel=GZIP_LEVEL)
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", "no-cache" if etag else "no-store")
+        self.send_header("Vary", "Accept-Encoding")
+        if etag:
+            self.send_header("ETag", etag)
+        if zipped:
+            self.send_header("Content-Encoding", "gzip")
         self.end_headers()
         self.wfile.write(body)
 
@@ -201,17 +255,41 @@ class Handler(BaseHTTPRequestHandler):
 
     # Files
 
+    def _send_zipped(self, path: Path, etag: str, cache: bool) -> None:
+        """Sends the whole of a text file as gzip, or 304 when the request holds that body already.
+
+        path: the file, which exists.
+        etag: the validator of the file's gzip body.
+        cache: whether a browser may keep the body for an hour without asking again.
+        """
+        if self._not_modified(etag, True):
+            return
+        held = _zipped_files.get(path)
+        if held is None or held[0] != etag:
+            held = (etag, gzip.compress(path.read_bytes(), compresslevel=GZIP_LEVEL))
+            _zipped_files[path] = held
+        self.send_response(200)
+        self.send_header("Content-Type", TYPES.get(path.suffix.lower(), "application/octet-stream"))
+        self.send_header("Content-Length", str(len(held[1])))
+        self.send_header("Content-Encoding", "gzip")
+        self.send_header("Vary", "Accept-Encoding")
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", "max-age=3600" if cache else "no-cache")
+        self.end_headers()
+        self.wfile.write(held[1])
+
     def send_file(self, path: Path, cache: bool = False, download: str | None = None) -> None:
         if not path.is_file():
             raise HTTPError(404, f"no file {path.name}")
         st = path.stat()
         size = st.st_size
         etag = f'"{int(st.st_mtime)}-{size}"'
-        if self.headers.get("If-None-Match") == etag:
-            self.send_response(304)
-            self.send_header("ETag", etag)
-            self.send_header("Content-Length", "0")
-            self.end_headers()
+        text = path.suffix.lower() in GZIP_SUFFIXES
+        if (text and GZIP_MIN <= size <= GZIP_MAX_FILE and not download and not self.headers.get("Range")
+                and self._takes_gzip()):
+            self._send_zipped(path, f'{etag[:-1]}-gz"', cache)
+            return
+        if self._not_modified(etag, text):
             return
         start, end, status = 0, size - 1, 200
         rng = self.headers.get("Range")
@@ -236,6 +314,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("ETag", etag)
         self.send_header("Cache-Control", "max-age=3600" if cache else "no-cache")
+        if text:
+            self.send_header("Vary", "Accept-Encoding")
         if download:
             self.send_header("Content-Disposition", content_disposition(download))
         if status == 206:
@@ -284,12 +364,26 @@ def get_static(h: Handler, q, rel):
     h.send_file(_under(STATIC, rel))
 
 
+def _slim(job: dict) -> dict:
+    """A job as the page reads it: without its command, and with only the page's fields of its nomad record.
+
+    job: a job of the snapshot, which is left as it is.
+    Returns a new dict. A job without a nomad record has none here either.
+    """
+    out = {k: v for k, v in job.items() if k not in SLIM_DROP}
+    if isinstance(out.get("nomad"), dict):
+        out["nomad"] = {k: out["nomad"][k] for k in SLIM_NOMAD if k in out["nomad"]}
+    return out
+
+
 def get_state(h: Handler, q):
     snap = h.manager.snapshot()
     active = [j for j in snap["jobs"] if j["status"] not in FINISHED]
     finished = [j for j in snap["jobs"] if j["status"] in FINISHED]
     snap["finished_total"] = len(finished)
     snap["jobs"] = active + (finished if q.get("all") else finished[:RECENT_FINISHED])
+    if q.get("slim") == "1":
+        snap["jobs"] = [_slim(j) for j in snap["jobs"]]
     if h.mirror is not None:
         snap["mirror"] = h.mirror.status()
     h._send_json(snap)
@@ -332,6 +426,10 @@ def get_log(h: Handler, q, jid):
     h._send_json(h.manager.read_log(jid, int(q.get("offset") or 0)))
 
 
+def get_version(h: Handler, q):
+    h._send_json({"code": exchange.code_version(), "files": exchange.deployed_files()})
+
+
 def get_lib_media(h: Handler, q, rel):
     path = _under(lib.LIBRARY, rel, views.AUDIO_SUFFIXES | views.IMAGE_SUFFIXES)
     # an image's address carries its file's time, so a browser may keep it
@@ -344,13 +442,14 @@ def get_download(h: Handler, q, slug, n):
 
 
 def get_comfy_media(h: Handler, q, rel):
-    h.send_file(_under(COMFY_OUTPUT, rel, views.AUDIO_SUFFIXES), cache=True)
+    # a retake replaces a take's file under the same address, so a browser asks again before each play
+    h.send_file(_under(COMFY_OUTPUT, rel, views.AUDIO_SUFFIXES))
 
 
 def get_mirror_media(h: Handler, q, rel):
     if views.MEDIA_MIRROR is None:
         raise HTTPError(404, "this web app keeps no media mirror")
-    h.send_file(_under(views.MEDIA_MIRROR, rel, views.AUDIO_SUFFIXES), cache=True)
+    h.send_file(_under(views.MEDIA_MIRROR, rel, views.AUDIO_SUFFIXES))
 
 
 # POST
@@ -365,8 +464,28 @@ def post_jobs(h: Handler, q):
     h._send_json({"jobs": jobs, "already": len(covered)})
 
 
+def _job_answer(job: dict) -> dict:
+    """A job as the answer to a request shows it: without its key, as /api/state has it."""
+    out = {k: v for k, v in job.items() if k != "gave_way"}
+    if isinstance(out.get("nomad"), dict):
+        out["nomad"] = {k: v for k, v in out["nomad"].items() if k not in ("key", "marks")}
+    return out
+
+
 def post_cancel(h: Handler, q, jid):
-    h._send_json({"job": h.manager.cancel(jid)})
+    requeue = h.body_json().get("requeue", False)
+    if not isinstance(requeue, bool):
+        raise HTTPError(400, "requeue must be true or false")
+    job = _worker_manager(h).cancel(jid, requeue=True) if requeue else h.manager.cancel(jid)
+    h._send_json({"job": _job_answer(job)})
+
+
+def post_job_pause(h: Handler, q, jid):
+    h._send_json({"job": _job_answer(_worker_manager(h).pause(jid))})
+
+
+def post_job_resume(h: Handler, q, jid):
+    h._send_json({"job": _job_answer(_worker_manager(h).resume(jid))})
 
 
 def post_move(h: Handler, q, jid):
@@ -545,6 +664,7 @@ GET_ROUTES = [
     (rf"/api/serials/{SLUG}/names", get_names),
     (rf"/api/serials/{SLUG}/bible", get_bible),
     (rf"/api/jobs/{JOB}/log", get_log),
+    (r"/api/version", get_version),
     (r"/media/lib/(.+)", get_lib_media),
     (rf"/download/{SLUG}/(\d+)", get_download),
     (r"/media/comfy/(.+)", get_comfy_media),
@@ -554,6 +674,8 @@ GET_ROUTES = [
 POST_ROUTES = [
     (r"/api/jobs", post_jobs),
     (rf"/api/jobs/{JOB}/cancel", post_cancel),
+    (rf"/api/jobs/{JOB}/pause", post_job_pause),
+    (rf"/api/jobs/{JOB}/resume", post_job_resume),
     (rf"/api/jobs/{JOB}/move", post_move),
     (rf"/api/jobs/{JOB}/retry", post_retry),
     (r"/api/jobs/clear", post_clear),
@@ -575,6 +697,12 @@ class Server(ThreadingHTTPServer):
 
     # On Windows SO_REUSEADDR lets a second listener share the port. Elsewhere it only skips TIME_WAIT.
     allow_reuse_address = os.name != "nt"
+
+    def handle_error(self, request, client_address):
+        # a client that drops its connection, or lets it time out, is no fault of the app
+        if isinstance(sys.exc_info()[1], (ConnectionError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
 
     def server_bind(self):
         if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):

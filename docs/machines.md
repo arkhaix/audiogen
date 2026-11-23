@@ -74,6 +74,12 @@ It runs as the Windows service `Nomad` under LocalSystem, with data in `D:\nomad
 aj-legion5-tailscale`, then `pwsh -NoProfile -Command "Restart-Service Nomad"`. The client takes about 30 s to
 fingerprint before the node shows ready.
 
+The service depends on the Tailscale service, which can be started before the tailnet's DNS answers. The client
+looks its server's name up once, when it starts. On 2026-11-21 it started 31 s after a boot, the lookup of
+`containers.goblin-truck.ts.net` failed with "no such host", and the client never asked again: the service showed
+Running, the app showed the node down, and the log repeated `client.server_mgr: no servers available`. Restart the
+service when the log says that. It was the first such start in the logs, which go back to 2026-11-05.
+
 ### Parakeet
 
 Since 2026-11-08 the laptop checks takes and casting candidates with Parakeet, so its checks no longer need ComfyUI.

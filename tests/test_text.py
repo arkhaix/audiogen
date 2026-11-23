@@ -10,6 +10,7 @@ import json
 import subprocess
 import tempfile
 import unittest
+import urllib.error
 import zipfile
 from pathlib import Path
 from unittest import mock
@@ -33,6 +34,30 @@ PAGE = """<html><head><style>.cjZhYjNm { display: none; speak: never; }</style><
 </body></html>"""
 ENTRY = {"number": 3, "id": 77, "title": "Chapter 3: The One Act Play (1)", "url": "https://example.invalid/3",
          "date": "2026-01-01", "volume": 1, "volume_title": "Book One"}
+STORY = "https://www.royalroad.com/fiction/55/a-story"
+INDEX = [{"number": 3, "id": 903, "title": "Chapter 3: The One Act Play (1)",
+          "url": f"{STORY}/chapter/903/chapter-3-the-one-act-play-1", "date": "2026-10-19T16:02:04Z",
+          "volume": 1, "volume_title": "Book One"}]
+
+
+PREV = "<link rel='prev' href='/fiction/55/a-story/chapter/903/chapter-3-the-one-act-play-1'>"
+
+
+def saved_page(address: str, tag: str = '<link rel="canonical" href="{}"/>', prev: str = PREV) -> str:
+    """A saved page of the chapter after INDEX's last.
+
+    address: the address the page gives as its own.
+    tag: the tag that gives it.
+    prev: the tag that names the chapter before.
+    """
+    return ('<html><head>' + tag.format(address) + prev + '</head><body>'
+            '<h1 class="font-white">Chapter 4: The Gate</h1>'
+            '<time unixtime="1792512122" datetime="2026-10-20T16:02:02.0000000Z" format="U" >Tuesday</time>'
+            '<a href="/fiction/55/a-story/chapter/905/chapter-5-the-wall">Next Chapter</a>'
+            '<div class="chapter-inner chapter-content"><p>The gate stood open.</p></div></body></html>')
+
+
+BEYOND = saved_page(f"{STORY}/chapter/904/chapter-4-the-gate")
 
 
 class RoyalRoadTest(unittest.TestCase):
@@ -63,6 +88,55 @@ class RoyalRoadTest(unittest.TestCase):
         with self.assertRaises(royalroad.RoyalRoadError):
             royalroad.chapter(ENTRY, "<html><body><p>Checking your browser.</p></body></html>")
 
+    def test_a_page_beyond_the_index_gives_its_own_entry(self):
+        entry = royalroad.page_entry(BEYOND, 4, 55, INDEX)
+        self.assertEqual(entry, {"number": 4, "id": 904, "title": "", "url": f"{STORY}/chapter/904/chapter-4-the-gate",
+                                 "date": "2026-10-20T16:02:02Z", "volume": 0, "volume_title": ""})
+
+        # The entry makes the chapter, which has no volume, because a chapter page doesn't name one.
+        chapter = royalroad.chapter(entry, BEYOND)
+        self.assertEqual((chapter.number, chapter.label, chapter.title, chapter.part, chapter.part_title),
+                         (4, "Chapter 4", "The Gate", 0, ""))
+        self.assertEqual((chapter.source_id, chapter.source_url, chapter.published),
+                         (904, f"{STORY}/chapter/904/chapter-4-the-gate", "2026-10-20T16:02:02Z"))
+
+        # A page gives its address in og:url too, and in either kind of quotes with its attributes in any order.
+        address = f"{STORY}/chapter/904/chapter-4-the-gate?comments=2"
+        for tag in ('<meta property="og:url" content="{}">', "<meta content='{}' property='og:url'>",
+                    "<link href='{}' rel='canonical'>",
+                    f'<link rel="canonical" href="{STORY}"/><meta property="og:url" content="{{}}">'):
+            self.assertEqual(royalroad.page_entry(saved_page(address, tag), 4, 55, INDEX), entry, tag)
+
+    def test_a_page_that_is_not_a_new_chapter_of_the_serial_is_refused(self):
+        # A page of another fiction.
+        with self.assertRaisesRegex(royalroad.RoyalRoadError, "fiction 55, and the serial is fiction 56"):
+            royalroad.page_entry(BEYOND, 4, 56, INDEX)
+
+        # A page of a chapter that the index has under its own number.
+        with self.assertRaisesRegex(royalroad.RoyalRoadError, "chapter 3 of the saved index"):
+            royalroad.page_entry(saved_page(INDEX[0]["url"]), 4, 55, INDEX)
+
+        # A page that doesn't give the address of a chapter on Royal Road: one without an address, the fiction's own
+        # page, a page of another site, and a page of another site with a chapter's address in its query.
+        chapter = "/fiction/55/a-story/chapter/904/chapter-4-the-gate"
+        for page in (PAGE, saved_page(STORY), saved_page(f"https://notroyalroad.com{chapter}"),
+                     saved_page(f"https://example.invalid/read?from=https://www.royalroad.com{chapter}"),
+                     saved_page(chapter)):
+            with self.assertRaisesRegex(royalroad.RoyalRoadError, "address of a chapter"):
+                royalroad.page_entry(page, 4, 55, INDEX)
+
+    def test_a_page_beyond_the_index_has_to_follow_the_chapter_before_its_number(self):
+        # The page names chapter 903 as the one before it.
+        self.assertEqual(royalroad.page_entry(BEYOND, 4, 55, INDEX, 903)["id"], 904)
+        with self.assertRaisesRegex(royalroad.RoyalRoadError,
+                                    "comes after the chapter with the id 903, and chapter 4 has the id 904"):
+            royalroad.page_entry(BEYOND, 5, 55, INDEX, 904)
+
+        # The number stands as given when the chapter before it is not known, or the page doesn't name one.
+        self.assertEqual(royalroad.page_entry(BEYOND, 9, 55, INDEX, None)["number"], 9)
+        first = saved_page(f"{STORY}/chapter/904/chapter-4-the-gate", prev="")
+        self.assertEqual(royalroad.page_entry(first, 5, 55, INDEX, 904)["number"], 5)
+
     def test_titles_split_into_label_and_title(self):
         self.assertEqual(royalroad.split_title("Chapter 3: The One Act Play (1)", 3), ("Chapter 3", "The One Act Play (1)"))
         self.assertEqual(royalroad.split_title("Interlude - The Keeper", 9), ("Interlude", "The Keeper"))
@@ -73,6 +147,119 @@ class RoyalRoadTest(unittest.TestCase):
         self.assertEqual(royalroad.fiction_id("https://www.royalroad.com/fiction/12345/some-title"), 12345)
         with self.assertRaises(royalroad.RoyalRoadError):
             royalroad.fiction_id("https://example.invalid/fiction")
+
+
+class ImportSavedPageTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        patch = mock.patch.object(cli.lib, "LIBRARY", Path(tmp.name) / "library")
+        patch.start()
+        self.addCleanup(patch.stop)
+        cli.lib.save_serial("story", {"slug": "story", "title": "A Story", "chapters": 1,
+                                      "source": {"type": "royalroad", "url": STORY, "fiction_id": 55}})
+        self.index = cli.lib.serial_dir("story") / "source_index.yaml"
+        cli.lib.save_yaml(self.index, {"fiction_id": 55, "url": STORY, "volumes": [], "chapters": INDEX})
+        self.pages = Path(tmp.name)
+
+    def fetch(self, n: int, page: str | None, *more: str) -> tuple[int, str]:
+        """Runs `fetch story <n>` on the saved `page`, or on the saved index alone. Returns the exit code and what the
+        command printed."""
+        args = ["fetch", "story", str(n), "--no-refresh", *more]
+        if page is not None:
+            (self.pages / "page.htm").write_text(page, encoding="utf-8")
+            args = ["fetch", "story", str(n), "--html", str(self.pages / "page.htm"), *more]
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            code = cli.main(args)
+        return code, out.getvalue()
+
+    def test_a_chapter_beyond_the_index_is_imported_from_its_page(self):
+        index = self.index.read_bytes()
+        serial = (cli.lib.serial_dir("story") / "serial.yaml").read_bytes()
+        code, said = self.fetch(4, BEYOND)
+        self.assertEqual(code, 0, said)
+        meta, text = cli.lib.load_chapter("story", 4)
+        self.assertEqual(text, "# Chapter 4: The Gate\n\nThe gate stood open.\n")
+        self.assertEqual({k: meta[k] for k in ("number", "part", "part_title", "label", "title", "source_id",
+                                               "source_url", "published", "status")},
+                         {"number": 4, "part": 0, "part_title": "", "label": "Chapter 4", "title": "The Gate",
+                          "source_id": 904, "source_url": f"{STORY}/chapter/904/chapter-4-the-gate",
+                          "published": "2026-10-20T16:02:02Z", "status": "fetched"})
+
+        # The import writes its chapter's files alone.
+        self.assertEqual(self.index.read_bytes(), index)
+        self.assertEqual((cli.lib.serial_dir("story") / "serial.yaml").read_bytes(), serial)
+
+        # The chapter is still not in the index, and its page replaces the text when asked to.
+        code, said = self.fetch(4, BEYOND)
+        self.assertEqual((code, cli.lib.list_chapters("story")), (1, [4]))
+        self.assertIn("chapter 4: already fetched", said)
+        code, said = self.fetch(4, BEYOND.replace("stood open", "stood shut"), "--force")
+        self.assertEqual(code, 0, said)
+        self.assertEqual(cli.lib.load_chapter("story", 4)[1], "# Chapter 4: The Gate\n\nThe gate stood shut.\n")
+
+    def test_a_chapter_of_the_index_still_takes_its_entry_from_the_index(self):
+        code, said = self.fetch(3, PAGE)
+        self.assertEqual(code, 0, said)
+        meta, _ = cli.lib.load_chapter("story", 3)
+        self.assertEqual((meta["source_id"], meta["part"], meta["part_title"], meta["published"]),
+                         (903, 1, "Book One", "2026-10-19T16:02:04Z"))
+
+    def test_a_chapter_beyond_the_index_needs_a_page_of_its_own(self):
+        # Without a page, the index is the only source.
+        code, said = self.fetch(4, None)
+        self.assertEqual(code, 1)
+        self.assertIn("chapter 4: not in the source index", said)
+
+        # The page of a chapter that the index has is not chapter 4.
+        code, said = self.fetch(4, saved_page(INDEX[0]["url"]))
+        self.assertEqual(code, 1)
+        self.assertIn("chapter 4: the saved page is chapter 3 of the saved index", said)
+
+        # Nor is a page of another fiction, or a page that doesn't give the address of a chapter.
+        code, said = self.fetch(4, saved_page("https://www.royalroad.com/fiction/77/other/chapter/904/chapter-4"))
+        self.assertEqual(code, 1)
+        self.assertIn("chapter 4: the saved page is of fiction 77, and the serial is fiction 55", said)
+        code, said = self.fetch(4, PAGE)
+        self.assertEqual(code, 1)
+        self.assertIn("chapter 4: the saved page doesn't give the address of a chapter", said)
+
+        # An empty page is refused without a request to the site, and so is the number 0.
+        with mock.patch.object(cli.rr, "fiction") as site, mock.patch.object(cli.rr, "fetch") as get:
+            code, said = self.fetch(4, "")
+            self.assertEqual(code, 1)
+            self.assertIn("chapter 4: the saved page doesn't give the address of a chapter", said)
+            code, said = self.fetch(0, BEYOND)
+            self.assertEqual(code, 1)
+            self.assertIn("--html needs exactly one chapter number", said)
+        self.assertEqual((site.call_count, get.call_count), (0, 0))
+        self.assertEqual(cli.lib.list_chapters("story"), [])
+
+    def test_a_page_under_the_wrong_number_is_refused_by_the_chapter_before_it(self):
+        # Chapter 4 follows chapter 3 of the index.
+        self.assertEqual(self.fetch(4, BEYOND)[0], 0)
+
+        # The same page is not chapter 5, which would follow chapter 4 on disk.
+        code, said = self.fetch(5, BEYOND)
+        self.assertEqual(code, 1)
+        self.assertIn("chapter 5: the saved page comes after the chapter with the id 903, and chapter 4 has the id 904",
+                      said)
+
+        # The page that names chapter 4 as the one before it is chapter 5.
+        after = saved_page(f"{STORY}/chapter/905/chapter-5-the-wall",
+                           prev='<link rel="prev" href="/fiction/55/a-story/chapter/904/chapter-4-the-gate">')
+        code, said = self.fetch(5, after)
+        self.assertEqual(code, 0, said)
+        self.assertEqual(cli.lib.list_chapters("story"), [4, 5])
+        self.assertEqual(cli.lib.load_chapter("story", 5)[0]["source_id"], 905)
+
+    def test_the_serials_list_counts_a_chapter_beyond_the_index_as_known(self):
+        from serial_audio.web import views
+        self.assertEqual(self.fetch(3, PAGE)[0], 0)
+        self.assertEqual(self.fetch(4, BEYOND)[0], 0)
+        story = next(s for s in views.serials() if s["slug"] == "story")
+        self.assertEqual((story["known"], story["on_disk"]), (2, 2))
 
 
 CONTAINER = ('<?xml version="1.0"?><container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">'
@@ -861,6 +1048,58 @@ class AuditScriptsTest(unittest.TestCase):
             " chapter  kind     words  line  quote",
             f"       2  dropped     16     6  \"{GUARD}\""])
         self.assertEqual(after, before)
+
+
+class RoyalRoadFetchTest(unittest.TestCase):
+    """The page fetch: HTTP/2 with a Chrome fingerprint, the urllib fallback, and the challenge error."""
+
+    def setUp(self):
+        self.saved = (royalroad.MIN_INTERVAL, royalroad._last_request, royalroad._session)
+        royalroad.MIN_INTERVAL = 0
+        royalroad._last_request = 0.0
+        royalroad._session = None
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        royalroad.MIN_INTERVAL, royalroad._last_request, royalroad._session = self.saved
+
+    def _client(self, status, text):
+        answer = mock.Mock(status_code=status, text=text)
+        client = mock.Mock()
+        client.get.return_value = answer
+        return client
+
+    def test_a_page_is_fetched_over_http2_with_the_chrome_client(self):
+        client = self._client(200, "<html>the page</html>")
+        with mock.patch.object(royalroad, "_http2_client", return_value=client):
+            self.assertEqual(royalroad.fetch("https://www.royalroad.com/fiction/1/x"), "<html>the page</html>")
+        client.get.assert_called_once()
+        self.assertEqual(client.get.call_args.args[0], "https://www.royalroad.com/fiction/1/x")
+
+    def test_a_challenge_is_refused_with_its_reason(self):
+        client = self._client(403, "<title>Just a moment...</title>")
+        with mock.patch.object(royalroad, "_http2_client", return_value=client):
+            with self.assertRaisesRegex(royalroad.RoyalRoadError, "Cloudflare challenge"):
+                royalroad.fetch("https://www.royalroad.com/fiction/1/x")
+
+    def test_another_error_is_reported(self):
+        client = self._client(404, "")
+        with mock.patch.object(royalroad, "_http2_client", return_value=client):
+            with self.assertRaisesRegex(royalroad.RoyalRoadError, "HTTP 404"):
+                royalroad.fetch("https://www.royalroad.com/fiction/1/x")
+
+    def test_the_urllib_fallback_is_used_without_curl_cffi(self):
+        with mock.patch.object(royalroad, "_http2_client", return_value=None), \
+             mock.patch.object(royalroad, "_fetch_urllib", return_value="<html>fallback</html>") as fallback:
+            self.assertEqual(royalroad.fetch("https://www.royalroad.com/fiction/1/x"), "<html>fallback</html>")
+        fallback.assert_called_once_with("https://www.royalroad.com/fiction/1/x", 60)
+
+    def test_a_403_from_the_fallback_is_reported_as_a_challenge(self):
+        refused = urllib.error.HTTPError("https://www.royalroad.com/fiction/1/x", 403, "Forbidden", {}, None)
+        with mock.patch.object(royalroad, "_http2_client", return_value=None), \
+             mock.patch.object(royalroad, "_fetch_urllib", side_effect=refused):
+            with self.assertRaisesRegex(royalroad.RoyalRoadError, "Cloudflare challenge"):
+                royalroad.fetch("https://www.royalroad.com/fiction/1/x")
 
 
 if __name__ == "__main__":

@@ -108,9 +108,11 @@ job "serial-audio" {
       attempts  = 0
       unlimited = false
     }
-    # A laptop that sleeps through part of a render picks it up again.
+    # A laptop that sleeps through part of a render picks it up again when it
+    # is back within this time. After it the app queues the job again. The
+    # app's LOST_AFTER_MINUTES has to say the same.
     disconnect {
-      lost_after = "2h"
+      lost_after = "30m"
       replace    = false
       reconcile  = "keep_original"
     }

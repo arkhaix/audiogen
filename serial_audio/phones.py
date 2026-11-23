@@ -18,6 +18,7 @@ window and may match any part of it. Standard library only.
 """
 from __future__ import annotations
 
+import functools
 import re
 
 # vowels as (height from 0 open to 1 close, backness from 0 front to 1 back, rounded)
@@ -77,6 +78,7 @@ def indel(p: str) -> float:
     return MARK_COST if p in MARKS else WEAK.get(p, 1.0)
 
 
+@functools.lru_cache(maxsize=1 << 16)
 def sub(a: str, b: str) -> float:
     """The cost of hearing one phone as another.
 
@@ -110,6 +112,7 @@ def weight(phones: str) -> float:
     return sum(indel(p) for p in phones) or 1.0
 
 
+@functools.lru_cache(maxsize=1 << 16)
 def within(ref: str, window: str) -> tuple[float, int, int]:
     """The part of a window that is nearest a reference.
 
@@ -140,6 +143,7 @@ def apart(ref: str, window: str) -> float:
     return round(within(ref, window)[0] / weight(ref), 3)
 
 
+@functools.lru_cache(maxsize=1 << 16)
 def whole(a: str, b: str) -> float:
     """How far apart two phone strings are, end to end.
 

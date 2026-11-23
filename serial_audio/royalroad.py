@@ -1,4 +1,9 @@
-"""Royal Road -> chapters, with the standard library only.
+"""Royal Road -> chapters.
+
+Royal Road's Cloudflare answers an HTTP/1.1 request from a script with a "Just a moment..." challenge. A page
+is fetched over HTTP/2 with a Chrome TLS fingerprint through curl_cffi, which the site accepts; without
+curl_cffi the standard library's urllib is used, and the site challenges it. The parser needs only the
+standard library.
 
 The fiction page carries the chapter index as `window.chapters = [...]`. Each chapter page holds the
 text in `div.chapter-inner.chapter-content`; a decoy paragraph ("You could be reading stolen content")
@@ -15,6 +20,8 @@ import gzip
 import json
 import re
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
@@ -24,32 +31,78 @@ USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHT
               "Chrome/130.0 Safari/537.36")
 MIN_INTERVAL = 2.0          # seconds between requests: this is one reader, not a crawler
 FICTION_RE = re.compile(r"royalroad\.com/fiction/(\d+)(?:/([^/?#]+))?")
+HOSTS = ("www.royalroad.com", "royalroad.com")
+CHAPTER_PATH_RE = re.compile(r"/fiction/(\d+)/[^/]+/chapter/(\d+)(?:/.*)?")
+ATTR_RE = re.compile(r"""([\w:-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')""")
+PUBLISHED_RE = re.compile(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)(?:\.\d+)?Z")
 HIDDEN_RE = re.compile(r"\.([\w-]+)\s*\{[^}]*display\s*:\s*none", re.S)
 TITLE_RE = re.compile(r"^\s*((?:chapter|ch\.?|interlude|epilogue|prologue)\s*[\w.]*)\s*[:.\-–—|]\s*(.+?)\s*$",
                       re.IGNORECASE)
 _last_request = 0.0
+_session = None
+IMPERSONATE = "chrome"      # curl_cffi's Chrome TLS fingerprint: Royal Road's Cloudflare accepts it over HTTP/2
 
 
 class RoyalRoadError(RuntimeError):
     pass
 
 
+def _http2_client():
+    """The HTTP/2 client, or None when curl_cffi is not installed.
+
+    One session stands for one reader: the site's cookies and the connection stay together, as MIN_INTERVAL's
+    pacing expects. The import is lazy so the rest of the pipeline runs without curl_cffi.
+    """
+    global _session
+    if _session is None:
+        try:
+            from curl_cffi import requests as _requests
+        except ImportError:
+            return None
+        _session = _requests.Session(impersonate=IMPERSONATE)
+    return _session
+
+
+def _fetch_urllib(url: str, timeout: float) -> str:
+    """GET a page with the standard library. Royal Road's Cloudflare challenges this path."""
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html",
+                                               "Accept-Encoding": "gzip", "Accept-Language": "en"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = resp.read()
+        if resp.headers.get("Content-Encoding") == "gzip":
+            data = gzip.decompress(data)
+    return data.decode("utf-8", errors="replace")
+
+
+def _blocked(url: str, status: int) -> str:
+    """The error for a page that the site's bot check refused."""
+    return (f"{url}: Royal Road answered with a Cloudflare challenge ({status}). Its pages need an HTTP/2 request "
+            f"with a browser TLS fingerprint; install curl_cffi (requirements.txt).")
+
+
 def fetch(url: str, *, timeout: float = 60) -> str:
-    """GET a page politely (one request every MIN_INTERVAL seconds, browser user agent, gzip)."""
+    """GET a page politely: one request every MIN_INTERVAL seconds, over HTTP/2 with a Chrome fingerprint."""
     global _last_request
     wait = MIN_INTERVAL - (time.monotonic() - _last_request)
     if wait > 0:
         time.sleep(wait)
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "text/html",
-                                               "Accept-Encoding": "gzip", "Accept-Language": "en"})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = resp.read()
-            if resp.headers.get("Content-Encoding") == "gzip":
-                data = gzip.decompress(data)
+        client = _http2_client()
+        if client is None:
+            try:
+                return _fetch_urllib(url, timeout)
+            except urllib.error.HTTPError as e:
+                if e.code == 403:
+                    raise RoyalRoadError(_blocked(url, e.code)) from None
+                raise RoyalRoadError(f"{url}: HTTP {e.code}") from None
+        resp = client.get(url, timeout=timeout)
+        if resp.status_code == 403 and "Just a moment" in resp.text:
+            raise RoyalRoadError(_blocked(url, resp.status_code))
+        if resp.status_code >= 400:
+            raise RoyalRoadError(f"{url}: HTTP {resp.status_code}")
+        return resp.text
     finally:
         _last_request = time.monotonic()
-    return data.decode("utf-8", errors="replace")
 
 
 def fiction_id(url_or_id: str) -> int:
@@ -346,6 +399,61 @@ class Chapter:
     def text(self) -> str:
         head = f"# {self.label}: {self.title}" if self.title else f"# {self.label}"
         return head + "\n\n" + "\n\n".join(self.blocks) + "\n"
+
+
+def _tags(html: str, name: str) -> list[dict]:
+    """The attributes of each `name` tag of a page, in the page's order."""
+    return [{k.lower(): _unescape(a or b).strip() for k, a, b in ATTR_RE.findall(tag)}
+            for tag in re.findall(rf"<{name}\b[^>]*>", html, re.I)]
+
+
+def _chapter_address(url: str, relative: bool = False) -> tuple[int, int, str] | None:
+    """The fiction id, the chapter id and the path of a chapter's address on Royal Road, or None for any other address.
+
+    url: the address.
+    relative: also take an address without a host.
+    """
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return None
+    m = CHAPTER_PATH_RE.fullmatch(parts.path)
+    if not m or not (parts.hostname in HOSTS or (relative and not parts.netloc)):
+        return None
+    return int(m.group(1)), int(m.group(2)), parts.path
+
+
+def page_entry(html: str, number: int, fiction: int, index: list[dict], before: int | None = None) -> dict:
+    """The index entry of a chapter that the saved index doesn't have, read from the chapter's saved page.
+
+    html: the saved page.
+    number: the chapter's number in the serial.
+    fiction: the id of the serial's fiction.
+    index: the entries of the saved index.
+    before: the id of chapter `number - 1`, or None when that chapter is not known.
+    Returns an entry as `fiction()` gives it, with no title and no volume. Raises RoyalRoadError when the page doesn't
+    give the address of a chapter on Royal Road, is of another fiction, is a chapter that the index has, or names
+    another chapter than `before` as the one before it.
+    """
+    links = [(t.get("rel", "").lower().split(), t.get("href", "")) for t in _tags(html, "link")]
+    own = [href for rel, href in links if "canonical" in rel]
+    own += [t.get("content", "") for t in _tags(html, "meta") if t.get("property") == "og:url"]
+    found = next((a for a in map(_chapter_address, own) if a), None)
+    if not found:
+        raise RoyalRoadError("the saved page doesn't give the address of a chapter")
+    of, cid, path = found
+    if of != fiction:
+        raise RoyalRoadError(f"the saved page is of fiction {of}, and the serial is fiction {fiction}")
+    known = next((c for c in index if c.get("id") == cid), None)
+    if known:
+        raise RoyalRoadError(f"the saved page is chapter {known['number']} of the saved index")
+    prev = next((a for a in (_chapter_address(href, True) for rel, href in links if "prev" in rel) if a), None)
+    if prev and before is not None and prev[1] != before:
+        raise RoyalRoadError(f"the saved page comes after the chapter with the id {prev[1]}, and chapter "
+                             f"{number - 1} has the id {before}")
+    when = PUBLISHED_RE.fullmatch(next((t["datetime"] for t in _tags(html, "time") if t.get("datetime")), ""))
+    return {"number": number, "id": cid, "title": "", "url": BASE + path,
+            "date": f"{when.group(1)}Z" if when else "", "volume": 0, "volume_title": ""}
 
 
 def chapter(entry: dict, html: str | None = None) -> Chapter:

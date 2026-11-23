@@ -239,48 +239,13 @@ def media_files(folder: Path, changed: dict | None) -> list[str]:
         serial.
     Returns the paths that are files on this node, sorted. Never raises.
     """
-    import yaml
-    said = folder / "bible" / "pronunciations.yaml"
-    if changed is None:
-        voices = sorted((folder / "voices").glob("*.yaml"))
-        chapters = sorted(p.parent for p in (folder / "chapters").glob(f"*/{exchange.TAKES_FILE}"))
-    else:
-        voices = [folder / rel for rel in changed if rel.startswith("voices/") and rel.endswith(".yaml")]
-        chapters = sorted({folder / "chapters" / rel.split("/")[1] for rel in changed
-                           if rel.startswith("chapters/") and rel.count("/") >= 2})
-    out = set()
-    if changed is None or "bible/pronunciations.yaml" in changed:
-        try:
-            entries = yaml.safe_load(said.read_text(encoding="utf-8"))
-        except (OSError, ValueError, yaml.YAMLError):
-            entries = None
-        for entry in entries.values() if isinstance(entries, dict) else []:
-            options = entry.get("options") if isinstance(entry, dict) else None
-            candidates = options.get("candidates") if isinstance(options, dict) else None
-            for c in candidates if isinstance(candidates, list) else []:
-                if isinstance(c, dict) and isinstance(c.get("clip"), str):
-                    out.add(c["clip"])
-    for path in voices:
-        if path.name == "_briefs.yaml":
-            continue
-        try:
-            rec = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-            for batch in [rec] + list(rec.get("history") or []):
-                for c in batch.get("candidates") or []:
-                    if isinstance(c, dict):
-                        out.update(v for v in (c.get("clip"), c.get("voice_file")) if isinstance(v, str))
-        except (OSError, ValueError, AttributeError, TypeError, yaml.YAMLError):
-            continue
-    for chapter in chapters:
-        out.update(exchange.take_files(chapter).values())
-
     def sendable(p: str) -> bool:
         try:
             return Path(p).suffix.lower() in exchange.MIRROR_SUFFIXES and Path(p).stat().st_size > 0
         except OSError:
             return False
 
-    return sorted(p for p in out if sendable(p))
+    return sorted(p for p in exchange.named_media(folder, changed) if sendable(p))
 
 
 def app_call(call, down: threading.Event, stop: threading.Event | None = None, fatal: tuple = (403, 404, 410)):
@@ -673,17 +638,8 @@ class Held:
 
 def comfy_marker(info: dict) -> str | None:
     """The text that marks this job's ComfyUI prompts in their graphs, or None for a job that queues none."""
-    slug, kind = info.get("slug") or "", info.get("kind")
-    chapters = info.get("chapters") or []
-    if kind == "render" and chapters:
-        return f"{slug}/ch{int(chapters[0]):04d}"
-    if kind == "cast":
-        return f"cast/{slug}/"
-    if kind == "draw":
-        return f"images/{slug}/"
-    if kind == "check-takes" and chapters:
-        return f"breeze/{slug}/ch{int(chapters[0]):04d}/"
-    return None
+    from .web import kinds
+    return kinds.comfy_marker(info.get("kind"), info.get("slug") or "", info.get("chapters") or [])
 
 
 def cancel_comfy(comfy_url: str, marker: str) -> list[str]:

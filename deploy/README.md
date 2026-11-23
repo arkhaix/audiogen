@@ -32,7 +32,7 @@ Everything lives in `/opt/serial-audio`, its own compose project beside the hous
 * `compose.yml` is a copy of `deploy/docker/compose.yml`.
 * `src/` holds the repo's code: `serial_audio`, `prompts`, `schemas` and `deploy`.
 * `library/` is the library. It is the copy of record, so nothing else should write to it.
-* `state/` holds job records, job logs, `conflicts/` and `media/`, the media mirror (below).
+* `state/` holds job records, job logs, `conflicts/` and `media/`, the media mirror (below). `jobs.json` and `placement.json` each have a copy beside them, `<name>.bak`, which the app writes once every ten minutes. When one of the two can't be read at a start, the app moves it to `<name>.unreadable`, loads the copy, writes the file again and says so on the page. The copy can be ten minutes old, so look at what the queue shows. Each later start says that `<name>.unreadable` is still there, and removes no job log while `jobs.json.unreadable` is. Remove the file when you have looked at it.
 * `incoming/` holds uploaded EPUBs and saved pages.
 * `secrets/nomad-token` holds the dispatch token, mode 600, owned by aj.
 
@@ -56,6 +56,16 @@ the laptop and `._*` files from the Mac (CLAUDE.md, Gotchas).
 
 Logs: `ssh aj@containers docker logs --tail 50 serial-audio`. A worker always runs the code the app runs, because it
 fetches the code with its job, so a deploy needs nothing on the nodes.
+
+`GET /api/version` says what the app runs: `code`, the version a worker's bundle has, and `files`, the SHA-256 of
+every file under `serial_audio`, `prompts` and `schemas` in the image. A deployed file has LF line endings, so
+compare a hash with `git show HEAD:<path> | sha256sum`, not with the hash of a CRLF file in the laptop's tree. The
+list doesn't have `deploy/`, which is not in the image.
+
+`/api/state` has `tick`, which says how the app's job loop fares: when its last pass completed, how long ago, and the
+failure of the newest pass. The page shows a banner when no pass has completed for 30 s or the newest one failed,
+and the failure is in the container's log with its traceback. `notices` there lists what the app had to say about
+its own state at its start, such as a state file it could not read.
 
 ### Backup
 
@@ -179,9 +189,9 @@ none is (`SERIAL_AUDIO_COMFY_MAIN`, `docs/machines.md`).
 2. The task's `bootstrap.py` fetches the job's bundle from the app: the code, the prompts and schemas, and the serial's folder without its audio and its images, about 1.5 MB for Twenty Thousand Leagues.
 3. A GPU job takes the machine's GPU lock first (`C:\ProgramData\serial-audio\gpu.lock`, or `/tmp/serial-audio-gpu.lock`), so two GPU jobs on one machine run one after the other, whoever dispatched them. It also waits while ComfyUI is busy with another prompt and, on Windows, while a render or pipeline script started by hand runs. It then fetches from the app the chapter's saved takes that its node lacks (The media mirror, below). Then the worker runs the CLI steps in its copy of the serial and sends the log to the app every 3 seconds.
 4. At the end the worker sends the app the takes and cast candidates its node made, and then every file the steps created or changed. The app writes a file only when the library copy still has the hash it had when the bundle was made. A file that changed meanwhile goes to `state/conflicts/<job id>/` instead, and the job's note says so. A failed or stopped job writes back only the files a rerun can use, such as `breeze_takes.json`, the casting briefs, the images a draw finished and the chapters a look pass read. The look pass and the draw write each of those files whole, under another name first, so a stop can't send back half a file. A failed Claude pass writes back the chapters it finished, because the passes save each chapter as it completes.
-5. Stop in the app asks the worker to stop. It kills the CLI within a few seconds, cancels the job's ComfyUI prompts and reports. A job no node has started yet is cancelled at once, and its dispatch exits as soon as a node starts it. A dispatch that fails or times out is tried again with the same idempotency token, so Nomad never runs it twice.
+5. Stop in the app asks the worker to stop. It kills the CLI within a few seconds, cancels the job's ComfyUI prompts and reports. A job no node has started yet is cancelled at once, and its dispatch exits as soon as a node starts it. A dispatch that fails or times out is tried again with the same idempotency token, so Nomad never runs it twice. A plain Stop ends the job as stopped and skips the queued jobs of its batch. Stop and queue again, in the Stop dialog of a job on the cluster, asks for the same stop and then puts the job back in its place in the queue, and the batch stays as it is. Pause on a running job does that too and keeps the job out until Resume. Pause is offered only for a job that keeps what it made: a Breeze render before its join, which keeps its takes and hears the new ones again, and a draw that is not a redraw (`_pausable()` in `serial_audio/web/nomad.py`). Either way the stage that was stopped runs again under another key, and the stages before it stand. A job whose node is disconnected goes back into the queue at once, because no worker can confirm. A worker that doesn't confirm the stop within 90 seconds leaves the job stopped, because its task may still run, and its batch is then skipped as for a stop.
 6. A worker that finishes a `breeze` job sends the version of its code with the result. The app answers with the job it would dispatch to that node next, when that is a `breeze` job too and the worker runs the app's code. The worker fetches that job's bundle and runs it in the same task, so the app doesn't dispatch a Nomad job for it, and the job's log says which task it runs in. The worker keeps the GPU lock from its first job to its last. The breeze-server and the Parakeet process its steps started stay up between the jobs, recorded in a registry beside the lock (`gpu.kept.json`, `serial_audio/kept.py`), so the next job doesn't load a model. The worker stops them when the app doesn't hand it a job, when a job fails or is stopped, when a handed job has other code than its own, and before it waits for something outside the job. A step that finds ComfyUI busy stops the kept breeze-server before it waits, so ComfyUI has the card. On Windows they also sit in a job object the worker holds, so they end with it however it ends. A worker that finds processes in the registry when it takes the lock stops them first. A handed job whose task ends before it fetched the bundle is queued again. `HAND_NEXT` in `serial_audio/web/nomad.py` turns the handing off.
-7. A job whose node goes away is queued again. Nomad calls the allocation lost when its node has been disconnected for 2 hours (`lost_after` in the job spec), and the app also counts a task that failed after it saw the node disconnected. The stage that did not end runs again on any node that offers it, under another key, so the worker that went away can't send anything for it. The stages before it stand, and the batch jobs that wait for the job stay queued. A job that was asked to stop is not queued again. A job is queued again twice in a row at most, and a result of any stage starts that count again (`LOST_BACKS` in `serial_audio/web/nomad.py`, where 0 switches the rule off).
+7. A job whose node goes away is queued again. Nomad calls the allocation lost when its node has been disconnected for 30 minutes (`lost_after` in the job spec, which `LOST_AFTER_MINUTES` in `serial_audio/web/nomad.py` has to match for the note a waiting job shows), and the app also counts a task that failed after it saw the node disconnected. The stage that did not end runs again on any node that offers it, under another key, so the worker that went away can't send anything for it. The stages before it stand, and the batch jobs that wait for the job stay queued. A job that was asked to stop is not queued again. A job is queued again twice in a row at most, and a result of any stage starts that count again (`LOST_BACKS` in `serial_audio/web/nomad.py`, where 0 switches the rule off).
 
 Jobs on different chapters, serials or nodes run at the same time. Jobs on the same chapter wait for each other, and
 so does any job beside one that changes a whole serial (a cast, casting bios, picking a voice, fetching from the
@@ -208,7 +218,7 @@ everyone who needs a voice, and each later one names the chapter whose pass it f
 meta, "Cast · ch 55" in the queue). A render or a take check waits for a cast, which gives its speakers their voices,
 but not for one that follows a later chapter's pass. So a chapter renders once the passes and casts up to its own
 chapter and its screenplay are done. A cast for everyone that finds nobody who needs a voice is skipped when its turn
-comes, without a dispatch. A laptop that sleeps through part of a render has 2 hours to come back before Nomad
+comes, without a dispatch. A laptop that sleeps through part of a render has 30 minutes to come back before Nomad
 gives the allocation up, and the render is then queued again (point 7, above).
 
 A job of a Process batch waits by the same rules and for nothing else, so a chapter renders as soon as its voices are
@@ -270,6 +280,19 @@ Its log ends with how many files it sent. While the app is unreachable, a worker
 before it gives up on the audio and goes on to the result. A job's log says so when a file did not arrive, and the
 next job on that chapter on the same node sends it again.
 
+A chapter's takes get a path on the node that last worked on them, so each move of a chapter to another node leaves
+the old node's copies in the mirror. A `prune-media` job removes the mirror's files that no takes file, voice
+record or say-as option of any serial names. It keeps a file that changed in the last `days` days (7, and 1 at the
+least), because a worker sends its audio ahead of the result that names it, and the app dates a copy again when
+it tells a worker that it holds it. It leaves a file that is not audio. It removes nothing when a record of a
+serial can't be read, or when the mirror and the library are not apart. It runs on the app's machine, has no button, and nothing queues it by itself. Count first
+with a dry run, and read the job's log:
+
+```
+curl -s -X POST http://containers.goblin-truck.ts.net:8765/api/jobs -H 'X-Serial-Audio: 1' \
+  -d '{"jobs": [{"kind": "prune-media", "params": {"dry_run": true}}]}'
+```
+
 ---
 
 ## Known limits
@@ -278,7 +301,7 @@ next job on that chapter on the same node sends it again.
 * The worker doesn't send back deleted files. Only fetch and reset-bible delete library files, and they run on the app's machine.
 * A Drama 3 render, a Drama 3 decode, a Qwen cast and a draw need ComfyUI, which only the laptop has.
 * A join or a take check of a chapter whose takes the mirror lacks waits for the node that holds them.
-* The mirror keeps one copy of a chapter's takes for each node that worked on the chapter, about 70 MB each, and nothing removes the copies the library no longer names. The daily backup leaves the mirror out, because the nodes hold the takes too.
+* The mirror keeps one copy of a chapter's takes for each node that worked on the chapter, about 70 MB each, until a `prune-media` job removes the copies the library no longer names (The media mirror, above). The daily backup leaves the mirror out, because the nodes hold the takes too.
 * The Claude passes run only on a Linux node with aj's install of `claude`, which today is dev-arch.
 
 ---

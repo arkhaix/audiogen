@@ -32,6 +32,7 @@ schemas/                                  JSON schemas the passes must return
 python -m serial_audio.cli add-epub <file.epub> --slug <slug>
 python -m serial_audio.cli add-royalroad <fiction url> --slug <slug> [--chapters 1|1-5|all|none]
 python -m serial_audio.cli fetch <slug> [new|1|1-5|all] [--limit N]   # refresh the index, pull chapters
+python -m serial_audio.cli fetch <slug> <n> --html <saved page>       # import a chapter from a page saved in the browser, also one the index doesn't have
 python -m serial_audio.cli chapters <slug>
 python -m serial_audio.cli character-pass <slug> <1|1-5|all> [--backend auto|subscription|api] [--model opus|sonnet|haiku] [--on-limit api|wait|fail]
 python -m serial_audio.cli bible <slug> [-v]
@@ -54,6 +55,7 @@ python -m serial_audio.cli look-pass <slug> <1|1-5|all> [--redo]   # what the ch
 python -m serial_audio.cli draw <slug> [--characters a,b] [--settings x,y] [--candidates 2] [--redraw] [--prompt "..."] [--style name] [--style-text "..."] [--image-model qwen21|krea2] [--dry-run]   # an image for each character and setting that needs one
 python -m serial_audio.cli pick-image <slug> <characters/id|settings/id> [--seed N] [--style name]   # after looking: file another candidate / approve
 python -m serial_audio.cli images <slug> [-v]            # the bible's images, and how far the look pass has read
+python -m serial_audio.cli prune-media [--days 7] [--dry-run]   # on the app's machine: remove the media mirror's files that no serial names
 ```
 
 ## Web app
@@ -70,8 +72,12 @@ python -m serial_audio.web --host 100.81.138.51     # reachable over Tailscale, 
 
 Run a local instance from a copy of the code that has its own `library/`, with its own `--state-dir`. The app shows
 each serial's chapters on the way to audio and plays rendered chapters,
-remembering the listening position per chapter. On the Cast tab you can play every candidate, file or approve
-one, recast with a new description, or cast the characters who have no voice yet. Each voice card shows the
+remembering the listening position per chapter. The chapter list folds a volume whose chapters are all rendered,
+except the last volume and the one with the chapter last played on that device, and a volume's row opens or folds
+it. A Continue bar above the list plays that chapter from where it stopped, or the one after it when it ended, and
+the serial's card in the library has the same. On the Cast tab you can play every candidate, file or approve
+one, recast with a new description, or cast the characters who have no voice yet. An approved voice is one row that
+opens to its card. Each voice card shows the
 character's casting bio: age, race, station, temperament and habits of speech, without the plot. Write bios queues a
 `bios` job for the voices that don't have one, and Rewrite bio on a card writes that one again from the bible as it
 stands. The bible and pronunciations are searchable. The app has no login, so bind it only to an address you trust. It answers only to localhost,
@@ -125,12 +131,19 @@ before the join, the join and the sending back, and its time left runs down betw
 cluster each queued job shows how long it takes, on which node, and when it is expected to end, and the queue's
 heading says when the last job ends. Each node's own jobs give its timings, so the figures follow a change to the
 pipeline within a few jobs (`deploy/README.md`, How a job runs). A queued job has no time until the app has counted
-its takes, while the queue is on hold, and while no ready node offers its class.
+its takes, while the queue is on hold, and while no ready node offers its class. The header counts the jobs that
+failed since the Jobs page was last open on that device, in red beside the count of queued jobs, and says how many
+nodes are on hold. The Finished list has a filter for the failed jobs.
 
 On the cluster each node's row there has a Hold button and a Going offline button. Hold stops the app from sending the
 node jobs until Resume, for a machine whose card is busy with other work. Going offline does the same until the node
 has been away and is back, for a machine that is about to be turned off. The node finishes the job it has either way.
 A job whose node goes away before it ends is queued again (`deploy/README.md`, How a job runs, point 7).
+
+A running job that loses no work by it has a Pause button: a Breeze render before its join, and a draw that is not a
+redraw. Pause stops the job where it is and keeps it in the queue, in its place, until Resume, and the queued jobs of
+its batch stay queued. Stop asks first. For a job on the cluster its dialog offers Stop and queue again, which stops
+the job and puts it back in its place at once. A plain Stop ends the job and skips the queued jobs of its batch.
 
 A queued job has buttons that move it to the top, up, down and to the bottom, and a handle to drag it. Select several
 jobs to move or cancel them together, and drag one of them to move them all. Backlog work stays behind every other
@@ -138,7 +151,7 @@ job, so a job moves among its own kind of work. A job stays behind the jobs of i
 render moved to the top stops behind its screenplay.
 
 The chapter page shows the take check, with each flagged or out-of-range take's script line, transcript and a
-player, and a Check takes button that runs it as a job.
+play button, and a Check takes button that runs it as a job.
 Every chapter with audio has a download button on the serial page and the chapter page. `GET /download/<slug>/<n>`
 sends the file as an attachment named `<serial> - <NNN> - <chapter title>.opus`, so an audiobook reader on a phone
 sorts the chapters in order.
@@ -159,7 +172,10 @@ chapter, each with the passage it comes from, and Draw or Redraw, which opens a 
 An image lists the passages it was painted from. A second appearance of a character, such as a suit of armour, has
 its own image and its own details under the character. When the text has given more details
 than the image's description saw, the row says so. A Settings section lists the places where scenes happen in the
-same way, the ones with the most chapters first. The Process dialog has a Look pass stage. It is ticked when the
+same way, the ones with the most chapters first. An image opens large on the page, with the subject's other
+candidates a step away. The Image filter keeps the rows without an image, with an image that is not approved, or
+with details newer than the image. The search reads names, aliases, roles and places, and with its box ticked the
+facts, looks and descriptions too, which the browser's own search doesn't find in a row that has not been opened. The Process dialog has a Look pass stage. It is ticked when the
 batch has a character pass to run, and it reads the chapters that get one, with Sonnet unless the stage names
 another model. Two boxes add the selected chapters that have a character pass already: the ones without a look
 pass, and the ones to read again.

@@ -30,7 +30,8 @@ IMPORTANCE_ORDER = {"major": 0, "recurring": 1, "minor": 2, "one_off": 3}
 _Loader = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
 _cache: dict[str, tuple[float, int, object]] = {}
 _names_cache: dict[str, tuple[tuple, tuple]] = {}
-_ways_cache: dict[str, tuple[tuple, dict]] = {}
+# by serial and term: the term's reference and sayings, and how _ways sorted them
+_ways_cache: dict[str, dict[str, tuple[tuple, dict]]] = {}
 NAMES_SHOWN = 12
 # the most sayings of one name that the Names page sorts into ways, and the most it takes a reference from
 SAID_MAX = 400
@@ -234,9 +235,12 @@ def serials() -> list[dict]:
             if audio:
                 seconds += _duration(audio) or 0
         pending = sum(1 for v in _voice_records(slug).values() if v.get("status") != "approved")
+        # A chapter imported from a saved page can be one that the index, which serial.yaml counts, doesn't have.
+        known = serial.get("chapters")
+        on_disk = sum(counts.values())
         out.append({"slug": slug, "title": serial.get("title") or slug, "subtitle": serial.get("subtitle"),
                     "author": serial.get("author"), "source": (serial.get("source") or {}).get("type"),
-                    "known": serial.get("chapters"), "on_disk": sum(counts.values()), "status": dict(counts),
+                    "known": known and max(known, on_disk), "on_disk": on_disk, "status": dict(counts),
                     "words": words, "audio_seconds": round(seconds), "voices_pending": pending})
     return out
 
@@ -579,7 +583,7 @@ def names_heard(slug: str) -> dict:
     spans: dict[str, list] = {}
     adds: dict[str, list[int]] = {}
     counted: dict[str, set[int]] = {}
-    known, unknown, judged, stamps = [], [], [], []
+    known, unknown, judged = [], [], []
     for n in lib.list_chapters(slug):
         folder = lib.chapter_dir(slug, n)
         if not (folder / TAKES_FILE).is_file():
@@ -589,7 +593,6 @@ def names_heard(slug: str) -> dict:
             unknown.append(n)
             continue
         known.append(n)
-        stamps.append(stamp)
         if not stale(check, bible):
             judged.append(n)
         with_names = check["names"] if isinstance(check.get("names"), dict) else {}
@@ -609,10 +612,13 @@ def names_heard(slug: str) -> dict:
                 where[term].append(n)
     refs = {str(term): entry["said"] for term, entry in pronunciations.items()
             if isinstance(entry, dict) and isinstance(entry.get("said"), str) and entry["said"]}
-    key = (tuple(stamps), tuple(sorted(refs.items())))
-    if _ways_cache.get(slug, (None,))[0] != key:
-        _ways_cache[slug] = (key, {term: _ways(found, refs.get(term)) for term, found in spans.items()})
-    ways = _ways_cache[slug][1]
+    kept, sorted_now = _ways_cache.get(slug) or {}, {}
+    for term, found in spans.items():
+        key = (refs.get(term), tuple((s[0], s[1]) for s in found))
+        hit = kept.get(term)
+        sorted_now[term] = hit if hit and hit[0] == key else (key, _ways(found, refs.get(term)))
+    _ways_cache[slug] = sorted_now
+    ways = {term: hit[1] for term, hit in sorted_now.items()}
 
     def view(term: str, entry: dict, spellings: Counter) -> dict:
         sent = " ".join(words(str(entry.get("say") or term)))

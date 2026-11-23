@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 import uuid
@@ -25,7 +26,7 @@ from pathlib import Path
 from .. import library as lib
 from ..comfy import ComfyError
 from ..render import plan_engine
-from . import procs
+from . import kinds, procs
 
 ROOT = lib.ROOT
 STATE_DIR = ROOT / ".webapp"
@@ -34,17 +35,15 @@ LOG_DIR = STATE_DIR / "jobs"
 INCOMING = ROOT / "incoming"
 COMFY_URL = "http://127.0.0.1:8188"
 
-HEAVY = {"render", "cast", "bios", "check-takes", "character-pass", "screenplay", "say-options", "look-pass", "draw"}
-BIBLE_WRITERS = {"character-pass", "cast", "bios"}
-# jobs that start ComfyUI themselves when none answers
-STARTS_COMFY = {"draw"}
+# the kinds of each group that one machine's rules read, by the flags of kinds.KINDS, which says what each means
+HEAVY = set(kinds.having("heavy"))
+BIBLE_WRITERS = set(kinds.having("writes_bible"))
+STARTS_COMFY = set(kinds.having("starts_comfy"))
 # the model of a look pass whose request names none
 LOOK_MODEL = "sonnet"
-SERIAL_WRITERS = {"voice-effect"}    # rewrites serial.yaml in place, so it waits for any job on that serial
-# a render's own changes show in render_changes, and no render reads a name's options
-RENDER_NEUTRAL = {"render", "say-options"}
-# the kinds of backlog work that write only their own chapter's files, so they run beside each other
-BACKLOG_BESIDE = frozenset({"render", "check-takes"})
+SERIAL_WRITERS = set(kinds.having("writes_serial"))
+RENDER_NEUTRAL = set(kinds.having("render_neutral"))
+BACKLOG_BESIDE = kinds.having("backlog_beside")
 FINISHED = {"done", "failed", "cancelled", "stopped", "skipped", "lost"}
 SETTLE_SECONDS = 15
 TICK_SECONDS = 2.0
@@ -67,6 +66,16 @@ RETAKE_TRIES = 2
 REORDER = ("top", "bottom", "up", "down", "before")
 # a part that outlasts its estimate keeps this share of it as time left
 OVERRUN_SHARE = 0.1
+# seconds between two prints of one failure of the job loop, which a pass repeats every TICK_SECONDS
+TROUBLE_EVERY = 60.0
+# seconds a state file's kept copy stands before a save replaces it
+KEPT_EVERY = 600.0
+JOB_ID_RE = re.compile(r"[0-9]{8}-[0-9]{6}-[0-9a-f]{6}")
+# whether a start removes the logs and exit files in the log folder that belong to no job record
+SWEEP_LOGS = True
+# what a job record of older code may lack and the loop reads without asking
+RECORD_DEFAULTS = {"seq": 0, "heavy": False, "gpu": False, "args": [], "meta": {}, "slug": None, "batch": None,
+                   "params": {}, "started": None, "finished": None, "note": None}
 
 CREATE_NEW_PROCESS_GROUP = 0x00000200
 CREATE_BREAKAWAY_FROM_JOB = 0x01000000
@@ -225,6 +234,332 @@ def _render_plan(slug: str, number: int, decode_only: bool) -> tuple[str, str | 
         raise ValueError(str(e)) from None
 
 
+def _build_chapter_pass(kind: str, p: dict, comfy_url: str, coming: dict | None) -> dict:
+    slug = _slug(p)
+    spec = _spec(p.get("chapters"))
+    args = [kind, slug, spec] + _llm_args(p) + (["--redo"] if p.get("redo") else [])
+    label = "Character pass" if kind == "character-pass" else "Screenplay"
+    return {"args": args, "heavy": True, "gpu": False, "comfy": False, "title": f"{label} · ch {spec}", "slug": slug,
+            "meta": {"chapters": _expand(slug, spec, (coming or {}).get(slug, ()))}}
+
+
+def _build_render(kind: str, p: dict, comfy_url: str, coming: dict | None) -> dict:
+    slug = _slug(p)
+    n = _int(p, "chapter", 1, 99999)
+    if n is None:
+        raise ValueError("render needs a chapter")
+    seed = _int(p, "seed", 0, 2**31)
+    decode_only = bool(p.get("decode_only"))
+    engine, runner = _render_plan(slug, n, decode_only)
+    args = ["render", slug, str(n)] + (["--seed", str(seed)] if seed is not None else [])
+    args += ["--comfy-url", comfy_url, "--engine", engine]
+    if runner:
+        args += ["--runner", runner]
+    if decode_only:
+        args.append("--decode-only")
+    again = "Join" if engine == "breeze" else "Decode"
+    title = f"{again if decode_only else 'Render'} · ch {n}"
+    comfy = engine == "drama3" or (runner == "comfyui" and not decode_only)
+    return {"args": args, "heavy": True, "gpu": comfy or not decode_only, "comfy": comfy, "title": title,
+            "slug": slug, "meta": {"chapters": [n], "lines": _chapter_lines(slug, n), "decode_only": decode_only,
+                                   "engine": engine, "runner": runner}}
+
+
+def _build_check_takes(kind: str, p: dict, comfy_url: str, coming: dict | None) -> dict:
+    slug = _slug(p)
+    n = _int(p, "chapter", 1, 99999)
+    if n is None:
+        raise ValueError("check-takes needs a chapter")
+    args = ["check-takes", slug, str(n), "--comfy-url", comfy_url] + (["--redo"] if p.get("redo") else [])
+    return {"args": args, "heavy": True, "gpu": True, "comfy": True, "title": f"Check takes · ch {n}", "slug": slug,
+            "meta": {"chapters": [n], "lines": _chapter_lines(slug, n)}}
+
+
+def _build_cast(kind: str, p: dict, comfy_url: str, coming: dict | None) -> dict:
+    slug = _slug(p)
+    ids = _character_ids(p)
+    args = ["cast", slug, "--candidates", str(_int(p, "candidates", 1, 12, 3)),
+            "--seed", str(_int(p, "seed", 0, 2**31, 1000)), "--comfy-url", comfy_url] + _llm_args(p)
+    if ids:
+        args += ["--characters", ",".join(ids)]
+    if p.get("recast"):
+        if not ids:
+            raise ValueError("a recast needs the characters to replace")
+        args.append("--recast")
+    instruct = _text(p, "instruct")
+    if instruct:
+        if len(ids) != 1:
+            raise ValueError("a voice description applies to exactly one character")
+        args += ["--instruct", instruct]
+    if p.get("redo_brief"):
+        args.append("--redo-brief")
+    note = _text(p, "note", 500)
+    if note:
+        args += ["--note", note]
+    dry = bool(p.get("dry_run"))
+    if dry:
+        args.append("--dry-run")
+    first = _int(p, "from_chapter", 1, 99999)
+    if first is not None and ids:
+        raise ValueError("a cast that follows a chapter's character pass names no characters")
+    who = ", ".join(ids) if ids else f"ch {first}" if first else "everyone who needs a voice"
+    verb = "Recast" if p.get("recast") else ("Casting briefs" if dry else "Cast")
+    meta = {"characters": ids, "candidates": _int(p, "candidates", 1, 12, 3), "dry_run": dry}
+    if first is not None:
+        meta["from_chapter"] = first
+    return {"args": args, "heavy": True, "gpu": not dry, "comfy": not dry, "title": f"{verb} · {who}", "slug": slug,
+            "meta": meta}
+
+
+def _build_bios(kind: str, p: dict, comfy_url: str, coming: dict | None) -> dict:
+    slug = _slug(p)
+    ids = _character_ids(p)
+    redo = bool(p.get("redo"))
+    args = ["bios", slug] + _llm_args(p)
+    if ids:
+        args += ["--characters", ",".join(ids)]
+    if redo:
+        args.append("--redo")
+    who = "every voice" if redo else "every voice without one"
+    if ids:
+        who = ", ".join(ids) if len(ids) <= 3 else f"{len(ids)} characters"
+    return {"args": args, "heavy": True, "gpu": False, "comfy": False, "title": f"Casting bios · {who}",
+            "slug": slug, "meta": {"characters": ids}}
+
+
+def _build_look_pass(kind: str, p: dict, comfy_url: str, coming: dict | None) -> dict:
+    slug = _slug(p)
+    spec = _spec(p.get("chapters"))
+    if spec == "new":
+        raise ValueError("a look pass needs its chapters: use 7, 7-12, 3,5,8 or all")
+    args = ["look-pass", slug, spec] + _llm_args(p, LOOK_MODEL) + (["--redo"] if p.get("redo") else [])
+    return {"args": args, "heavy": True, "gpu": False, "comfy": False, "title": f"Look pass · ch {spec}",
+            "slug": slug, "meta": {"chapters": _expand(slug, spec, (coming or {}).get(slug, ()))}}
+
+
+def _build_draw(kind: str, p: dict, comfy_url: str, coming: dict | None) -> dict:
+    from ..comfy import IMAGE_MODELS
+    slug = _slug(p)
+    chars, places = _character_ids(p), _character_ids(p, "settings")
+    named = chars + places
+    count = _int(p, "candidates", 1, 8, 2)
+    args = ["draw", slug, "--candidates", str(count), "--comfy-url", comfy_url] + _llm_args(p)
+    seed = _int(p, "seed", 0, 2**31)
+    if seed is not None:
+        args += ["--seed", str(seed)]
+    if chars:
+        args += ["--characters", ",".join(chars)]
+    if places:
+        args += ["--settings", ",".join(places)]
+    if p.get("redraw"):
+        if not named:
+            raise ValueError("a redraw needs the characters or settings to replace")
+        args.append("--redraw")
+    prompt = _text(p, "prompt")
+    if prompt:
+        if len(named) != 1:
+            raise ValueError("a description applies to exactly one character or setting")
+        args.append(f"--prompt={prompt}")
+    if p.get("redo_brief"):
+        args.append("--redo-brief")
+    note = _text(p, "note", 500)
+    if note:
+        args.append(f"--note={note}")
+    style, style_text = _style(p), _text(p, "style_text", 600)
+    if style:
+        args += ["--style", style]
+    if style_text:
+        args.append(f"--style-text={style_text}")
+    image_model = _choice(p, "image_model", set(IMAGE_MODELS), None)
+    if image_model:
+        args += ["--image-model", image_model]
+    dry = bool(p.get("dry_run"))
+    if dry:
+        args.append("--dry-run")
+    who = ", ".join(named) if 0 < len(named) <= 3 else f"{len(named)} subjects" if named else "everyone who needs an image"
+    verb = "Redraw" if p.get("redraw") else ("Image briefs" if dry else "Draw")
+    meta = {"characters": chars, "settings": places, "candidates": count, "dry_run": dry}
+    if style:
+        meta["style"] = style
+    if not named:
+        meta["subjects"] = to_draw(slug, style)
+    return {"args": args, "heavy": True, "gpu": not dry, "comfy": not dry,
+            "title": f"{verb} · {who}" + (f" · {style}" if style else ""), "slug": slug, "meta": meta}
+
+
+def _build_pick_image(kind: str, p: dict, comfy_url: str, coming: dict | None) -> dict:
+    slug = _slug(p)
+    subject = str(p.get("subject") or "")
+    group, _, sid = subject.partition("/")
+    if group not in ("characters", "settings") or not SLUG_RE.match(sid):
+        raise ValueError(f"bad image subject {subject!r}")
+    seed = _int(p, "seed", 0, 2**31)
+    args = ["pick-image", slug, subject] + (["--seed", str(seed)] if seed is not None else [])
+    approve = p.get("approve", True)
+    if not approve:
+        args.append("--no-approve")
+    style = _style(p)
+    if style:
+        args += ["--style", style]
+    what = f"seed {seed}" if seed is not None else "current"
+    title = f"{'Approve' if approve else 'Pick'} image · {sid} ({what})" + (f" · {style}" if style else "")
+    return {"args": args, "heavy": False, "gpu": False, "comfy": False, "title": title, "slug": slug,
+            "meta": {"subject": subject, **({"style": style} if style else {})}}
+
+
+def _build_pick_voice(kind: str, p: dict, comfy_url: str, coming: dict | None) -> dict:
+    slug = _slug(p)
+    cid = str(p.get("character") or "")
+    if not SLUG_RE.match(cid):
+        raise ValueError(f"bad character id {cid!r}")
+    seed = _int(p, "seed", 0, 2**31)
+    args = ["pick-voice", slug, cid] + (["--seed", str(seed)] if seed is not None else [])
+    approve = p.get("approve", True)
+    if not approve:
+        args.append("--no-approve")
+    what = f"seed {seed}" if seed is not None else "current"
+    title = f"{'Approve' if approve else 'Pick'} voice · {cid} ({what})"
+    return {"args": args, "heavy": False, "gpu": False, "comfy": False, "title": title, "slug": slug,
+            "meta": {"characters": [cid]}}
+
+
+def _build_say_as(kind: str, p: dict, comfy_url: str, coming: dict | None) -> dict:
+    slug = _slug(p)
+    term = _text(p, "term", 200)
+    if not term:
+        raise ValueError("say-as needs a term")
+    clear = bool(p.get("clear"))
+    say = None if clear else _text(p, "say", 200)
+    if not clear and not say:
+        raise ValueError("say-as needs the spelling the voice reads, or clear")
+    args = ["say-as", slug]
+    note = p.get("note")
+    if note is not None:
+        if not isinstance(note, str) or len(note) > 600:
+            raise ValueError("note must be text of at most 600 characters")
+        args.append(f"--note={note.strip()}")
+    if clear:
+        args.append("--clear")
+    args += ["--", term] + ([say] if say else [])
+    title = f"Read {term} as written" if clear else f"Read {term} as {say}"
+    return {"args": args, "heavy": False, "gpu": False, "comfy": False, "title": title, "slug": slug,
+            "meta": {"term": term}}
+
+
+def _build_say_options(kind: str, p: dict, comfy_url: str, coming: dict | None) -> dict:
+    slug = _slug(p)
+    term = _text(p, "term", 80)
+    if not term:
+        raise ValueError("say-options needs a term")
+    again = bool(p.get("render_only"))
+    say = _text(p, "say", 120)
+    if p.get("say") is not None and not re.search(r"[^\W\d_]", say or ""):
+        raise ValueError("say-options needs a letter in the spelling to hear")
+    if say and again:
+        raise ValueError("say-options takes a spelling to add or render_only, not both")
+    args = ["say-options", slug, "--comfy-url", comfy_url] + _llm_args(p)
+    args += ([f"--add={say}"] if say else ["--render-only"] if again else []) + ["--", term]
+    title = (f"Hear {term} as {say}" if say else f"Say the options for {term} again" if again
+             else f"Options for {term}")
+    return {"args": args, "heavy": True, "gpu": True, "comfy": False, "title": title, "slug": slug,
+            "meta": {"term": term}}
+
+
+def _build_voice_effect(kind: str, p: dict, comfy_url: str, coming: dict | None) -> dict:
+    from ..render import VOICE_EFFECTS
+    slug = _slug(p)
+    voice = str(p.get("voice") or "")
+    if not SLUG_RE.match(voice):
+        raise ValueError(f"bad voice id {voice!r}")
+    clear = bool(p.get("clear"))
+    effect = None if clear else _text(p, "effect", 40)
+    if not clear and effect not in VOICE_EFFECTS:
+        raise ValueError(f"voice-effect needs clear or an effect from {', '.join(sorted(VOICE_EFFECTS))}")
+    args = ["voice-effect", slug, voice] + (["--clear"] if clear else [effect])
+    level = p.get("level")
+    if level is not None and not clear:
+        if isinstance(level, bool) or not isinstance(level, (int, float)) or not 0 <= level <= 1:
+            raise ValueError("level must be a number from 0 to 1")
+        args += ["--level", str(level)]
+    title = f"No effect on {voice}" if clear else f"{effect.capitalize()} effect on {voice}"
+    return {"args": args, "heavy": False, "gpu": False, "comfy": False, "title": title, "slug": slug,
+            "meta": {"voice": voice}}
+
+
+def _build_fetch(kind: str, p: dict, comfy_url: str, coming: dict | None) -> dict:
+    slug = _slug(p)
+    if p.get("html"):
+        n = _int(p, "chapter", 1, 99999)
+        if n is None:
+            raise ValueError("importing a saved page needs its chapter number")
+        path = _incoming_file(slug, p["html"], (".htm", ".html"))
+        args = ["fetch", slug, str(n), "--html", str(path)] + (["--force"] if p.get("force") else [])
+        return {"args": args, "heavy": False, "gpu": False, "comfy": False, "title": f"Import saved page · ch {n}", "slug": slug,
+                "meta": {"chapters": [n], "file": path.name}}
+    spec = _spec(p.get("chapters"), "new")
+    args = ["fetch", slug, spec]
+    limit = _int(p, "limit", 1, 1000)
+    if limit and spec == "new":
+        args += ["--limit", str(limit)]
+    if p.get("no_refresh"):
+        args.append("--no-refresh")
+    if p.get("force"):
+        args.append("--force")
+    return {"args": args, "heavy": False, "gpu": False, "comfy": False, "title": f"Fetch from site · {spec}", "slug": slug,
+            "meta": {}}
+
+
+def _build_add_royalroad(kind: str, p: dict, comfy_url: str, coming: dict | None) -> dict:
+    url = str(p.get("url") or "").strip()
+    if not (url.isdigit() or re.match(r"^https://(www\.)?royalroad\.com/fiction/\d+", url)):
+        raise ValueError("give a Royal Road fiction URL or id")
+    args = ["add-royalroad", url, "--chapters", _spec(p.get("chapters"), "1") if p.get("chapters") != "none" else "none"]
+    if p.get("slug"):
+        args += ["--slug", _slug(p, must_exist=False)]
+    return {"args": args, "heavy": False, "gpu": False, "comfy": False, "title": f"Add from Royal Road · {url}",
+            "slug": p.get("slug") or None, "meta": {}}
+
+
+def _build_add_epub(kind: str, p: dict, comfy_url: str, coming: dict | None) -> dict:
+    path = _incoming_file("_new", p.get("file"), (".epub",))
+    args = ["add-epub", str(path)]
+    if p.get("slug"):
+        args += ["--slug", _slug(p, must_exist=False)]
+    for key in ("title", "author"):
+        value = _text(p, key, 300)
+        if value:
+            args += [f"--{key}", value]
+    if p.get("force"):
+        args.append("--force")
+    return {"args": args, "heavy": False, "gpu": False, "comfy": False, "title": f"Add EPUB · {path.name}",
+            "slug": p.get("slug") or None, "meta": {}}
+
+
+def _build_reset_bible(kind: str, p: dict, comfy_url: str, coming: dict | None) -> dict:
+    slug = _slug(p)
+    if p.get("confirm") != slug:
+        raise ValueError("type the serial's slug to confirm")
+    return {"args": ["reset-bible", slug], "heavy": True, "gpu": False, "comfy": False, "title": "Reset bible", "slug": slug,
+            "meta": {}}
+
+
+def _build_prune_media(kind: str, p: dict, comfy_url: str, coming: dict | None) -> dict:
+    days, dry = _int(p, "days", 1, 3650, 7), bool(p.get("dry_run"))
+    args = ["prune-media", "--days", str(days)] + (["--dry-run"] if dry else [])
+    title = ("Count" if dry else "Remove") + " the audio copies that no serial names"
+    return {"args": args, "heavy": False, "gpu": False, "comfy": False, "title": title, "slug": None,
+            "meta": {"days": days, "dry_run": dry}}
+
+
+# what builds the job fields of a request of each kind, as build() returns them
+BUILDERS = {"character-pass": _build_chapter_pass, "screenplay": _build_chapter_pass, "render": _build_render,
+            "check-takes": _build_check_takes, "cast": _build_cast, "bios": _build_bios,
+            "look-pass": _build_look_pass, "draw": _build_draw, "pick-image": _build_pick_image,
+            "pick-voice": _build_pick_voice, "say-as": _build_say_as, "say-options": _build_say_options,
+            "voice-effect": _build_voice_effect, "fetch": _build_fetch, "add-royalroad": _build_add_royalroad,
+            "add-epub": _build_add_epub, "reset-bible": _build_reset_bible, "prune-media": _build_prune_media}
+
+
 def build(kind: str, p: dict, comfy_url: str = COMFY_URL, coming: dict | None = None) -> dict:
     """The job fields for a request: CLI args, lane, title and metadata.
 
@@ -238,300 +573,10 @@ def build(kind: str, p: dict, comfy_url: str = COMFY_URL, coming: dict | None = 
     """
     if not isinstance(kind, str) or not isinstance(p, dict):
         raise ValueError("each job needs a kind and a params object")
-    if kind in ("character-pass", "screenplay"):
-        slug = _slug(p)
-        spec = _spec(p.get("chapters"))
-        args = [kind, slug, spec] + _llm_args(p) + (["--redo"] if p.get("redo") else [])
-        label = "Character pass" if kind == "character-pass" else "Screenplay"
-        return {"args": args, "heavy": True, "gpu": False, "comfy": False, "title": f"{label} · ch {spec}", "slug": slug,
-                "meta": {"chapters": _expand(slug, spec, (coming or {}).get(slug, ()))}}
-
-    if kind == "render":
-        slug = _slug(p)
-        n = _int(p, "chapter", 1, 99999)
-        if n is None:
-            raise ValueError("render needs a chapter")
-        seed = _int(p, "seed", 0, 2**31)
-        decode_only = bool(p.get("decode_only"))
-        engine, runner = _render_plan(slug, n, decode_only)
-        args = ["render", slug, str(n)] + (["--seed", str(seed)] if seed is not None else [])
-        args += ["--comfy-url", comfy_url, "--engine", engine]
-        if runner:
-            args += ["--runner", runner]
-        if decode_only:
-            args.append("--decode-only")
-        again = "Join" if engine == "breeze" else "Decode"
-        title = f"{again if decode_only else 'Render'} · ch {n}"
-        comfy = engine == "drama3" or (runner == "comfyui" and not decode_only)
-        return {"args": args, "heavy": True, "gpu": comfy or not decode_only, "comfy": comfy, "title": title,
-                "slug": slug, "meta": {"chapters": [n], "lines": _chapter_lines(slug, n), "decode_only": decode_only,
-                                       "engine": engine, "runner": runner}}
-
-    if kind == "check-takes":
-        slug = _slug(p)
-        n = _int(p, "chapter", 1, 99999)
-        if n is None:
-            raise ValueError("check-takes needs a chapter")
-        args = ["check-takes", slug, str(n), "--comfy-url", comfy_url] + (["--redo"] if p.get("redo") else [])
-        return {"args": args, "heavy": True, "gpu": True, "comfy": True, "title": f"Check takes · ch {n}", "slug": slug,
-                "meta": {"chapters": [n], "lines": _chapter_lines(slug, n)}}
-
-    if kind == "cast":
-        slug = _slug(p)
-        ids = _character_ids(p)
-        args = ["cast", slug, "--candidates", str(_int(p, "candidates", 1, 12, 3)),
-                "--seed", str(_int(p, "seed", 0, 2**31, 1000)), "--comfy-url", comfy_url] + _llm_args(p)
-        if ids:
-            args += ["--characters", ",".join(ids)]
-        if p.get("recast"):
-            if not ids:
-                raise ValueError("a recast needs the characters to replace")
-            args.append("--recast")
-        instruct = _text(p, "instruct")
-        if instruct:
-            if len(ids) != 1:
-                raise ValueError("a voice description applies to exactly one character")
-            args += ["--instruct", instruct]
-        if p.get("redo_brief"):
-            args.append("--redo-brief")
-        note = _text(p, "note", 500)
-        if note:
-            args += ["--note", note]
-        dry = bool(p.get("dry_run"))
-        if dry:
-            args.append("--dry-run")
-        first = _int(p, "from_chapter", 1, 99999)
-        if first is not None and ids:
-            raise ValueError("a cast that follows a chapter's character pass names no characters")
-        who = ", ".join(ids) if ids else f"ch {first}" if first else "everyone who needs a voice"
-        verb = "Recast" if p.get("recast") else ("Casting briefs" if dry else "Cast")
-        meta = {"characters": ids, "candidates": _int(p, "candidates", 1, 12, 3), "dry_run": dry}
-        if first is not None:
-            meta["from_chapter"] = first
-        return {"args": args, "heavy": True, "gpu": not dry, "comfy": not dry, "title": f"{verb} · {who}", "slug": slug,
-                "meta": meta}
-
-    if kind == "bios":
-        slug = _slug(p)
-        ids = _character_ids(p)
-        redo = bool(p.get("redo"))
-        args = ["bios", slug] + _llm_args(p)
-        if ids:
-            args += ["--characters", ",".join(ids)]
-        if redo:
-            args.append("--redo")
-        who = "every voice" if redo else "every voice without one"
-        if ids:
-            who = ", ".join(ids) if len(ids) <= 3 else f"{len(ids)} characters"
-        return {"args": args, "heavy": True, "gpu": False, "comfy": False, "title": f"Casting bios · {who}",
-                "slug": slug, "meta": {"characters": ids}}
-
-    if kind == "look-pass":
-        slug = _slug(p)
-        spec = _spec(p.get("chapters"))
-        if spec == "new":
-            raise ValueError("a look pass needs its chapters: use 7, 7-12, 3,5,8 or all")
-        args = ["look-pass", slug, spec] + _llm_args(p, LOOK_MODEL) + (["--redo"] if p.get("redo") else [])
-        return {"args": args, "heavy": True, "gpu": False, "comfy": False, "title": f"Look pass · ch {spec}",
-                "slug": slug, "meta": {"chapters": _expand(slug, spec, (coming or {}).get(slug, ()))}}
-
-    if kind == "draw":
-        from ..comfy import IMAGE_MODELS
-        slug = _slug(p)
-        chars, places = _character_ids(p), _character_ids(p, "settings")
-        named = chars + places
-        count = _int(p, "candidates", 1, 8, 2)
-        args = ["draw", slug, "--candidates", str(count), "--comfy-url", comfy_url] + _llm_args(p)
-        seed = _int(p, "seed", 0, 2**31)
-        if seed is not None:
-            args += ["--seed", str(seed)]
-        if chars:
-            args += ["--characters", ",".join(chars)]
-        if places:
-            args += ["--settings", ",".join(places)]
-        if p.get("redraw"):
-            if not named:
-                raise ValueError("a redraw needs the characters or settings to replace")
-            args.append("--redraw")
-        prompt = _text(p, "prompt")
-        if prompt:
-            if len(named) != 1:
-                raise ValueError("a description applies to exactly one character or setting")
-            args.append(f"--prompt={prompt}")
-        if p.get("redo_brief"):
-            args.append("--redo-brief")
-        note = _text(p, "note", 500)
-        if note:
-            args.append(f"--note={note}")
-        style, style_text = _style(p), _text(p, "style_text", 600)
-        if style:
-            args += ["--style", style]
-        if style_text:
-            args.append(f"--style-text={style_text}")
-        image_model = _choice(p, "image_model", set(IMAGE_MODELS), None)
-        if image_model:
-            args += ["--image-model", image_model]
-        dry = bool(p.get("dry_run"))
-        if dry:
-            args.append("--dry-run")
-        who = ", ".join(named) if 0 < len(named) <= 3 else f"{len(named)} subjects" if named else "everyone who needs an image"
-        verb = "Redraw" if p.get("redraw") else ("Image briefs" if dry else "Draw")
-        meta = {"characters": chars, "settings": places, "candidates": count, "dry_run": dry}
-        if style:
-            meta["style"] = style
-        if not named:
-            meta["subjects"] = to_draw(slug, style)
-        return {"args": args, "heavy": True, "gpu": not dry, "comfy": not dry,
-                "title": f"{verb} · {who}" + (f" · {style}" if style else ""), "slug": slug, "meta": meta}
-
-    if kind == "pick-image":
-        slug = _slug(p)
-        subject = str(p.get("subject") or "")
-        group, _, sid = subject.partition("/")
-        if group not in ("characters", "settings") or not SLUG_RE.match(sid):
-            raise ValueError(f"bad image subject {subject!r}")
-        seed = _int(p, "seed", 0, 2**31)
-        args = ["pick-image", slug, subject] + (["--seed", str(seed)] if seed is not None else [])
-        approve = p.get("approve", True)
-        if not approve:
-            args.append("--no-approve")
-        style = _style(p)
-        if style:
-            args += ["--style", style]
-        what = f"seed {seed}" if seed is not None else "current"
-        title = f"{'Approve' if approve else 'Pick'} image · {sid} ({what})" + (f" · {style}" if style else "")
-        return {"args": args, "heavy": False, "gpu": False, "comfy": False, "title": title, "slug": slug,
-                "meta": {"subject": subject, **({"style": style} if style else {})}}
-
-    if kind == "pick-voice":
-        slug = _slug(p)
-        cid = str(p.get("character") or "")
-        if not SLUG_RE.match(cid):
-            raise ValueError(f"bad character id {cid!r}")
-        seed = _int(p, "seed", 0, 2**31)
-        args = ["pick-voice", slug, cid] + (["--seed", str(seed)] if seed is not None else [])
-        approve = p.get("approve", True)
-        if not approve:
-            args.append("--no-approve")
-        what = f"seed {seed}" if seed is not None else "current"
-        title = f"{'Approve' if approve else 'Pick'} voice · {cid} ({what})"
-        return {"args": args, "heavy": False, "gpu": False, "comfy": False, "title": title, "slug": slug,
-                "meta": {"characters": [cid]}}
-
-    if kind == "say-as":
-        slug = _slug(p)
-        term = _text(p, "term", 200)
-        if not term:
-            raise ValueError("say-as needs a term")
-        clear = bool(p.get("clear"))
-        say = None if clear else _text(p, "say", 200)
-        if not clear and not say:
-            raise ValueError("say-as needs the spelling the voice reads, or clear")
-        args = ["say-as", slug]
-        note = p.get("note")
-        if note is not None:
-            if not isinstance(note, str) or len(note) > 600:
-                raise ValueError("note must be text of at most 600 characters")
-            args.append(f"--note={note.strip()}")
-        if clear:
-            args.append("--clear")
-        args += ["--", term] + ([say] if say else [])
-        title = f"Read {term} as written" if clear else f"Read {term} as {say}"
-        return {"args": args, "heavy": False, "gpu": False, "comfy": False, "title": title, "slug": slug,
-                "meta": {"term": term}}
-
-    if kind == "say-options":
-        slug = _slug(p)
-        term = _text(p, "term", 80)
-        if not term:
-            raise ValueError("say-options needs a term")
-        again = bool(p.get("render_only"))
-        say = _text(p, "say", 120)
-        if p.get("say") is not None and not re.search(r"[^\W\d_]", say or ""):
-            raise ValueError("say-options needs a letter in the spelling to hear")
-        if say and again:
-            raise ValueError("say-options takes a spelling to add or render_only, not both")
-        args = ["say-options", slug, "--comfy-url", comfy_url] + _llm_args(p)
-        args += ([f"--add={say}"] if say else ["--render-only"] if again else []) + ["--", term]
-        title = (f"Hear {term} as {say}" if say else f"Say the options for {term} again" if again
-                 else f"Options for {term}")
-        return {"args": args, "heavy": True, "gpu": True, "comfy": False, "title": title, "slug": slug,
-                "meta": {"term": term}}
-
-    if kind == "voice-effect":
-        from ..render import VOICE_EFFECTS
-        slug = _slug(p)
-        voice = str(p.get("voice") or "")
-        if not SLUG_RE.match(voice):
-            raise ValueError(f"bad voice id {voice!r}")
-        clear = bool(p.get("clear"))
-        effect = None if clear else _text(p, "effect", 40)
-        if not clear and effect not in VOICE_EFFECTS:
-            raise ValueError(f"voice-effect needs clear or an effect from {', '.join(sorted(VOICE_EFFECTS))}")
-        args = ["voice-effect", slug, voice] + (["--clear"] if clear else [effect])
-        level = p.get("level")
-        if level is not None and not clear:
-            if isinstance(level, bool) or not isinstance(level, (int, float)) or not 0 <= level <= 1:
-                raise ValueError("level must be a number from 0 to 1")
-            args += ["--level", str(level)]
-        title = f"No effect on {voice}" if clear else f"{effect.capitalize()} effect on {voice}"
-        return {"args": args, "heavy": False, "gpu": False, "comfy": False, "title": title, "slug": slug,
-                "meta": {"voice": voice}}
-
-    if kind == "fetch":
-        slug = _slug(p)
-        if p.get("html"):
-            n = _int(p, "chapter", 1, 99999)
-            if n is None:
-                raise ValueError("importing a saved page needs its chapter number")
-            path = _incoming_file(slug, p["html"], (".htm", ".html"))
-            args = ["fetch", slug, str(n), "--html", str(path)] + (["--force"] if p.get("force") else [])
-            return {"args": args, "heavy": False, "gpu": False, "comfy": False, "title": f"Import saved page · ch {n}", "slug": slug,
-                    "meta": {"chapters": [n], "file": path.name}}
-        spec = _spec(p.get("chapters"), "new")
-        args = ["fetch", slug, spec]
-        limit = _int(p, "limit", 1, 1000)
-        if limit and spec == "new":
-            args += ["--limit", str(limit)]
-        if p.get("no_refresh"):
-            args.append("--no-refresh")
-        if p.get("force"):
-            args.append("--force")
-        return {"args": args, "heavy": False, "gpu": False, "comfy": False, "title": f"Fetch from site · {spec}", "slug": slug,
-                "meta": {}}
-
-    if kind == "add-royalroad":
-        url = str(p.get("url") or "").strip()
-        if not (url.isdigit() or re.match(r"^https://(www\.)?royalroad\.com/fiction/\d+", url)):
-            raise ValueError("give a Royal Road fiction URL or id")
-        args = ["add-royalroad", url, "--chapters", _spec(p.get("chapters"), "1") if p.get("chapters") != "none" else "none"]
-        if p.get("slug"):
-            args += ["--slug", _slug(p, must_exist=False)]
-        return {"args": args, "heavy": False, "gpu": False, "comfy": False, "title": f"Add from Royal Road · {url}",
-                "slug": p.get("slug") or None, "meta": {}}
-
-    if kind == "add-epub":
-        path = _incoming_file("_new", p.get("file"), (".epub",))
-        args = ["add-epub", str(path)]
-        if p.get("slug"):
-            args += ["--slug", _slug(p, must_exist=False)]
-        for key in ("title", "author"):
-            value = _text(p, key, 300)
-            if value:
-                args += [f"--{key}", value]
-        if p.get("force"):
-            args.append("--force")
-        return {"args": args, "heavy": False, "gpu": False, "comfy": False, "title": f"Add EPUB · {path.name}",
-                "slug": p.get("slug") or None, "meta": {}}
-
-    if kind == "reset-bible":
-        slug = _slug(p)
-        if p.get("confirm") != slug:
-            raise ValueError("type the serial's slug to confirm")
-        return {"args": ["reset-bible", slug], "heavy": True, "gpu": False, "comfy": False, "title": "Reset bible", "slug": slug,
-                "meta": {}}
-
-    raise ValueError(f"unknown job kind {kind!r}")
+    builder = BUILDERS.get(kind)
+    if builder is None:
+        raise ValueError(f"unknown job kind {kind!r}")
+    return builder(kind, p, comfy_url, coming)
 
 
 # Progress
@@ -901,6 +946,10 @@ def external_activity(snapshot: dict[int, procs.Proc], ours: set[int], now: floa
     return out
 
 
+# the wait reason of a queued job that was paused from the web app
+PAUSED_WAIT = "paused until you resume it"
+
+
 def backlog_wait(job: dict, jobs) -> str | None:
     """Why a queued backlog job cannot start now, or None.
 
@@ -910,9 +959,12 @@ def backlog_wait(job: dict, jobs) -> str | None:
     running backlog work, unless both jobs are of BACKLOG_BESIDE, which run beside each other, each on a GPU
     node of its own. It doesn't start beside one while a backlog job of another kind is queued ahead of it,
     which would otherwise wait for as long as such jobs keep coming. A job that waits between two stages on the
-    cluster counts as running, and every backlog job waits for it.
+    cluster counts as running, and every backlog job waits for it. A paused job waits for its resume and holds
+    no backlog job back.
     """
-    jobs = list(jobs)
+    if job.get("paused"):
+        return PAUSED_WAIT
+    jobs = [other for other in jobs if not other.get("paused")]
     beside = job.get("kind") in BACKLOG_BESIDE and not any(
         other is not job and other["status"] == "queued" and other.get("backlog")
         and other.get("kind") not in BACKLOG_BESIDE and other.get("seq", 0) < job.get("seq", 0) for other in jobs)
@@ -937,6 +989,94 @@ def between_stages(job: dict) -> bool:
 def start_order(job: dict) -> tuple[bool, int]:
     """The order in which queued jobs are offered a start: backlog work that has not started last, then by seq."""
     return bool(job.get("backlog")) and not between_stages(job), job["seq"]
+
+
+# State files
+
+def kept_copy(path: Path) -> Path:
+    """Where the copy of a state file is kept, which read_state loads when the file can't be read."""
+    return path.with_name(path.name + ".bak")
+
+
+def unreadable_copy(path: Path) -> Path:
+    """Where read_state keeps a state file that it could not read."""
+    return path.with_name(path.name + ".unreadable")
+
+
+def said(e: BaseException) -> str:
+    """An exception as one line, its type and its message. Never raises, whatever its __str__ does."""
+    try:
+        return f"{type(e).__name__}: {e}"
+    except Exception:
+        return type(e).__name__
+
+
+def _state_object(path: Path) -> dict:
+    """The JSON object a state file holds. Raises OSError when it can't be read and ValueError when it holds none."""
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("it does not hold a JSON object")
+    return data
+
+
+def read_state(path: Path) -> tuple[dict | None, str | None]:
+    """A state file of the app, or its kept copy when the file can't be read.
+
+    path: the file, which write_state wrote.
+    Returns (data, note). data is the file's object. It is None for a file that is missing, and for one that
+    can't be read and has no kept copy that can. note is None unless the file was there and could not be read,
+    at this start or at an earlier one. For this start it says what the app loaded in the file's place, and the
+    file stands beside it with ".unreadable" added. For an earlier one it says that the file kept then is still
+    there. Never raises.
+    """
+    aside = unreadable_copy(path)
+    still = (f"{aside.name} is still there from a start that could not read {path.name}. Remove it when you have "
+             f"looked at it.") if aside.exists() else None
+    if not path.exists():
+        return None, still
+    try:
+        return _state_object(path), still
+    except (OSError, ValueError, RecursionError) as e:
+        why = said(e)
+    try:
+        os.replace(path, aside)
+        left = f"The file is kept as {aside.name}"
+    except OSError as e:
+        left = f"The file could not be moved aside ({e})"
+    copy = kept_copy(path)
+    try:
+        data = _state_object(copy)
+        made = _dt.datetime.fromtimestamp(copy.stat().st_mtime).astimezone().isoformat(timespec="seconds")
+        return data, f"{path.name} could not be read ({why}), so the app loaded its copy of {made}. {left}."
+    except (OSError, ValueError, RecursionError):
+        return None, (f"{path.name} could not be read ({why}) and no copy of it can, so the app started without it. "
+                      f"{left}.")
+
+
+def write_state(path: Path, text: str) -> None:
+    """Writes a state file whole, and writes its kept copy again once every KEPT_EVERY seconds.
+
+    path: the file.
+    text: its new content.
+    Returns nothing. The file is the old one or the new one at every moment, and so is the copy. A copy that
+    can't be written is passed over. Raises OSError when the file can't be written.
+    """
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+    copy = kept_copy(path)
+    try:
+        if copy.exists() and time.time() - copy.stat().st_mtime < KEPT_EVERY:
+            return
+        part = copy.with_name(copy.name + ".tmp")
+        with part.open("w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            # the copy is for a crash that loses what the system had not written yet, so it can't wait for that
+            os.fsync(fh.fileno())
+        os.replace(part, copy)
+    except OSError:
+        pass
 
 
 # The manager
@@ -967,6 +1107,12 @@ class JobManager:
         self.last_busy = time.time()
         self._last_comfy_poll = 0.0
         self._stop = threading.Event()
+        self.began = time.time()
+        self.tick_ok: float | None = None
+        self.tick_error: str | None = None
+        self.troubles: dict[str, str] = {}
+        self.notices: list[str] = []
+        self._told: dict[str, float] = {}
         self._load()
         self.thread = threading.Thread(target=self._loop, name="jobs", daemon=True)
         if autostart:
@@ -991,18 +1137,37 @@ class JobManager:
         return fh
 
     def _load(self) -> None:
-        data = None
-        if self.jobs_file.exists():
-            try:
-                data = json.loads(self.jobs_file.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                data = None
+        # Records
+        data, note = read_state(self.jobs_file)
+        if note:
+            self._tell(note)
+        records = data.get("jobs") if data else None
+        dropped = 0
         if data:
             self.paused = bool(data.get("paused"))
-            for job in data.get("jobs", []):
-                job.pop("stopping", None)
-                job.setdefault("comfy", job.get("gpu", False))
-                self.jobs[job["id"]] = job
+        for job in records if isinstance(records, list) else []:
+            if not isinstance(job, dict) or not all(isinstance(job.get(k), str) and job[k]
+                                                    for k in ("id", "kind", "status")):
+                dropped += 1
+                continue
+            job.pop("stopping", None)
+            job.setdefault("comfy", job.get("gpu", False))
+            job.setdefault("title", job["kind"])
+            job.setdefault("created", "")
+            for key, value in RECORD_DEFAULTS.items():
+                if key not in job:
+                    job[key] = value.copy() if isinstance(value, (list, dict)) else value
+            self.jobs[job["id"]] = job
+        if dropped:
+            self._tell(f"{dropped} record(s) in {self.jobs_file.name} are not jobs and were left out")
+        if note and data:
+            self._save()
+
+        # Logs. A job list that is kept aside names jobs whose logs are the only other record of them
+        if SWEEP_LOGS and data is not None and not note:
+            swept = self._sweep()
+            if swept:
+                print(f"[jobs] removed {swept} log and exit file(s) of jobs that have no record", file=sys.stderr)
         snap = procs.snapshot()
         for job in self.jobs.values():
             if job["status"] == "running":
@@ -1010,12 +1175,68 @@ class JobManager:
 
     def _save(self) -> None:
         finished = [j for j in self.jobs.values() if j["status"] in FINISHED]
-        for old in sorted(finished, key=lambda j: j["created"])[:-KEEP_FINISHED]:
-            self.jobs.pop(old["id"], None)
-        tmp = self.jobs_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"paused": self.paused, "jobs": list(self.jobs.values())}, indent=1),
-                       encoding="utf-8")
-        os.replace(tmp, self.jobs_file)
+        for old in sorted(finished, key=lambda j: j.get("finished") or j["created"])[:-KEEP_FINISHED]:
+            self._forget(old)
+        write_state(self.jobs_file, json.dumps({"paused": self.paused, "jobs": list(self.jobs.values())}, indent=1))
+
+    def _forget(self, job: dict) -> None:
+        """Drops a job's record with its log and its exit file. A file that can't be removed stays."""
+        self.jobs.pop(job["id"], None)
+        log = self.log_path(job)
+        for path in (log, log.with_suffix(".exit")):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass  # a lost job's process may still hold its log open
+
+    def _sweep(self) -> int:
+        """Removes the logs and exit files in the log folder that belong to no job record. Returns how many."""
+        gone = 0
+        for path in list(self.log_dir.iterdir()):
+            if path.suffix in (".log", ".exit") and JOB_ID_RE.fullmatch(path.stem) and path.stem not in self.jobs:
+                try:
+                    path.unlink()
+                    gone += 1
+                except OSError:
+                    pass
+        return gone
+
+    def _tell(self, note: str) -> None:
+        """Keeps something about the app's own state for the snapshot, and prints it."""
+        self.notices.append(note)
+        print(f"[jobs] {note}", file=sys.stderr, flush=True)
+
+    def _trouble(self, what: str, e: BaseException) -> str:
+        """Prints a failure of the job loop with its traceback, once every TROUBLE_EVERY seconds for one failure.
+
+        what: what failed.
+        e: the exception.
+        Returns the failure as one line, for the snapshot. Never raises.
+        """
+        line = f"{what}: {said(e)}"
+        try:
+            now = time.time()
+            if now - self._told.get(line, 0.0) >= TROUBLE_EVERY:
+                if len(self._told) > 200:
+                    self._told.clear()
+                self._told[line] = now
+                print(f"[jobs] {line}", file=sys.stderr)
+                traceback.print_exception(e, file=sys.stderr)
+                sys.stderr.flush()
+        except Exception:
+            pass
+        return line
+
+    def health(self, now: float) -> dict:
+        """How the job loop fares, for the snapshot.
+
+        now: the current time.
+        Returns {"last_ok", "age", "error"}: when the last pass that completed ended, or None when none has
+        since the app started, the seconds since then or since the start, and the failure of the newest pass
+        or of a part of it as one line, or None.
+        """
+        error = self.tick_error or next(iter(self.troubles.values()), None)
+        return {"last_ok": self.tick_ok, "age": max(0.0, now - (self.tick_ok or self.began)), "error": error}
 
     # Requests
 
@@ -1224,14 +1445,9 @@ class JobManager:
 
     def clear_finished(self) -> int:
         with self.lock:
-            gone = [jid for jid, j in self.jobs.items() if j["status"] in FINISHED]
-            for jid in gone:
-                log = self.log_path(self.jobs.pop(jid))
-                for path in (log, log.with_suffix(".exit")):
-                    try:
-                        path.unlink(missing_ok=True)
-                    except OSError:
-                        pass  # a lost job's process may still hold its log open
+            gone = [j for j in self.jobs.values() if j["status"] in FINISHED]
+            for job in gone:
+                self._forget(job)
             self._save()
         return len(gone)
 
@@ -1320,7 +1536,8 @@ class JobManager:
                                         else j["meta"]["lines"] * rate * 60 + DECODE_SECONDS)
                 jobs.append(item)
             return {"jobs": jobs, "external": self.external, "comfy": self.comfy, "paused": self.paused,
-                    "minutes_per_line": round(rate, 3), "now": now}
+                    "minutes_per_line": round(rate, 3), "now": now, "tick": self.health(now),
+                    "notices": list(self.notices)}
 
     # The loop
 
@@ -1329,11 +1546,14 @@ class JobManager:
             try:
                 self.tick()
             except Exception as e:
-                print(f"[jobs] tick failed: {e!r}", file=sys.stderr)
+                self.tick_error = self._trouble("tick failed", e)
+            else:
+                self.tick_ok, self.tick_error = time.time(), None
             self._stop.wait(TICK_SECONDS)
 
     def start(self) -> None:
         if not self.thread.is_alive():
+            self.began = time.time()
             self.thread.start()
 
     def stop(self) -> None:
@@ -1595,17 +1815,11 @@ class JobManager:
                 "running_since": (running[0].get("create_time") or 0) / 1000 if running else None}
 
     def _cancel_comfy_prompts(self, job: dict) -> list[str]:
-        """Cancels the running or pending ComfyUI prompts that belong to the job's render or cast. Returns their ids."""
-        slug = job.get("slug") or ""
-        if job["kind"] == "render":
-            marker = f"{slug}/ch{int(job['meta']['chapters'][0]):04d}"
-        elif job["kind"] == "cast":
-            marker = f"cast/{slug}/"
-        elif job["kind"] == "draw":
-            marker = f"images/{slug}/"
-        elif job["kind"] == "check-takes":
-            marker = f"breeze/{slug}/ch{int(job['meta']['chapters'][0]):04d}/"
-        else:
+        """Cancels the running or pending ComfyUI prompts that belong to the job. Returns their ids."""
+        meta = job.get("meta")
+        marker = kinds.comfy_marker(job["kind"], job.get("slug") or "",
+                                    meta.get("chapters") if isinstance(meta, dict) else None)
+        if marker is None:
             return []
         try:
             queue = self._get("/queue", timeout=10)

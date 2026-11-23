@@ -38,35 +38,29 @@ from pathlib import Path
 from .. import library as lib
 from .. import machine
 from ..breeze import render_changes, reusable_takes
-from . import exchange
-from .jobs import (BACKLOG_BESIDE, CHECK_HEAD_RE, LOG_MARKS, OVERRUN_SHARE, PRECHECK_RE, QUICK_SETUP_SECONDS,
-                   RENDER_COST, RENDER_HEAD_RE, ROOT, TAKES_HEAD_RE, WORDS_PER_LINE, JobManager, _slug, _ts,
-                   backlog_wait, between_stages, now_iso, read_tail, start_order)
+from . import exchange, kinds
+from .jobs import (BACKLOG_BESIDE, CHECK_HEAD_RE, LOG_MARKS, OVERRUN_SHARE, PAUSED_WAIT, PRECHECK_RE,
+                   QUICK_SETUP_SECONDS, RENDER_COST, RENDER_HEAD_RE, ROOT, TAKES_HEAD_RE, WORDS_PER_LINE,
+                   JobManager, _slug, _ts, backlog_wait, between_stages, now_iso, read_state, read_tail, said,
+                   start_order, write_state)
 
 NAMESPACE = "serial-audio"
 PREFIX = "serial-audio"
 CLASSES = ("breeze", "comfyui", "llm")
 GPU_CLASSES = {"breeze", "comfyui"}
-LLM_KINDS = {"character-pass", "screenplay", "bios", "look-pass"}
-# jobs that write only the serial's looks, settings and images, which no other kind of job reads
-LOOK_KINDS = {"look-pass", "draw", "pick-image"}
-# a job with no CLI step: its worker sends the app every take and candidate its node holds for the serial
-SYNC_KIND = "sync-media"
-SERIAL_WIDE = {"character-pass", "cast", "bios", "reset-bible", "pick-voice", "fetch", "say-as", "voice-effect",
-               "say-options"}
-# serial-wide jobs that write only voices/, the bible and serial.yaml, which a chapter job took in its bundle
-CONFIG_WRITERS = {"cast", "bios", "pick-voice", "say-as", "voice-effect", "say-options"}
-# jobs that write only their chapters' files
-CHAPTER_KINDS = {"render", "screenplay", "check-takes"}
+# the kinds of each group that the wait rules read, by the flags of kinds.KINDS, which says what each means
+LLM_KINDS = set(kinds.having("llm"))
+LOOK_KINDS = set(kinds.having("look"))
+SYNC_KIND = kinds.SYNC
+SERIAL_WIDE = set(kinds.having("serial_wide"))
+CONFIG_WRITERS = set(kinds.having("config_writer"))
+CHAPTER_KINDS = set(kinds.having("chapter"))
 # pairs of serial-wide jobs that share no file: a fetch writes chapter files, the index and serial.yaml, and bios
 # writes bible/characters.yaml
 NO_SHARED_FILE = {frozenset({"bios", "fetch"})}
-# serial-wide jobs that change nothing a chapter job reads: the options of a term are not its say-as
-NO_CHAPTER_INPUT = {"say-options"} | LOOK_KINDS
-# serial-wide jobs that change nothing a screenplay reads: a script names who speaks, with a voice or without
-NO_SCRIPT_INPUT = {"cast", "bios", "pick-voice", "voice-effect"}
-# chapter jobs that read the voices a cast files
-VOICE_READERS = {"render", "check-takes"}
+NO_CHAPTER_INPUT = set(kinds.having("no_chapter_input"))
+NO_SCRIPT_INPUT = set(kinds.having("no_script_input"))
+VOICE_READERS = set(kinds.having("voice_reader"))
 # seconds per Breeze take by GPU type, until a node's own render records give its rate
 RATE_DEFAULT = {"nvidia": 3.0, "metal": 18.0, "none": 25.0}
 RATE_MIN_TAKES = 20
@@ -115,6 +109,8 @@ BUNDLE_BUILDS = 3
 TAKE_BACKS = 2
 # how often in a row a job whose node went away is queued again, and 0 switches that off
 LOST_BACKS = 2
+# the minutes a node can be disconnected before Nomad calls its allocation lost: lost_after in the job spec
+LOST_AFTER_MINUTES = 30
 EVICT = True
 EVICT_SECONDS = 20.0
 STOP_GRACE = 90.0
@@ -448,67 +444,10 @@ def _int_flag(args: list, flag: str) -> int | None:
     return None
 
 
-def _cast_engine(job: dict) -> str | None:
-    """The voice design engine a cast job asks for: its --engine flag, else the serial's cast_engine, else breeze.
-
-    An unknown cast_engine comes back as written, so the CLI refuses it before the casting pass. None when the
-    serial can't be read.
-    """
-    args = list(job.get("args") or [])
-    if "--engine" in args and args.index("--engine") + 1 < len(args):
-        return args[args.index("--engine") + 1]
-    from ..casting import plan_cast_engine
-    from ..comfy import ComfyError
-    try:
-        serial = lib.load_serial(job.get("slug") or "")
-    except Exception:
-        return None
-    try:
-        return plan_cast_engine(serial)
-    except ComfyError:
-        return str(serial.get("cast_engine"))
-
-
 def job_stages(job: dict) -> list[dict] | None:
-    """The Nomad dispatches a job runs as, in order, or None when it runs on the app's machine.
-
-    A cast writes its casting briefs on a Claude node first and then designs the voices on a GPU node, which finds
-    the briefs cached and calls no LLM. Only a Qwen cast needs a ComfyUI node. The options of a term are proposed on
-    a Claude node and then said on a breeze node, and a job that only says options, again or with one spelling
-    added, is the breeze stage alone. A take check runs on any breeze node, and picking a voice runs on the app's
-    machine, from the media mirror. A draw writes its descriptions on a Claude node and paints on a ComfyUI node,
-    which asks no LLM, and a draw from a description that came with the job is the ComfyUI stage alone.
-    """
-    kind, args = job["kind"], list(job["args"])
-    if kind in LLM_KINDS:
-        return [{"class": "llm", "args": args}]
-    if kind in ("check-takes", SYNC_KIND):
-        return [{"class": "breeze", "args": args}]
-    if kind == "cast":
-        if "--dry-run" in args:
-            return [{"class": "llm", "args": args}]
-        engine = _cast_engine(job)
-        flag = [] if engine is None or "--engine" in args else ["--engine", engine]
-        voices = [a for a in args if a != "--redo-brief"] + flag
-        return [{"class": "llm", "args": args + flag + ["--dry-run"], "label": "casting briefs"},
-                {"class": "comfyui" if engine == "qwen" else "breeze", "args": voices, "label": "voices"}]
-    if kind == "say-options":
-        cut = args.index("--") if "--" in args else len(args)
-        if any(a == "--render-only" or a.startswith("--add=") for a in args[:cut]):
-            return [{"class": "breeze", "args": args}]
-        return [{"class": "llm", "args": args[:cut] + ["--dry-run"] + args[cut:], "label": "respellings"},
-                {"class": "breeze", "args": args[:cut] + ["--render-only"] + args[cut:], "label": "takes"}]
-    if kind == "draw":
-        if "--dry-run" in args:
-            return [{"class": "llm", "args": args}]
-        images = [a for a in args if a != "--redo-brief"] + ["--briefed"]
-        if any(a.startswith("--prompt=") for a in args):
-            return [{"class": "comfyui", "args": images}]
-        return [{"class": "llm", "args": args + ["--dry-run"], "label": "descriptions"},
-                {"class": "comfyui", "args": images, "label": "images"}]
-    if kind == "render":
-        return [{"class": "comfyui" if job.get("comfy") else "breeze", "args": args}]
-    return None
+    """The Nomad dispatches a job runs as, in order, or None when it runs on the app's machine, as kinds.stages
+    gives them."""
+    return kinds.stages(job)
 
 
 class NomadJobManager(JobManager):
@@ -591,11 +530,16 @@ class NomadJobManager(JobManager):
         self._reconcile_local(job, snap)
 
     def _load_placement(self) -> dict:
-        try:
-            data = json.loads(self.placement_file.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            data = {}
-        return data if isinstance(data, dict) else {}
+        data, note = read_state(self.placement_file)
+        if note:
+            self._tell(note)
+        if note and data:
+            # the unreadable file was moved aside, and the next start would take a folder without one for new
+            try:
+                write_state(self.placement_file, json.dumps(data, indent=1))
+            except OSError as e:
+                self._tell(f"{self.placement_file.name} could not be written again from its copy: {e}")
+        return data or {}
 
     def _record_placement(self, job: dict, node: str | None, report: dict, success: bool) -> None:
         """Remembers the node that ran a chapter's render or take check as the node that holds its takes."""
@@ -615,9 +559,7 @@ class NomadJobManager(JobManager):
         self._save_placement()
 
     def _save_placement(self) -> None:
-        tmp = self.placement_file.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.placement, indent=1), encoding="utf-8")
-        os.replace(tmp, self.placement_file)
+        write_state(self.placement_file, json.dumps(self.placement, indent=1))
 
     # Holds
 
@@ -742,12 +684,22 @@ class NomadJobManager(JobManager):
 
     # Requests
 
-    def cancel(self, jid: str) -> dict:
-        """Cancels a queued job, asks a running worker to stop, or stops a local job. Returns the job."""
+    def cancel(self, jid: str, requeue: bool = False) -> dict:
+        """Cancels a queued job, asks a running worker to stop, or stops a local job.
+
+        jid: the job.
+        requeue: True asks a job that runs on the cluster to stop and to go back into the queue at once, in its
+            place. The queued jobs of its batch then stay queued.
+        Returns the job. Raises KeyError for an unknown job, and ValueError when requeue is asked for a job that
+        doesn't run on the cluster or that is stopping already.
+        """
         with self.lock:
             job = self.jobs.get(jid)
             if job is None:
                 raise KeyError(jid)
+            if requeue:
+                self._ask_back(job, "now")
+                return job
             if job["status"] != "running" or not self.is_nomad(job):
                 local = job["status"] == "running"
             else:
@@ -766,10 +718,11 @@ class NomadJobManager(JobManager):
                     job["stopping"] = True
                     self._append_log(job, "\n[web] stop requested; the worker stops within a few seconds\n")
                     self._skip_batch(job, "an earlier job in the batch was stopped")
-                elif n.get("evict") and not n.get("by_user"):
-                    n["by_user"] = True
-                    self._append_log(job, "\n[web] stop requested while the job was pausing for another, so it is "
-                                          "not queued again\n")
+                elif n.get("requeue") or (n.get("evict") and not n.get("by_user")):
+                    how = "on its way back into the queue" if n.pop("requeue", None) else "pausing for another"
+                    n["by_user"] = bool(n.get("evict"))
+                    self._append_log(job, f"\n[web] stop requested while the job was {how}, so it is not queued "
+                                          f"again\n")
                     self._skip_batch(job, "an earlier job in the batch was stopped")
                 self._save()
                 return job
@@ -876,6 +829,7 @@ class NomadJobManager(JobManager):
             outlook = {jid: dict(o) for jid, o in self._outlook.items()}
         ends = []
         for item in snap["jobs"]:
+            item["pausable"] = item["status"] == "running" and self._pausable(item)
             if item.get("nomad"):
                 item["nomad"] = {k: v for k, v in item["nomad"].items() if k not in ("key", "marks")}
             item.pop("gave_way", None)
@@ -890,7 +844,7 @@ class NomadJobManager(JobManager):
                 if o.get(key) is not None:
                     item[key] = max(0.0, o[key] - age)
             ends.append(item.get("end_in"))
-        snap.update({"executor": "nomad", "workers": self.workers, "nomad": self.nomad_state,
+        snap.update({"executor": "nomad", "workers": self.workers, "nomad": self.nomad_state, "requeue": True,
                      "queue_end_in": max(ends) if ends and None not in ends else None})
         return snap
 
@@ -997,6 +951,9 @@ class NomadJobManager(JobManager):
 
     def _poll_jobs(self, now: float) -> None:
         with self.lock:
+            for key in [k for k in self.troubles if k.startswith("poll ")
+                        and (self.jobs.get(k[5:]) or {}).get("status") != "running"]:
+                del self.troubles[key]
             todo = [(j["id"], j["nomad"]["dispatched"], bool(j["nomad"].get("ended_seen")))
                     for j in self.jobs.values()
                     if j["status"] == "running" and j.get("nomad") and j["nomad"].get("dispatched")
@@ -1019,7 +976,12 @@ class NomadJobManager(JobManager):
             with self.lock:
                 job = self.jobs.get(jid)
                 if job and job["status"] == "running" and job.get("nomad", {}).get("dispatched") == dispatched:
-                    self._apply_poll(job, seen, now)
+                    try:
+                        self._apply_poll(job, seen, now)
+                        self.troubles.pop(f"poll {jid}", None)
+                    except Exception as e:
+                        self.troubles[f"poll {jid}"] = self._trouble(f"what Nomad says of {job.get('title') or jid} "
+                                                                     f"could not be read", e)
 
     def _apply_poll(self, job: dict, seen: dict, now: float) -> None:
         n = job["nomad"]
@@ -1043,8 +1005,8 @@ class NomadJobManager(JobManager):
         status = alloc.get("ClientStatus")
         if status == "unknown":
             n["cut_off"] = True
-            n["wait"] = (f"{n['node']} is disconnected; the job carries on if it reconnects within 2 hours, "
-                         f"and is queued again if it doesn't")
+            n["wait"] = (f"{n['node']} is disconnected; the job carries on if it reconnects within "
+                         f"{LOST_AFTER_MINUTES} minutes, and is queued again if it doesn't")
             return
         n["wait"] = None
         if status not in ("complete", "failed", "lost"):
@@ -1067,6 +1029,9 @@ class NomadJobManager(JobManager):
         if n.get("evict") and not n.get("by_user"):
             self._queue_evicted(job, answered=False)
             return
+        if n.get("requeue"):
+            self._queue_stopped(job, answered=False)
+            return
         if _left_behind(job, status):
             self._take_back(job, f"{n['node']} went away while it ran this job", lost=True)
             return
@@ -1077,7 +1042,9 @@ class NomadJobManager(JobManager):
         n = job["nomad"]
         if n.get("cancel") and now - n.get("stop_at", now) > STOP_GRACE:
             paused = n.get("evict") and not n.get("by_user")
-            why = "the worker did not confirm the stop" + (" that paused it for another job" if paused else "")
+            back = n.get("requeue")
+            why = "the worker did not confirm the stop" + (" that paused it for another job" if paused else
+                                                           " that was to put it back into the queue" if back else "")
             self._finish(job, "stopped", f"{why}; check Nomad job {n.get('dispatched')}")
 
     def _finish(self, job: dict, status: str, note: str, code: int | None = None) -> None:
@@ -1122,38 +1089,63 @@ class NomadJobManager(JobManager):
         self._plan = {}
         blocked: dict[str, dict] = {}
         changed = False
+        trouble = None
         for job in queued:
-            lane = self.lane(job)
-            first = blocked.get(lane)
-            held = (backlog_wait(job, self.jobs.values()) if job.get("backlog") and not between_stages(job)
-                    else None)
-            if held:
-                reason = held
-            elif first and lane not in CLASSES and (not _starts_beside(job) or conflicts(job, first)):
-                reason = f"queued behind {first['title']}"
-            else:
-                reason = self._blocker_for(job, lane, running)
-            if reason:
-                self.wait_reasons[job["id"]] = reason
-                blocked.setdefault(lane, job)
-                continue
-            if not job.get("nomad"):
-                stale = self._already_done(job)
-                if stale:
-                    job.update({"status": "skipped", "finished": now_iso(), "note": stale})
+            try:
+                changed = self._offer(job, running, blocked, dispatch) or changed
+            except Exception as e:
+                # one record that can't be read raises for every job that is weighed against it
+                trouble = trouble or self._trouble(f"the pass could not place {job.get('title') or job.get('id')}", e)
+                if job.get("status") == "queued":
+                    self.wait_reasons[job.get("id") or ""] = f"the app could not work out whether it can start: {said(e)}"
+                else:
                     changed = True
-                    continue
-            if lane in CLASSES:
-                node, cls = self._picked.pop(job["id"], (None, None))
-                self._mark_dispatch(job, node, cls)
-                if not self._handed(job, node):
-                    dispatch.append(job["id"])
-            else:
-                self._launch_local(job)
-            if job["status"] == "running":
-                running.append(job)
-            changed = True
+                    if job.get("status") == "running" and all(job is not other for other in running):
+                        running.append(job)
+        if trouble:
+            self.troubles["schedule"] = trouble
+        else:
+            self.troubles.pop("schedule", None)
         return changed
+
+    def _offer(self, job: dict, running: list[dict], blocked: dict[str, dict], dispatch: list[str]) -> bool:
+        """Starts one queued job in a scheduling pass, or records why it waits.
+
+        job: the queued job.
+        running: the running jobs, which gets the job when it starts.
+        blocked: the first job of each lane that waits in this pass, which gets the job when it is the first.
+        dispatch: the ids of the jobs to dispatch after the pass, which gets the job's unless a worker was handed it.
+        Returns whether the job's record changed: it started, or was skipped as done already.
+        """
+        lane = self.lane(job)
+        first = blocked.get(lane)
+        held = (backlog_wait(job, self.jobs.values()) if job.get("backlog") and not between_stages(job)
+                else None)
+        if held:
+            reason = held
+        elif first and lane not in CLASSES and (not _starts_beside(job) or conflicts(job, first)):
+            reason = f"queued behind {first['title']}"
+        else:
+            reason = self._blocker_for(job, lane, running)
+        if reason:
+            self.wait_reasons[job["id"]] = reason
+            blocked.setdefault(lane, job)
+            return False
+        if not job.get("nomad"):
+            stale = self._already_done(job)
+            if stale:
+                job.update({"status": "skipped", "finished": now_iso(), "note": stale})
+                return True
+        if lane in CLASSES:
+            node, cls = self._picked.pop(job["id"], (None, None))
+            self._mark_dispatch(job, node, cls)
+            if not self._handed(job, node):
+                dispatch.append(job["id"])
+        else:
+            self._launch_local(job)
+        if job["status"] == "running":
+            running.append(job)
+        return True
 
     def _handed(self, job: dict, node: str | None) -> bool:
         """Hands a job that a pass just marked for dispatch to the worker the pass runs for, if it is that worker's.
@@ -1225,7 +1217,7 @@ class NomadJobManager(JobManager):
             self._handing = handing
             self._schedule(time.time(), [])
         except Exception as e:
-            print(f"[jobs] no next job handed after {job.get('id')}: {e!r}", file=sys.stderr)
+            self._trouble(f"no next job handed after {job.get('id')}", e)
         finally:
             self._handing = None
             if handing["got"]:
@@ -1249,6 +1241,8 @@ class NomadJobManager(JobManager):
 
     def _blocker_for(self, job: dict, lane: str, running: list[dict]) -> str | None:
         """Why the queued job cannot start now, or None."""
+        if job.get("paused"):
+            return PAUSED_WAIT
         if self.paused and (lane in CLASSES or job["heavy"]):
             return "the queue is on hold"
         # a job that is not backlog work never waits for backlog work that has not started, which waits for it
@@ -1392,14 +1386,26 @@ class NomadJobManager(JobManager):
         not a redraw, whose bundle a worker fetched on a GPU node and that nobody asked to stop. A draw gives way
         each time. False while EVICT is off.
         """
+        if not (EVICT and job.get("backlog")) or not self._pausable(job):
+            return False
+        return job["kind"] == "draw" or not job.get("evicted")
+
+    def _pausable(self, job: dict) -> bool:
+        """Whether a running job keeps what it made when it stops and runs again.
+
+        job: a running job, or the copy of one that the page gets.
+        Returns True for a Breeze render whose bundle a worker fetched and that has not started its join, and for
+        a draw that is not a redraw, in its images stage on a GPU node. False for a job that was asked to stop.
+        A render keeps its takes and hears the new ones again, and a draw keeps the subjects it filed.
+        """
         n = job.get("nomad") or {}
-        if not (EVICT and job.get("backlog") and n.get("contact")) or n.get("cancel"):
+        if not n.get("contact") or n.get("cancel"):
             return False
         if job["kind"] == "draw":
             # a redraw that is queued again would paint the subjects it has filed once more
             return n["stages"][n["stage"]]["class"] != "llm" and "--redraw" not in job.get("args", [])
         return (self._is_breeze(job) and not (job.get("meta") or {}).get("decode_only")
-                and "join" not in (n.get("marks") or {}) and not job.get("evicted"))
+                and "join" not in (n.get("marks") or {}))
 
     def _evict(self, job: dict, other: dict) -> None:
         """Asks the worker of a backlog render or draw to stop, so its node goes to a job that is not backlog work.
@@ -1435,6 +1441,102 @@ class NomadJobManager(JobManager):
         self._append_log(job, f"\n[web] {job['note']}, " + ("with what it made\n" if answered else
                                                             "after its task ended without a result\n"))
         self._save()
+
+    def _ask_back(self, job: dict, how: str) -> None:
+        """Asks a job that runs on the cluster to stop and to go back into the queue.
+
+        job: the job.
+        how: "hold" when the job then waits for resume(), "now" when it starts again by the scheduler's rules.
+        Returns nothing. A job whose worker has its bundle is queued again when the worker confirms the stop, or
+        when its task ends without a result. When the worker does not confirm within STOP_GRACE, the job ends as
+        stopped and its batch is skipped, as for a stop. A job that no worker has started, or whose node is
+        disconnected, is queued again at once. Raises ValueError for a job that doesn't run on the cluster or
+        that was asked to stop already.
+        """
+        n = job.get("nomad") if job["status"] == "running" else None
+        if not n:
+            raise ValueError("only a job that runs on the cluster can go back into the queue")
+        if n.get("cancel"):
+            raise ValueError("the job is stopping already")
+        n["requeue"] = how
+        if not n.get("contact") or n.get("client_status") == "unknown":
+            self._queue_stopped(job, answered=False)
+            return
+        n.update({"cancel": True, "stop_at": time.time()})
+        job["stopping"] = True
+        asked = "pause requested" if how == "hold" else "stop requested, and the job is queued again after it"
+        self._append_log(job, f"\n[web] {asked}; the worker stops within a few seconds\n")
+        self._save()
+
+    def _queue_stopped(self, job: dict, answered: bool = True) -> None:
+        """Queues a job again that _ask_back asked to stop.
+
+        job: the job, with the mark of that request on its nomad record.
+        answered: whether its worker sent the stopped stage's result, which was just applied.
+        Returns nothing. The job keeps its place in the queue. The stage that was stopped runs again under another
+        key, and the stages before it stand. A job that was paused waits for resume(). A repeated upload of the
+        stopped stage's result gets the report the first one got.
+        """
+        n = job["nomad"]
+        hold = n.get("requeue") == "hold"
+        gave = {"key_sha": _key_sha(n.get("key")), "report": (n.get("reports") or {}).get(str(n["stage"]))}
+        if n["stage"] == 0:
+            job.pop("nomad")
+            job["started"] = None
+        else:
+            # the stage's next run sends a result of its own, which the report of the stopped run would answer
+            (n.get("reports") or {}).pop(str(n["stage"]), None)
+            for mark in ("cancel", "stop_at", "requeue", "by_user"):
+                n.pop(mark, None)
+            n.update({"dispatched": None, "alloc": None, "follows": None, "dispatching": False, "contact": None,
+                      "client_status": None, "ended_seen": None, "wait": None, "cut_off": None,
+                      "key": secrets.token_urlsafe(24)})
+        job.pop("stopping", None)
+        what = "paused from the web app" if hold else "stopped and queued again"
+        job.update({"status": "queued", "exit_code": None, "gave_way": gave, "paused": hold,
+                    "note": None if hold else what})
+        self._takes_cache.clear()
+        self._append_log(job, f"\n[web] {what}, " + ("with what it made\n" if answered else
+                                                     "and no worker sent a result for the stopped run\n"))
+        self._save()
+
+    def pause(self, jid: str) -> dict:
+        """Asks a running job to stop where it is and to wait in the queue until resume().
+
+        jid: the job.
+        Returns the job. When its worker has stopped, the job is queued again in its place and marked as paused,
+        and the queued jobs of its batch stay queued. Raises KeyError for an unknown job, and ValueError for a
+        job that is not running, that is stopping already, or that _pausable refuses.
+        """
+        with self.lock:
+            job = self.jobs.get(jid)
+            if job is None:
+                raise KeyError(jid)
+            if job["status"] != "running":
+                raise ValueError("only a running job can be paused")
+            if (job.get("nomad") or {}).get("cancel"):
+                raise ValueError("the job is stopping already")
+            if not self._pausable(job):
+                raise ValueError("this job can't be paused without losing work, so stop it and queue it again")
+            self._ask_back(job, "hold")
+            return job
+
+    def resume(self, jid: str) -> dict:
+        """Lets a paused job start again by the scheduler's rules.
+
+        jid: the job.
+        Returns the job. Raises KeyError for an unknown job, and ValueError for a job that is not paused.
+        """
+        with self.lock:
+            job = self.jobs.get(jid)
+            if job is None:
+                raise KeyError(jid)
+            if job["status"] != "queued" or not job.get("paused"):
+                raise ValueError("this job is not paused")
+            job.update({"paused": False, "note": None})
+            self._append_log(job, "[web] resumed from the web app\n")
+            self._save()
+            return job
 
     def _remaining(self, job: dict, count: bool = True) -> float:
         """Seconds a running job is estimated to keep its node.
@@ -1785,9 +1887,10 @@ class NomadJobManager(JobManager):
                                                                 or not o.get("backlog") or between_stages(o))]
             if job.get("backlog") and not staged:
                 beside = job["kind"] in BACKLOG_BESIDE
-                waits += [o for o in done if not (beside and o.get("backlog") and o["kind"] in BACKLOG_BESIDE
-                                                  and not between_stages(o))]
-            held = self.paused and (bool(stages) or job["heavy"])
+                waits += [o for o in done if not o.get("paused")
+                          and not (beside and o.get("backlog") and o["kind"] in BACKLOG_BESIDE
+                                   and not between_stages(o))]
+            held = job.get("paused") or (self.paused and (bool(stages) or job["heavy"]))
             t = None if held or any(ends[o["id"]] is None for o in waits) else max(
                 (ends[o["id"]] for o in waits), default=0.0)
             if stages:
@@ -1887,7 +1990,8 @@ class NomadJobManager(JobManager):
             n["stages"][n["stage"]]["class"] = cls
         n.update({"dispatched": None, "alloc": None, "node": None, "target": node, "contact": None,
                   "client_status": None, "wait": None, "ended_seen": None, "polled": 0, "dispatching": True,
-                  "retry_at": 0, "log_got": 0, "marks": {}, "follows": None, "cut_off": None})
+                  "retry_at": 0, "log_got": 0, "marks": {}, "follows": None, "cut_off": None,
+                  "cancel": None, "requeue": None})
         job.update({"status": "running", "pid": None, "note": None})
 
     def dispatch_target(self, n: dict) -> str:
@@ -1917,7 +2021,8 @@ class NomadJobManager(JobManager):
         with self.lock:
             self._in_flight.discard(jid)
             job = self.jobs.get(jid)
-            if not job or not job.get("nomad"):
+            # a job that was queued again during the request has another key, and this answer is not its own
+            if not job or not job.get("nomad") or job["nomad"].get("key") != meta["key"]:
                 return
             n = job["nomad"]
             if error is None:
@@ -2108,7 +2213,8 @@ class NomadJobManager(JobManager):
         jid, key: the job and its key.
         paths: mirror paths, as exchange.mirror_rel gives them.
         Returns {"have": {path: SHA-256}} for the paths that are files in the mirror. A path that is not a mirror
-        path is left out. Raises WorkerError on a wrong key or a job that no longer runs.
+        path is left out. A file the worker is told of is dated as exchange.confirm_held does, so a prune leaves
+        it for the result that names it. Raises WorkerError on a wrong key or a job that no longer runs.
         """
         with self.lock:
             self._media_job(jid, key)
@@ -2118,7 +2224,7 @@ class NomadJobManager(JobManager):
                 continue
             try:
                 if (self.media_dir / rel).is_file():
-                    have[rel] = exchange.sha256_file(self.media_dir / rel)
+                    have[rel] = exchange.confirm_held(self.media_dir / rel)
             except OSError:
                 continue
         return {"have": have}
@@ -2193,9 +2299,15 @@ class NomadJobManager(JobManager):
             task = n.get("dispatched")
             code = info.get("exit_code")
             paused = bool(n.get("evict")) and not n.get("by_user")
-            # a render that ends by itself while it is asked to give way has finished
-            cancelled = bool(info.get("cancelled")) or (bool(n.get("cancel")) and not paused)
+            back = n.get("requeue")
+            # a job that ends by itself while it is asked to give way or to go back into the queue has finished
+            cancelled = bool(info.get("cancelled")) or (bool(n.get("cancel")) and not paused and not back)
             success = code == 0 and not cancelled
+            if success and back:
+                # the next stage's worker would be refused its bundle while the request stands
+                for mark in ("cancel", "stop_at", "requeue"):
+                    n.pop(mark, None)
+                job.pop("stopping", None)
             keep = success or (st["class"] == "llm" and not cancelled)
             self._applied[job["slug"]] = self._applied.get(job["slug"], 0) + 1
             try:
@@ -2219,13 +2331,15 @@ class NomadJobManager(JobManager):
                 self._save()
             elif cancelled and paused:
                 self._queue_evicted(job)
+            elif cancelled and back:
+                self._queue_stopped(job)
             elif cancelled:
                 self._finish(job, "stopped", "stopped from the web app", code)
             elif not success:
                 self._finish(job, "failed", f"exit {code} on {node}", code)
             elif n["stage"] + 1 < len(n["stages"]) and not drew_nothing(job, read_tail(self.log_path(job), 8000)):
                 n["stage"] += 1
-                job["status"] = "queued"
+                job.update({"status": "queued", "paused": success and back == "hold"})
                 self._append_log(job, f"[web] stage {n['stage']} of {len(n['stages'])} done on {node}\n")
                 self._save()
             else:

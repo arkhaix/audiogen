@@ -6,7 +6,7 @@ FROM python:3.13.17-slim-trixie
 
 RUN apt-get update && apt-get install -y --no-install-recommends tzdata \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install --no-cache-dir pyyaml==6.0.3
+    && pip install --no-cache-dir pyyaml==6.0.3 curl_cffi==0.17.0
 
 WORKDIR /app
 COPY serial_audio /app/serial_audio

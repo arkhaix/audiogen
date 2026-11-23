@@ -521,6 +521,60 @@ def inside(slug: str) -> int:
         finally:
             dummy.kill()
 
+    # A pause over HTTP stops the worker and keeps the job in the queue until a resume, and a stop can queue the job
+    # again at once
+    if os.name == "nt":
+        def ask(path, body=None):
+            req = urllib.request.Request(f"{app_url}{path}", method="POST", data=json.dumps(body or {}).encode(),
+                                         headers={"X-Serial-Audio": "1", "Content-Type": "application/json"})
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    return resp.status, json.loads(resp.read())
+            except urllib.error.HTTPError as e:
+                return e.code, {}
+
+        def waits(job):
+            return lambda: "[worker] waiting:" in (log(job) if m.log_path(job).exists() else "")
+
+        outside = [sys.executable, "-c", "import time; time.sleep(600)", "serial_audio.cli", "render", "dummy", "1"]
+        dummy = subprocess.Popen(outside)
+        try:
+            job = submit("render", {"slug": slug, "chapter": 1}, args=["chapters", slug])
+            check(run_until(waits(job), 90), "the render to pause waits for the machine")
+            seen = next(j for j in m.snapshot()["jobs"] if j["id"] == job["id"])
+            check(seen["pausable"] is True and m.snapshot()["requeue"] is True, "the page is told the render can pause")
+            status, answer = ask(f"/api/jobs/{job['id']}/pause")
+            check(status == 200 and answer["job"]["nomad"]["requeue"] == "hold", f"the pause was accepted ({status})")
+            check(run_until(lambda: job["status"] == "queued", 60) and job.get("paused") is True and "nomad" not in job,
+                  f"the paused render waits in the queue ({job['status']}, note {job.get('note')})")
+            for _ in range(4):
+                m.tick()
+            check(job["status"] == "queued" and m.wait_reasons.get(job["id"]) == "paused until you resume it",
+                  f"no pass starts the paused render ({job['status']}, {m.wait_reasons.get(job['id'])})")
+            check(ask(f"/api/jobs/{job['id']}/pause")[0] == 400, "a job that is not running can't be paused")
+        finally:
+            dummy.kill()
+        status, answer = ask(f"/api/jobs/{job['id']}/resume")
+        check(status == 200 and answer["job"]["paused"] is False, f"the resume was accepted ({status})")
+        check(run_until(finished(job), 90) and job["status"] == "done",
+              f"the resumed render ran ({job['status']}, note {job.get('note')})")
+        check("paused from the web app, with what it made" in log(job) and "resumed from the web app" in log(job),
+              "its log has the pause and the resume")
+
+        dummy = subprocess.Popen(outside)
+        try:
+            job = submit("render", {"slug": slug, "chapter": 1}, args=["chapters", slug])
+            check(run_until(waits(job), 90), "the render to stop waits for the machine")
+            first = job["nomad"]["dispatched"]
+            status, answer = ask(f"/api/jobs/{job['id']}/cancel", {"requeue": True})
+            check(status == 200 and answer["job"]["nomad"]["requeue"] == "now", f"the stop was accepted ({status})")
+            check(run_until(lambda: "stopped and queued again, with what it made" in log(job), 60),
+                  f"the stopped render went back into the queue ({job['status']}, note {job.get('note')})")
+        finally:
+            dummy.kill()
+        check(run_until(finished(job), 90) and job["status"] == "done" and job["nomad"]["dispatched"] != first,
+              f"it ran again in a task of its own ({job['status']}, note {job.get('note')})")
+
     # A backlog render gives its node to a job that is not backlog work, and runs again after it
     if os.name == "nt":
         fake.second = True
