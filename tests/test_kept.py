@@ -691,7 +691,7 @@ class HandNextTest(unittest.TestCase):
         job = {"id": jid, "seq": seq, "kind": "render", "slug": slug, "status": status, "heavy": True, "gpu": True,
                "comfy": comfy, "title": f"Render · ch {n}", "args": ["render", slug, str(n)],
                "meta": {"chapters": [n], "lines": 100, "engine": "drama3" if comfy else "breeze"},
-               "batch": None, "backlog": False, "started": None}
+               "needs": [], "backlog": False, "started": None}
         self.m.jobs[jid] = job
         return job
 
@@ -1019,7 +1019,7 @@ class HandNextTest(unittest.TestCase):
         stage (1)."""
         args = ["draw", "demo", "--candidates", "2"]
         job = {"id": jid, "seq": seq, "kind": "draw", "slug": "demo", "status": "running", "heavy": True, "gpu": True,
-               "comfy": True, "title": "Draw · everyone who needs an image", "args": args, "batch": None,
+               "comfy": True, "title": "Draw · everyone who needs an image", "args": args, "needs": [],
                "meta": {"characters": [], "settings": [], "candidates": 2, "subjects": 24}, "backlog": True,
                "long": True, "started": None}
         job["nomad"] = {"key": f"key-{jid}", "stage": stage, "target": node_name, "node": node_name, "contact": "t",

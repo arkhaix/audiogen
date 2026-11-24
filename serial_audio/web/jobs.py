@@ -4,7 +4,8 @@ Every change to the library runs as a `python -m serial_audio.cli` job under run
 Heavy jobs (render, cast, check-takes, character-pass, screenplay) run one at a time and wait while any pipeline process the app
 did not start is running, or while ComfyUI is busy with a prompt the app did not queue. A job that queues ComfyUI
 prompts also waits for ComfyUI to answer. A Breeze render under breeze-server does not. Quick jobs (pick-voice,
-imports) run beside a render but never beside a job that rewrites the bible.
+imports) run beside a render but never beside a job that rewrites the bible. A job also waits for the jobs it
+needs, which deps.py names, and it is skipped when one of them does not end well.
 """
 from __future__ import annotations
 
@@ -26,7 +27,7 @@ from pathlib import Path
 from .. import library as lib
 from ..comfy import ComfyError
 from ..render import plan_engine
-from . import kinds, procs
+from . import deps, kinds, procs
 
 ROOT = lib.ROOT
 STATE_DIR = ROOT / ".webapp"
@@ -74,7 +75,7 @@ JOB_ID_RE = re.compile(r"[0-9]{8}-[0-9]{6}-[0-9a-f]{6}")
 # whether a start removes the logs and exit files in the log folder that belong to no job record
 SWEEP_LOGS = True
 # what a job record of older code may lack and the loop reads without asking
-RECORD_DEFAULTS = {"seq": 0, "heavy": False, "gpu": False, "args": [], "meta": {}, "slug": None, "batch": None,
+RECORD_DEFAULTS = {"seq": 0, "heavy": False, "gpu": False, "args": [], "meta": {}, "slug": None, "needs": [],
                    "params": {}, "started": None, "finished": None, "note": None}
 
 CREATE_NEW_PROCESS_GROUP = 0x00000200
@@ -185,7 +186,7 @@ def _expand(slug: str, spec: str, coming=()) -> list[int]:
 
     slug: the serial.
     spec: a chapter list such as 7-12, "all" or "new".
-    coming: chapters that earlier jobs of the batch import. They count beside the chapters on disk.
+    coming: chapters that the imports ahead of the job bring. They count beside the chapters on disk.
     Returns the chapter numbers in order. "new" names none.
     """
     have = sorted(set(lib.list_chapters(slug)) | set(coming))
@@ -566,8 +567,8 @@ def build(kind: str, p: dict, comfy_url: str = COMFY_URL, coming: dict | None = 
     kind: a CLI subcommand the app exposes.
     p: the request's parameters.
     comfy_url: the ComfyUI address render and cast jobs use.
-    coming: {slug: chapters} that jobs queued ahead of this one in its batch import. A character pass or a
-        screenplay counts them as chapters of the serial.
+    coming: {slug: chapters} that the imports ahead of this job bring, in its request or in the queue. A
+        character pass or a screenplay counts them as chapters of the serial.
     Returns {"args", "heavy", "gpu", "comfy", "title", "slug", "meta"}. gpu: the job uses the card. comfy: it queues
     ComfyUI prompts. Raises ValueError on a bad request.
     """
@@ -1143,6 +1144,7 @@ class JobManager:
             self._tell(note)
         records = data.get("jobs") if data else None
         dropped = 0
+        unwired: set[str] = set()
         if data:
             self.paused = bool(data.get("paused"))
         for job in records if isinstance(records, list) else []:
@@ -1150,6 +1152,11 @@ class JobManager:
                                                     for k in ("id", "kind", "status")):
                 dropped += 1
                 continue
+            if isinstance(job.get("needs"), list):
+                job["needs"] = [nid for nid in job["needs"] if isinstance(nid, str)]
+            else:
+                job.pop("needs", None)
+                unwired.add(job["id"])
             job.pop("stopping", None)
             job.setdefault("comfy", job.get("gpu", False))
             job.setdefault("title", job["kind"])
@@ -1160,6 +1167,7 @@ class JobManager:
             self.jobs[job["id"]] = job
         if dropped:
             self._tell(f"{dropped} record(s) in {self.jobs_file.name} are not jobs and were left out")
+        self._wire_old(unwired)
         if note and data:
             self._save()
 
@@ -1173,10 +1181,29 @@ class JobManager:
             if job["status"] == "running":
                 self._reconcile(job, snap)
 
+    def _wire_old(self, ids: set[str]) -> None:
+        """Gives the queued records of older code the needs they would get if they were queued now.
+
+        ids: the records that came without needs.
+        Returns nothing. A job that has started keeps none. A record that the rule can't read keeps none, and
+        the snapshot says so.
+        """
+        queue = sorted((j for j in self.jobs.values() if j["status"] in deps.OPEN), key=lambda j: j["seq"])
+        for i, job in enumerate(queue):
+            if job["id"] in ids and job["status"] == "queued" and not job.get("nomad"):
+                try:
+                    job["needs"] = deps.wire(job, queue[:i])
+                except Exception as e:
+                    self._tell(f"the jobs that {job['id']} needs could not be worked out: {said(e)}")
+
     def _save(self) -> None:
         finished = [j for j in self.jobs.values() if j["status"] in FINISHED]
+        # a job that waits for a record, or was skipped for one, still reads it
+        read = {nid for j in self.jobs.values() if j["status"] not in FINISHED or j.get("lacks")
+                for nid in j.get("needs") or ()}
         for old in sorted(finished, key=lambda j: j.get("finished") or j["created"])[:-KEEP_FINISHED]:
-            self._forget(old)
+            if old["id"] not in read:
+                self._forget(old)
         write_state(self.jobs_file, json.dumps({"paused": self.paused, "jobs": list(self.jobs.values())}, indent=1))
 
     def _forget(self, job: dict) -> None:
@@ -1240,23 +1267,27 @@ class JobManager:
 
     # Requests
 
-    def submit(self, requests: list[dict], stop_on_failure: bool = True,
-               covered: list[dict] | None = None) -> list[dict]:
-        """Queues the jobs in order as one batch. Validates them all first.
+    def submit(self, requests: list[dict], covered: list[dict] | None = None) -> list[dict]:
+        """Queues the jobs in order. Validates them all first.
 
         requests: [{"kind", "params"}]. A request whose params hold "backlog": true is queued as backlog work,
             which starts only when backlog_wait lets it.
-        stop_on_failure: when one job fails, skip the batch's queued jobs that can't go on. Here that is the rest
-            of the batch, and on the cluster the jobs that wait for the failed one.
         covered: when given, receives the waiting job that stands in for each request that was not queued.
-        A character pass or a screenplay that follows the import of its chapter in `requests` names that chapter in
-        its meta before the chapter is on disk. A backlog render is not queued while a backlog render with the same
-        arguments waits outside a batch and no other kind of backlog job is queued after that one. The render that
-        waits stands in for it, and from then on counts as queued at the time of this request.
+        Each job's needs are the jobs that deps.wire() finds for it among the jobs that have not ended: the ones
+        queued or running before this request, and the ones ahead of it in `requests`.
+        A character pass or a screenplay that follows the import of its chapter, in `requests` or in the queue,
+        names that chapter in its meta before the chapter is on disk. A backlog render is not queued while a
+        backlog render with the same arguments waits that needs no job which this one would not need, and no
+        other kind of backlog job is queued after that one. The render that waits stands in for it: from then on
+        it counts as queued at the time of this request, with the needs this one would have.
         Returns the new jobs. Raises ValueError and queues nothing if any request is bad.
         """
         built = []
         coming: dict[str, set[int]] = {}
+        with self.lock:
+            for j in self.jobs.values():
+                if j["status"] in deps.OPEN and j.get("slug") and deps.is_import(j):
+                    coming.setdefault(j["slug"], set()).update(deps.chapters(j))
         for r in requests:
             if not isinstance(r, dict):
                 raise ValueError("each job must be an object with a kind and params")
@@ -1265,26 +1296,28 @@ class JobManager:
             if r.get("kind") == "fetch":
                 coming.setdefault(b["slug"], set()).update(b["meta"].get("chapters") or [])
             built.append((r.get("kind"), params, b))
-        batch = uuid.uuid4().hex[:8]
         out = []
         with self.lock:
+            ahead = sorted((j for j in self.jobs.values() if j["status"] in deps.OPEN), key=lambda j: j.get("seq", 0))
             seq = max((j.get("seq", 0) for j in self.jobs.values()), default=0)
             for kind, params, b in built:
                 backlog = isinstance(params, dict) and params.get("backlog") is True
-                waiting = self._stands_in(kind, b["args"]) if backlog else None
+                jid = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
+                job = {"id": jid, "kind": kind, "params": params, "args": b["args"], "heavy": b["heavy"],
+                       "gpu": b["gpu"], "comfy": b["comfy"], "title": b["title"], "slug": b["slug"], "meta": b["meta"],
+                       "needs": [], "seq": seq + 1,
+                       "backlog": backlog,
+                       "status": "queued", "created": now_iso(), "started": None, "finished": None,
+                       "exit_code": None, "pid": None, "note": None}
+                job["needs"] = deps.wire(job, ahead)
+                waiting = self._stands_in(job) if backlog else None
                 if waiting:
-                    waiting["asked"] = now_iso()
+                    waiting.update({"asked": now_iso(), "needs": job["needs"]})
                     if covered is not None:
                         covered.append(waiting)
                     continue
                 seq += 1
-                jid = time.strftime("%Y%m%d-%H%M%S-") + uuid.uuid4().hex[:6]
-                job = {"id": jid, "kind": kind, "params": params, "args": b["args"], "heavy": b["heavy"],
-                       "gpu": b["gpu"], "comfy": b["comfy"], "title": b["title"], "slug": b["slug"], "meta": b["meta"],
-                       "batch": batch if len(built) > 1 and stop_on_failure else None, "seq": seq,
-                       "backlog": backlog,
-                       "status": "queued", "created": now_iso(), "started": None, "finished": None,
-                       "exit_code": None, "pid": None, "note": None}
+                ahead.append(job)
                 self.jobs[jid] = job
                 out.append(job)
             self._save()
@@ -1294,18 +1327,18 @@ class JobManager:
         """The job fields for one request, as build returns them. Raises ValueError on a bad request."""
         return build(kind, params, self.comfy_url, coming)
 
-    def _stands_in(self, kind: str, args: list[str]) -> dict | None:
+    def _stands_in(self, job: dict) -> dict | None:
         """Finds the waiting job that a new backlog render would only repeat.
 
-        kind: the new job's kind.
-        args: the new job's CLI arguments.
-        Returns the last queued backlog render with these arguments that is not part of a batch, or None when
-        there is none or another kind of backlog job is queued after it.
+        job: the new job with its needs, before it is queued.
+        Returns the last queued backlog render with the same arguments that needs no job which the new one
+        doesn't need, or None when there is none or another kind of backlog job is queued after it.
         """
-        if kind != "render":
+        if job["kind"] != "render":
             return None
-        same = [j for j in self.jobs.values() if j["kind"] == "render" and j.get("backlog") and j["args"] == args
-                and j["status"] == "queued" and not between_stages(j) and not j.get("batch")]
+        wanted = set(job["needs"])
+        same = [j for j in self.jobs.values() if j["kind"] == "render" and j.get("backlog") and j["args"] == job["args"]
+                and j["status"] == "queued" and not between_stages(j) and set(j.get("needs") or ()) <= wanted]
         if not same:
             return None
         last = max(same, key=lambda j: j["seq"])
@@ -1315,7 +1348,11 @@ class JobManager:
         return last
 
     def cancel(self, jid: str) -> dict:
-        """Cancels a queued job, or stops a running one and cancels its ComfyUI prompts. Returns the job."""
+        """Cancels a queued job, or stops a running one and cancels its ComfyUI prompts.
+
+        jid: the job.
+        Returns the job. The queued jobs that need it are skipped with it. Raises KeyError for an unknown job.
+        """
         with self.lock:
             job = self.jobs.get(jid)
             if job is None:
@@ -1323,6 +1360,7 @@ class JobManager:
             if job["status"] == "queued":
                 job["status"] = "cancelled"
                 job["finished"] = now_iso()
+                self._settle_needs()
                 self._save()
                 return job
             if job["status"] != "running" or job.get("stopping"):
@@ -1339,7 +1377,7 @@ class JobManager:
             job["note"] = "stopped from the web app" + (f"; cancelled ComfyUI prompt(s) {', '.join(cancelled)}"
                                                         if cancelled else "")
             self._append_log(job, f"\n[web] {job['note']}\n")
-            self._skip_batch(job, "an earlier job in the batch was stopped")
+            self._settle_needs()
             self._save()
         return job
 
@@ -1353,9 +1391,9 @@ class JobManager:
         to: "top", "bottom", "up" or "down" by one place, or "before".
         before: with "before", the queued job the moved ones go ahead of.
         Returns nothing. The queue is in start_order, so a job moves only among the jobs of its own half: backlog
-        work that has not started, or the rest. A job stays behind every job of its batch that it was queued
-        behind and that _keeps_ahead names. A job of ids that started meanwhile is passed over. Raises KeyError
-        when none of ids is queued or `before` is not, and ValueError on another to.
+        work that has not started, or the rest. A job stays behind every job it needs. A job of ids that started
+        meanwhile is passed over. Raises KeyError when none of ids is queued or `before` is not, and ValueError
+        on another to.
         """
         if to not in REORDER:
             raise ValueError(f"cannot move jobs {to!r}: use one of {', '.join(REORDER)}")
@@ -1393,14 +1431,12 @@ class JobManager:
                           if by_id[before] in half else 0 if late else len(rest))
                 order += rest[:at] + mine + rest[at:]
 
-            # A job goes no higher than the jobs of its batch that it has to follow
-            was = {j["id"]: i for i, j in enumerate(queue)}
+            # A job goes no higher than the jobs it needs
             for _ in range(len(order)):
                 moved = False
                 for i, job in enumerate(order):
-                    last = max((k for k, other in enumerate(order) if k > i and job.get("batch")
-                                and other.get("batch") == job["batch"] and was[other["id"]] < was[job["id"]]
-                                and self._keeps_ahead(other, job)), default=None)
+                    last = max((k for k, other in enumerate(order) if k > i
+                                and other["id"] in (job.get("needs") or ())), default=None)
                     if last is not None:
                         order.insert(last, order.pop(i))
                         moved = True
@@ -1413,15 +1449,11 @@ class JobManager:
                 job["seq"] = seq
             self._save()
 
-    def _keeps_ahead(self, first: dict, job: dict) -> bool:
-        """Whether job has to stay behind first, a job of its batch that was queued ahead of it."""
-        return True
-
     def cancel_queued(self, ids: list[str]) -> int:
         """Cancels the jobs of ids that are still queued, as cancel does one.
 
         ids: job ids. A job that started meanwhile keeps running, and an unknown id is passed over.
-        Returns how many were cancelled.
+        Returns how many were cancelled. A queued job that needs one of them, and is not of ids, is skipped.
         """
         with self.lock:
             done = 0
@@ -1431,20 +1463,45 @@ class JobManager:
                     job.update({"status": "cancelled", "finished": now_iso()})
                     done += 1
             if done:
+                self._settle_needs()
                 self._save()
         return done
 
-    def retry(self, jid: str) -> dict:
+    def retry(self, jid: str, back: list[dict] | None = None) -> dict:
+        """Queues a job again from its request, with the jobs that were skipped for it.
+
+        jid: the job, which has ended.
+        back: when given, receives the jobs that were skipped for it and are queued again.
+        Returns the new job, or the waiting job that stands in for it. A job that was skipped for this one comes
+        back as deps.revive says, behind the new job in the queue and in the order it had. The job's `again` names
+        the new job from then on, so it doesn't come back with the jobs that were skipped for another job.
+        Raises KeyError for an unknown job, and ValueError when the request is refused now.
+        """
         with self.lock:
             job = self.jobs.get(jid)
             if job is None:
                 raise KeyError(jid)
+            self._settle_needs()
             covered: list[dict] = []
             new = self.submit([{"kind": job["kind"], "params": job["params"]}], covered=covered)
-            return (new or covered)[0]
+            again = (new or covered)[0]
+            if job["status"] in FINISHED:
+                job["again"] = again["id"]
+            revived = deps.revive(self.jobs, jid, again["id"]) if job["status"] in FINISHED else []
+            seq = max((j.get("seq", 0) for j in self.jobs.values()), default=0)
+            for other in revived:
+                seq += 1
+                other["seq"] = seq
+            if revived:
+                self._save()
+            if back is not None:
+                back.extend(revived)
+            return again
 
     def clear_finished(self) -> int:
         with self.lock:
+            # a need that ended well comes off the jobs that wait for it before its record goes
+            self._settle_needs()
             gone = [j for j in self.jobs.values() if j["status"] in FINISHED]
             for job in gone:
                 self._forget(job)
@@ -1580,18 +1637,20 @@ class JobManager:
             if ext_heavy or comfy_busy:
                 self.last_busy = now
             self.wait_reasons = {}
+            changed = bool(self._settle_needs())
             queued = sorted((j for j in self.jobs.values() if j["status"] == "queued"), key=start_order)
-            changed = False
             ahead: dict[bool, dict] = {}
             for job in queued:
                 first = ahead.get(job["heavy"])
                 held = backlog_wait(job, self.jobs.values()) if job.get("backlog") else None
-                reason = held or (f"queued behind {first['title']}" if first else
-                                  self._blocker(job, running, ext_heavy, comfy_busy, now))
+                reason = held or deps.waits_for(job, self.jobs) or (
+                    f"queued behind {first['title']}" if first else
+                    self._blocker(job, running, ext_heavy, comfy_busy, now))
                 if reason:
                     self.wait_reasons[job["id"]] = reason
                     ahead.setdefault(job["heavy"], job)
                     continue
+                job["needs"] = []
                 stale = self._already_done(job)
                 if stale:
                     job.update({"status": "skipped", "finished": now_iso(), "note": stale})
@@ -1745,7 +1804,7 @@ class JobManager:
                 proc = subprocess.Popen(argv, creationflags=base, **kwargs)
         except OSError as e:
             job.update({"status": "failed", "finished": now_iso(), "note": f"could not start: {e}"})
-            self._skip_batch(job, "an earlier job in the batch failed")
+            self._settle_needs()
             return
         job.update({"status": "running", "pid": proc.pid, "started": now_iso(), "note": None})
 
@@ -1773,17 +1832,12 @@ class JobManager:
         else:
             return
         if job["status"] != "done":
-            self._skip_batch(job, f"an earlier job in the batch {job['status']}")
+            self._settle_needs()
         self._save()
 
-    def _skip_batch(self, job: dict, why: str) -> None:
-        if not job.get("batch"):
-            return
-        for other in self.jobs.values():
-            if other["batch"] == job["batch"] and other["status"] == "queued":
-                other["status"] = "skipped"
-                other["finished"] = now_iso()
-                other["note"] = why
+    def _settle_needs(self) -> list[dict]:
+        """Skips the queued jobs that need a job which did not end well, as deps.settle does. Returns them."""
+        return deps.settle(self.jobs, now_iso())
 
     def _append_log(self, job: dict, text: str) -> None:
         try:

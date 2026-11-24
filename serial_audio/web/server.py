@@ -460,7 +460,7 @@ def post_jobs(h: Handler, q):
     if not isinstance(requests, list) or not requests:
         raise HTTPError(400, "give a list of jobs")
     covered: list[dict] = []
-    jobs = h.manager.submit(requests, stop_on_failure=body.get("stop_on_failure", True) is not False, covered=covered)
+    jobs = h.manager.submit(requests, covered=covered)
     h._send_json({"jobs": jobs, "already": len(covered)})
 
 
@@ -519,7 +519,9 @@ def post_cancel_queued(h: Handler, q):
 
 
 def post_retry(h: Handler, q, jid):
-    h._send_json({"job": h.manager.retry(jid)})
+    back: list[dict] = []
+    job = h.manager.retry(jid, back)
+    h._send_json({"job": job, "revived": len(back)})
 
 
 def post_clear(h: Handler, q):

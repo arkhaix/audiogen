@@ -11,8 +11,9 @@ uploaded page's name, which can be empty. The dump has five parts:
 * requests: the same for made-up requests of every kind, good and bad, with the stages of what each builds.
 * stages: the stages and the lane of each job record as it is stored.
 * conflicts: for a sample of the records and for made-up records of every kind, which waits for which.
-* queues: N made-up queues of the records, each with what one scheduling pass starts, on which node, why the
-  others wait, which running job it asks to stop, and the forecast after the pass.
+* queues: N made-up queues of the records, each with the jobs that every queued job needs, what one scheduling
+  pass starts, on which node, why the others wait, which running job it asks to stop, and the forecast after the
+  pass.
 
 Two dumps of one root are equal when the rules answer the same, so a change that should keep every answer is
 checked by a dump before it and one after it. The dump starts no process and no Nomad job. It writes out.json and
@@ -203,7 +204,7 @@ def other_serials() -> list[dict]:
     def add(kind, slug, name, args, meta, gpu=False, comfy=False, heavy=True):
         out.append({"id": f"other-{kind}-{slug}-{name}", "kind": kind, "slug": slug, "args": [kind, slug] + args,
                     "meta": meta, "heavy": heavy, "gpu": gpu, "comfy": comfy, "title": f"{kind} · {slug} {name}",
-                    "params": {}, "batch": None})
+                    "params": {}})
 
     for s in range(1, 7):
         slug = f"other-{s}"
@@ -246,7 +247,6 @@ def queue(records: list[dict], nomad, rng: random.Random) -> tuple[list[dict], l
         job.setdefault("heavy", False)
         job.setdefault("gpu", False)
         job.setdefault("comfy", False)
-        job.setdefault("batch", None)
         job.setdefault("title", job["kind"])
         job.setdefault("meta", {})
         job.setdefault("args", [])
@@ -273,6 +273,7 @@ def queue(records: list[dict], nomad, rng: random.Random) -> tuple[list[dict], l
 def play(m, nomad, jobs_now: list[dict], nodes: list[dict], paused: bool, counts: dict, mirrored: bool) -> dict:
     """One scheduling pass over a made-up queue and the forecast after it."""
     m.jobs = {j["id"]: j for j in jobs_now}
+    m._wire_old(set(m.jobs))
     m.workers, m.paused = nodes, paused
     for cache in (m._picked, m._plan, m._takes_cache, m._mirror_cache, m._work, m._words_cache, m.wait_reasons):
         cache.clear()
@@ -291,6 +292,7 @@ def play(m, nomad, jobs_now: list[dict], nodes: list[dict], paused: bool, counts
             st = n["stages"][n["stage"]] if n.get("stages") else None
             after[j["id"]] = {k: v for k, v in {
                 "status": j["status"], "wait": m.wait_reasons.get(j["id"]), "note": j.get("note"),
+                "needs": j.get("needs") or None, "lacks": j.get("lacks"),
                 "target": n.get("target"), "class": st["class"] if st else None, "cancel": n.get("cancel"),
                 "evict": n.get("evict"), "asked_stop": j.get("asked_stop"), "follows": n.get("follows")}.items()
                 if v not in (None, False)}

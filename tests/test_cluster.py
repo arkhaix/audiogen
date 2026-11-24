@@ -245,6 +245,13 @@ def job(kind, slug="demo", chapters=None, args=None, comfy=False):
     return {"kind": kind, "slug": slug, "meta": {"chapters": chapters or []}, "args": args or [kind], "comfy": comfy}
 
 
+def wired(manager) -> dict:
+    """Gives a manager's queued records the needs they would get if they were queued in the order of their seq,
+    as a start of the app does for the records of older code. Returns the records by id."""
+    manager._wire_old(set(manager.jobs))
+    return manager.jobs
+
+
 class SchedulingTest(unittest.TestCase):
     def test_conflicts(self):
         self.assertFalse(conflicts(job("render", chapters=[7]), job("render", chapters=[8])))
@@ -331,6 +338,429 @@ class SchedulingTest(unittest.TestCase):
                                                                 {"network: reserved port collision gpu=19137": 1}}}}]
         self.assertIn("another GPU job", placement_wait(evals))
         self.assertIsNone(placement_wait([{"CreateIndex": 1}]))
+
+
+def record(jid, kind, chapters=None, seq=0, status="queued", args=None, **meta):
+    """A job record as deps.py reads one, on the serial demo."""
+    return {"id": jid, "kind": kind, "slug": "demo", "status": status, "seq": seq, "title": jid,
+            "meta": {"chapters": chapters or [], **meta}, "args": args or [kind, "demo"], "needs": []}
+
+
+class NeedsTest(unittest.TestCase):
+    """Which job needs which, and what a needed job's end does to the jobs that need it (deps.py)."""
+
+    def test_a_job_needs_the_jobs_whose_work_it_reads(self):
+        from serial_audio.web.deps import needs
+
+        def imp(n):
+            return record(f"i{n}", "fetch", [n], args=["fetch", "demo", str(n), "--html", "page.html"])
+
+        def yes(kind, chapters, other, **meta):
+            return needs(record("j", kind, chapters, **meta), other)
+
+        # The import of a saved page: the jobs that read its chapter's text need it. A job on another chapter
+        # doesn't, and neither does a job that reads no chapter.
+        for kind in ("character-pass", "look-pass", "screenplay", "render", "check-takes"):
+            self.assertTrue(yes(kind, [7], imp(7)), kind)
+            self.assertFalse(yes(kind, [8], imp(7)), kind)
+        for kind in ("cast", "bios", "say-as", "pick-voice", "draw", "fetch"):
+            self.assertFalse(yes(kind, [7], imp(7)), kind)
+        # A fetch from the site names no chapter. Only a pass that names none either needs it, because its chapter
+        # was not on disk when it was queued.
+        site = record("f", "fetch")
+        self.assertEqual([yes(kind, chapters, site) for kind, chapters in (
+            ("character-pass", []), ("screenplay", []), ("character-pass", [7]), ("render", [7]), ("look-pass", []))],
+            [True, True, False, False, False])
+
+        # A character pass: the passes of later chapters need it, and so do the look pass, the screenplay, the
+        # render and the take check of its own chapter. A pass of an earlier chapter, or of the same one, doesn't.
+        chars = record("c7", "character-pass", [7])
+        self.assertEqual([yes("character-pass", c, chars) for c in ([8], [8, 9], [7], [6], [6, 8], [])],
+                         [True, True, False, False, False, False])
+        self.assertFalse(yes("character-pass", [8], record("c", "character-pass")))
+        for kind in ("look-pass", "screenplay", "render", "check-takes"):
+            self.assertEqual([yes(kind, c, chars) for c in ([7], [6, 7], [8], [])], [True, True, False, True], kind)
+            self.assertTrue(yes(kind, [8], record("c", "character-pass")), kind)
+        # A cast for everyone needs the character passes. One that follows a chapter's pass needs the passes up to
+        # its chapter. A cast of named characters needs none, and neither do the other jobs that write voices.
+        self.assertTrue(yes("cast", [], chars, characters=[]))
+        self.assertEqual([yes("cast", [], chars, characters=[], from_chapter=n) for n in (6, 7, 8)],
+                         [False, True, True])
+        self.assertFalse(yes("cast", [], chars, characters=["ann"]))
+        for kind in ("bios", "pick-voice", "say-as", "voice-effect", "say-options", "draw"):
+            self.assertFalse(yes(kind, [], chars), kind)
+
+        # A cast: a render and a take check need it, unless it follows the pass of a later chapter or only writes
+        # briefs. A screenplay and a character pass read nothing it files.
+        cast, late = record("k", "cast", characters=[]), record("k9", "cast", characters=[], from_chapter=9)
+        for kind in ("render", "check-takes"):
+            self.assertEqual([yes(kind, [8], cast), yes(kind, [8], late), yes(kind, [9], late), yes(kind, [12], late),
+                              yes(kind, [8], record("k", "cast", characters=["ann"])),
+                              yes(kind, [8], record("k", "cast", characters=[], dry_run=True))],
+                             [True, False, True, True, True, False], kind)
+        for kind in ("screenplay", "character-pass", "look-pass", "cast", "bios"):
+            self.assertFalse(yes(kind, [8], cast), kind)
+        # A voice pick and a voice effect: a render and a take check. A say-as: a screenplay too.
+        for made in ("pick-voice", "voice-effect", "say-as"):
+            self.assertEqual([yes(kind, [8], record("v", made)) for kind in ("render", "check-takes", "screenplay",
+                                                                           "character-pass", "cast")],
+                             [True, True, made == "say-as", False, False], made)
+        self.assertFalse(yes("render", [8], record("o", "say-options")))
+        self.assertFalse(yes("render", [8], record("b", "bios")))
+
+        # A chapter's own jobs: the render and the take check need the screenplay, and the take check the render.
+        # Nothing needs a take check, and a second job of the same kind doesn't need the first.
+        script, render = record("s8", "screenplay", [8]), record("r8", "render", [8])
+        self.assertEqual([yes("render", [8], script), yes("check-takes", [8], script), yes("render", [9], script),
+                          yes("screenplay", [8], script), yes("look-pass", [8], script)],
+                         [True, True, False, False, False])
+        self.assertEqual([yes("check-takes", [8], render), yes("check-takes", [9], render), yes("render", [8], render),
+                          yes("screenplay", [8], render), yes("character-pass", [8], render)],
+                         [True, False, False, False, False])
+        self.assertFalse(yes("render", [8], record("t8", "check-takes", [8])))
+        # A reset of the bible: every job that reads the bible.
+        reset = record("x", "reset-bible")
+        self.assertEqual([yes(kind, [8], reset) for kind in ("character-pass", "cast", "bios", "look-pass",
+                                                             "screenplay", "render", "check-takes", "draw", "say-as",
+                                                             "pick-voice", "fetch")], [True] * 8 + [False] * 3)
+
+        # Another serial, and a job that names no serial: never. Backlog work that has not started waits for every
+        # other job, so no job that is not backlog work needs it. Two backlog jobs keep the rule.
+        self.assertFalse(needs({**record("j", "render", [8]), "slug": "other"}, script))
+        self.assertFalse(needs({**record("j", "render", [8]), "slug": None}, {**script, "slug": None}))
+        self.assertFalse(yes("render", [8], {**script, "backlog": True}))
+        self.assertTrue(needs({**record("j", "render", [8]), "backlog": True}, {**script, "backlog": True}))
+        self.assertTrue(needs({**record("j", "render", [8]), "backlog": True}, script))
+        # A record whose meta is not what a job's is reads as a job that names nothing.
+        self.assertFalse(needs({**record("j", "render"), "meta": None}, {**script, "meta": ["x"]}))
+        with self.assertRaises(KeyError):
+            needs({"slug": "demo"}, script)
+
+    def test_a_job_waits_for_every_job_it_needs(self):
+        # needs() names no pair that conflicts() lets run side by side, so a job that needs another also waits for
+        # it by the rule for jobs that can't run at the same time, and the queue's forecast holds for it.
+        from serial_audio.web import kinds
+        from serial_audio.web.deps import needs
+        made = []
+        for kind in kinds.KINDS:
+            for chapters in ([], [1], [2], [1, 2]):
+                made.append(record(f"{kind}{chapters}", kind, chapters))
+                if kind == "fetch" and len(chapters) == 1:
+                    made.append(record(f"import{chapters}", kind, chapters,
+                                       args=["fetch", "demo", str(chapters[0]), "--html", "p.html"]))
+            if kind == "cast":
+                made += [record("cast-ann", kind, characters=["ann"]), record("cast-dry", kind, characters=[], dry_run=True),
+                         record("cast-1", kind, characters=[], from_chapter=1),
+                         record("cast-2", kind, characters=[], from_chapter=2)]
+        pairs = [(a, b) for a in made for b in made if needs(a, b)]
+        self.assertGreater(len(pairs), 100)
+        self.assertEqual([f"{a['id']} needs {b['id']}" for a, b in pairs if not conflicts(a, b)], [])
+
+    def test_a_job_is_queued_with_the_jobs_it_needs(self):
+        from serial_audio.web.deps import wire
+        ahead = [record("c7", "character-pass", [7], 1), record("k", "cast", seq=2, characters=[]),
+                 record("c8", "character-pass", [8], 3), record("k8", "cast", seq=4, characters=[], from_chapter=8),
+                 record("ann", "cast", seq=5, characters=["ann"]), record("s8", "screenplay", [8], 6),
+                 record("done", "say-as", seq=7, status="done"), record("on", "say-as", seq=8, status="running")]
+        # A render needs the pass and the screenplay of its chapter, the say-as that has not ended, the cast of
+        # named characters, and of the casts for everyone the last one, which casts everyone who needs a voice by
+        # then. A job that has ended is not needed, and the job itself isn't either.
+        render = record("r8", "render", [8], 9)
+        self.assertEqual(wire(render, ahead + [render]), ["c8", "k8", "ann", "s8", "on"])
+        self.assertEqual(wire(record("r7", "render", [7], 9), ahead), ["c7", "k", "ann", "on"])
+        # A cast is needed only for its voices, so a screenplay has none of them among its needs.
+        self.assertEqual(wire(record("s7", "screenplay", [7], 9), ahead), ["c7", "on"])
+
+        # A job that was asked to stop for good is not needed by a job that is queued after the request, on the
+        # cluster or on one machine. A job that goes back into the queue after its stop is needed.
+        def running(**more):
+            return {**record("s9", "screenplay", [9], 1, "running"), **more}
+
+        render = record("r9", "render", [9], 9)
+        self.assertEqual([wire(render, [one]) for one in (
+            running(nomad={"cancel": True}), running(nomad={"cancel": True, "evict": "x", "by_user": True}),
+            running(stopping=True), running(nomad={"cancel": True, "requeue": "now"}),
+            running(nomad={"cancel": True, "evict": "x"}), running(nomad={"stage": 0}))],
+            [[], [], [], ["s9"], ["s9"], ["s9"]])
+        # Of two jobs that make the same thing, the later one is needed: the second screenplay of a chapter and
+        # the second import of its page. The first one can fail without the render.
+        def imp(jid, seq):
+            return record(jid, "fetch", [9], seq, args=["fetch", "demo", "9", "--html", "p.html"])
+
+        twice = [record("s9a", "screenplay", [9], 1), imp("i9a", 2), record("s9b", "screenplay", [9], 3), imp("i9b", 4),
+                 record("s8", "screenplay", [8], 5)]
+        self.assertEqual(wire(render, twice), ["s9b", "i9b"])
+        # A character pass needs the pass of the chapter before it, and reaches the earlier ones through that one.
+        # So does a cast for everyone. Passes that were queued out of the order of their chapters are each needed,
+        # because the pass of an earlier chapter doesn't need a later chapter's pass.
+        passes = [record(f"c{n}", "character-pass", [n], n) for n in (5, 6, 7)]
+        self.assertEqual((wire(record("c8", "character-pass", [8], 9), passes),
+                          wire(record("k", "cast", seq=9, characters=[]), passes),
+                          wire(record("c9", "character-pass", [9], 9), [passes[2], passes[0]])),
+                         (["c7"], ["c7"], ["c7", "c5"]))
+
+    def test_a_need_that_ends_settles_the_jobs_that_wait_for_it(self):
+        from serial_audio.web.deps import leans_on, met, revive, settle, waits_for
+
+        def queue():
+            jobs = [record("s8", "screenplay", [8], 1), record("r8", "render", [8], 2), record("t8", "check-takes", [8], 3),
+                    record("r9", "render", [9], 4), record("k", "cast", seq=5, characters=[])]
+            jobs[1]["needs"], jobs[2]["needs"] = ["s8"], ["s8", "r8"]
+            return {j["id"]: j for j in jobs}
+
+        # A job says which job it waits for: the first one in the queue, and how many more.
+        jobs = queue()
+        self.assertEqual((waits_for(jobs["r8"], jobs), waits_for(jobs["t8"], jobs), waits_for(jobs["r9"], jobs)),
+                         ("needs s8", "needs s8 and 1 more job", None))
+        jobs["s8"]["paused"] = True
+        self.assertEqual(waits_for(jobs["r8"], jobs), "needs s8, which is paused")
+        self.assertTrue(leans_on(jobs["t8"], jobs["s8"], jobs) and leans_on(jobs["t8"], jobs["r8"], jobs))
+        self.assertFalse(leans_on(jobs["s8"], jobs["t8"], jobs) or leans_on(jobs["r9"], jobs["s8"], jobs))
+
+        # A need that ended well is taken off, and the job goes on. A job that was skipped because nothing was
+        # left for it to do ended well too.
+        jobs = queue()
+        jobs["s8"]["status"] = "done"
+        self.assertEqual((settle(jobs, "t1"), jobs["r8"]["needs"], jobs["t8"]["needs"], waits_for(jobs["r8"], jobs)),
+                         ([], [], ["r8"], None))
+        jobs["r8"].update({"status": "skipped", "note": "rendered outside the app"})
+        self.assertTrue(met(jobs["r8"]))
+        self.assertEqual((settle(jobs, "t1"), jobs["t8"]["needs"], jobs["t8"]["status"]), ([], [], "queued"))
+
+        # A need that did not end well skips the job, and a job that needs the skipped one with it. Each names
+        # the job it lacks. The other jobs stay.
+        for status, said in (("failed", "failed"), ("lost", "was lost"), ("stopped", "was stopped"),
+                             ("cancelled", "was cancelled")):
+            jobs = queue()
+            jobs["s8"]["status"] = status
+            self.assertEqual([j["id"] for j in settle(jobs, "t1")], ["r8", "t8"], status)
+            self.assertEqual({jid: j["status"] for jid, j in jobs.items()},
+                             {"s8": status, "r8": "skipped", "t8": "skipped", "r9": "queued", "k": "queued"})
+            self.assertEqual((jobs["r8"]["lacks"], jobs["r8"]["note"], jobs["r8"]["finished"], jobs["t8"]["lacks"]),
+                             ("s8", f"needs s8, which {said}", "t1", "s8"))
+            self.assertFalse(met(jobs["r8"]))
+            # A second pass changes nothing.
+            self.assertEqual(settle(jobs, "t2"), [])
+        # A need whose record is gone never ended well while the job waited, so the job is skipped.
+        jobs = queue()
+        del jobs["s8"]
+        settle(jobs, "t1")
+        self.assertEqual((jobs["r8"]["status"], jobs["r8"]["note"]), ("skipped", "needs a job whose record is gone"))
+        # A running job is left as it is, and the queued job that needs the failed one is still skipped.
+        jobs = queue()
+        jobs["s8"]["status"] = "failed"
+        jobs["r8"]["status"] = "running"
+        self.assertEqual(([j["id"] for j in settle(jobs, "t1")], jobs["r8"]["status"], jobs["r8"]["needs"]),
+                         (["t8"], "running", ["s8"]))
+
+        # The failed job is queued again as another. The jobs that were skipped for it come back, with the new
+        # job among their needs, and so does the job that was skipped for one of them.
+        jobs = queue()
+        jobs["s8"]["status"] = "failed"
+        settle(jobs, "t1")
+        jobs["s8b"] = record("s8b", "screenplay", [8], 9)
+        self.assertEqual([j["id"] for j in revive(jobs, "s8", "s8b")], ["r8", "t8"])
+        self.assertEqual({jid: (j["status"], j["needs"], j["finished"], j["note"], "lacks" in j)
+                          for jid, j in jobs.items() if jid in ("r8", "t8")},
+                         {"r8": ("queued", ["s8b"], None, None, False), "t8": ("queued", ["s8b", "r8"], None, None, False)})
+        # A job that still needs another job which did not end well stays skipped, and names that one from then on.
+        jobs = queue()
+        jobs["s8"]["status"] = jobs["r8"]["status"] = "failed"
+        settle(jobs, "t1")
+        jobs["s8b"] = record("s8b", "screenplay", [8], 9)
+        self.assertEqual(revive(jobs, "s8", "s8b"), [])
+        self.assertEqual((jobs["t8"]["status"], jobs["t8"]["lacks"], jobs["t8"]["note"]),
+                         ("skipped", "r8", "needs r8, which failed"))
+        jobs["r8b"] = record("r8b", "render", [8], 10)
+        self.assertEqual([j["id"] for j in revive(jobs, "r8", "r8b")], ["t8"])
+        self.assertEqual(jobs["t8"]["needs"], ["s8b", "r8b"])
+        # A job that was skipped for another reason is not brought back.
+        jobs = queue()
+        jobs["k"].update({"status": "skipped", "note": "nobody needs a voice, so there is nothing to cast"})
+        jobs["s8"]["status"] = "failed"
+        settle(jobs, "t1")
+        jobs["s8b"] = record("s8b", "screenplay", [8], 9)
+        revive(jobs, "s8", "s8b")
+        self.assertEqual(jobs["k"]["status"], "skipped")
+        # Two needs of one job failed. They are queued again one at a time, in either order, and the first of the
+        # new jobs has ended well by the time the second is queued. The skipped job comes back with the second.
+        for first, second in (("s8", "k"), ("k", "s8")):
+            jobs = queue()
+            jobs["r8"]["needs"] = ["k", "s8"]
+            jobs["s8"]["status"] = jobs["k"]["status"] = "failed"
+            settle(jobs, "t1")
+            jobs[first + "b"] = record(first + "b", jobs[first]["kind"], seq=9)
+            self.assertEqual(revive(jobs, first, first + "b"), [], first)
+            jobs[first + "b"]["status"] = "done"
+            jobs[second + "b"] = record(second + "b", jobs[second]["kind"], seq=10)
+            self.assertEqual([j["id"] for j in revive(jobs, second, second + "b")], ["r8", "t8"], first)
+            self.assertEqual(jobs["r8"]["needs"], [second + "b"], first)
+        # A skipped job that was itself queued again, which its again says, stays skipped.
+        jobs = queue()
+        jobs["s8"]["status"] = "failed"
+        settle(jobs, "t1")
+        jobs["r8"]["again"] = "r8b"
+        jobs["s8b"] = record("s8b", "screenplay", [8], 9)
+        self.assertEqual((revive(jobs, "s8", "s8b"), jobs["r8"]["status"], jobs["r8"]["needs"]),
+                         ([], "skipped", ["s8b"]))
+
+
+class NeedsQueueTest(unittest.TestCase):
+    """The queue of one machine with jobs that need each other: how they are queued, cancelled and queued again."""
+
+    def setUp(self):
+        from unittest import mock
+        from serial_audio import library as lib
+        from serial_audio.web import jobs
+        self.jobs = jobs
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        for p in (mock.patch.object(lib, "LIBRARY", Path(self.tmp.name) / "library"),
+                  mock.patch.object(jobs, "external_activity", lambda *a, **k: []),
+                  mock.patch.object(jobs.procs, "snapshot", lambda: {})):
+            p.start()
+            self.addCleanup(p.stop)
+        lib.save_serial("demo", {"title": "Demo"})
+        for n in (1, 2):
+            lib.chapter_dir("demo", n).mkdir(parents=True)
+        self.state = Path(self.tmp.name) / "state"
+        self.m = self.manager()
+        self.started: list[str] = []
+
+        def launch(job):
+            self.started.append(job["id"])
+            job["status"] = "running"
+        for p in (mock.patch.object(self.m, "_launch", launch),
+                  mock.patch.object(self.m, "_poll_comfy", lambda: {"up": True}),
+                  mock.patch.object(self.m, "_reconcile", lambda job, snap: None)):
+            p.start()
+            self.addCleanup(p.stop)
+        self.m.last_busy = -1000.0
+
+    def manager(self):
+        m = self.jobs.JobManager(state_dir=self.state, autostart=False)
+        self.addCleanup(m._lock_file.close)
+        return m
+
+    def queue(self, kind, n):
+        key = "chapter" if kind in ("render", "check-takes") else "chapters"
+        [job] = self.m.submit([{"kind": kind, "params": {"slug": "demo", key: n if key == "chapter" else str(n)}}])
+        return job
+
+    def test_jobs_that_were_queued_apart_need_each_other_like_jobs_that_came_together(self):
+        # A render queued by itself needs the screenplay of its chapter that waits in the queue, and one that
+        # comes in the same request as its screenplay needs it in the same way.
+        script, render = self.queue("screenplay", 1), self.queue("render", 1)
+        both = self.m.submit([{"kind": "screenplay", "params": {"slug": "demo", "chapters": "2"}},
+                              {"kind": "render", "params": {"slug": "demo", "chapter": 2}}])
+        self.assertEqual((script["needs"], render["needs"], both[0]["needs"], both[1]["needs"]),
+                         ([], [script["id"]], [], [both[0]["id"]]))
+        for job in (script, render, *both):
+            self.assertNotIn("batch", job)
+
+        # The screenplay runs, and the render says what it needs.
+        self.m.tick()
+        self.assertEqual(self.started, [script["id"]])
+        self.assertEqual(self.m.wait_reasons[render["id"]], "needs Screenplay · ch 1")
+        # It fails. The render of its chapter is skipped, and chapter 2's jobs go on.
+        script["status"] = "failed"
+        self.m.tick()
+        self.assertEqual((render["status"], render["note"], render["lacks"]),
+                         ("skipped", "needs Screenplay · ch 1, which failed", script["id"]))
+        self.assertEqual((self.started, both[1]["status"]), ([script["id"], both[0]["id"]], "queued"))
+
+        # Run again on the screenplay queues it as a new job and brings the render back behind it.
+        back: list[dict] = []
+        again = self.m.retry(script["id"], back)
+        self.assertEqual((back, render["status"], render["needs"], render["seq"] > again["seq"]),
+                         ([render], "queued", [again["id"]], True))
+        # Run again on a job that nothing was skipped for brings nothing back.
+        both[0]["status"] = "done"
+        self.assertEqual((self.m.retry(both[0]["id"], back), len(back))[1], 1)
+
+    def test_a_skipped_job_that_was_queued_again_does_not_come_back_too(self):
+        script, render = self.queue("screenplay", 1), self.queue("render", 1)
+        script["status"] = "failed"
+        self.m.tick()
+        self.assertEqual(render["status"], "skipped")
+        # Run again on the skipped render queues a copy of it. Run again on the screenplay afterwards brings
+        # nothing back, so the chapter renders once.
+        copy = self.m.retry(render["id"])
+        back: list[dict] = []
+        self.m.retry(script["id"], back)
+        self.assertEqual((back, render["status"], render["again"]), ([], "skipped", copy["id"]))
+        self.assertEqual([j["title"] for j in self.m.jobs.values() if j["status"] == "queued"],
+                         ["Render · ch 1", "Screenplay · ch 1"])
+
+    def test_a_job_that_starts_needs_nothing_from_then_on(self):
+        script, render = self.queue("screenplay", 1), self.queue("render", 1)
+        # The screenplay ended well in the moment before the pass, so the render still names it when it starts.
+        # The start takes it off.
+        script["status"] = "done"
+        self.m.tick()
+        self.assertEqual((render["status"], render["needs"]), ("running", []))
+        # The finished jobs are cleared, and the render goes back into the queue, as after a pause. It is not
+        # skipped for the record that is gone.
+        self.m.clear_finished()
+        render["status"] = "queued"
+        self.m.tick()
+        self.assertEqual((render["status"], self.started), ("running", [render["id"], render["id"]]))
+
+    def test_a_finished_job_keeps_its_record_while_a_job_still_reads_it(self):
+        from unittest import mock
+        script, render, other = self.queue("screenplay", 1), self.queue("render", 1), self.queue("render", 2)
+        script.update({"status": "done", "finished": "2026-11-23T10:00:00"})
+        other.update({"status": "done", "finished": "2026-11-23T11:00:00"})
+        # The app keeps one finished record here, and the screenplay is the older of two. It stays while the
+        # queued render names it, and it goes with the next save after the render has started.
+        with mock.patch.object(self.jobs, "KEEP_FINISHED", 1):
+            self.m._save()
+            self.assertEqual(sorted(self.m.jobs), sorted([script["id"], render["id"], other["id"]]))
+            self.m.tick()
+            self.m._save()
+        self.assertEqual((sorted(self.m.jobs), render["status"]), (sorted([render["id"], other["id"]]), "running"))
+
+    def test_cancelling_a_job_skips_the_jobs_that_need_it(self):
+        script, render, other = self.queue("screenplay", 1), self.queue("render", 1), self.queue("render", 2)
+        self.m.cancel(script["id"])
+        self.assertEqual((script["status"], render["status"], render["note"], other["status"]),
+                         ("cancelled", "skipped", "needs Screenplay · ch 1, which was cancelled", "queued"))
+        # A selection that holds both jobs cancels both, and one that holds the needed job alone skips the other.
+        script, render = self.queue("screenplay", 1), self.queue("render", 1)
+        self.assertEqual(self.m.cancel_queued([script["id"], render["id"]]), 2)
+        self.assertEqual((script["status"], render["status"]), ("cancelled", "cancelled"))
+        script, render = self.queue("screenplay", 1), self.queue("render", 1)
+        self.assertEqual(self.m.cancel_queued([script["id"]]), 1)
+        self.assertEqual((render["status"], other["status"]), ("skipped", "queued"))
+
+    def test_clearing_the_finished_jobs_leaves_a_job_that_needed_one_of_them(self):
+        script, render = self.queue("screenplay", 1), self.queue("render", 1)
+        # The screenplay ended well, and its record goes before a pass has taken it off the render's needs. The
+        # render is not skipped for a record that is gone: it starts.
+        script["status"] = "done"
+        self.assertEqual(self.m.clear_finished(), 1)
+        self.m.tick()
+        self.assertEqual((render["needs"], render["status"], self.started), ([], "running", [render["id"]]))
+
+    def test_a_queued_record_of_older_code_gets_its_needs_at_the_start(self):
+        def old(jid, seq, kind, n, status="queued", **more):
+            return {"id": jid, "seq": seq, "kind": kind, "status": status, "slug": "demo", "batch": "b1",
+                    "title": jid, "meta": {"chapters": [n]}, "args": [kind, "demo", str(n)], **more}
+        self.m._lock_file.close()
+        self.state.mkdir(parents=True, exist_ok=True)
+        (self.state / "jobs.json").write_text(json.dumps({"paused": False, "jobs": [
+            old("c1", 1, "character-pass", 1, "running"), old("s1", 2, "screenplay", 1), old("r1", 3, "render", 1),
+            old("r2", 4, "render", 2, nomad={"stage": 1, "stages": []}), old("s0", 5, "screenplay", 1, "done"),
+            {**old("new", 6, "render", 1), "needs": []}, old("odd", 7, "render", 1, needs="s1"),
+            old("mixed", 8, "render", 1, needs=[["a"], None, "s1", {"b": 1}])]}), encoding="utf-8")
+        m = self.manager()
+        # A queued record without needs gets the ones a job queued now would get, among the jobs that have not
+        # ended. A job that has started, one that has ended, and one that came with its needs keep theirs. What
+        # is no list of needs counts as none, and what is no id in a list is left out of it.
+        self.assertEqual({jid: j["needs"] for jid, j in m.jobs.items()},
+                         {"c1": [], "s1": ["c1"], "r1": ["c1", "s1"], "r2": [], "s0": [], "new": [],
+                          "odd": ["c1", "s1"], "mixed": ["s1"]})
+        self.assertEqual(m.notices, [])
 
 
 def worker(name, classes, os_name, gpu="none", ready=True):
@@ -526,8 +956,8 @@ class NodeChoiceTest(unittest.TestCase):
         self.assertEqual(self.m._blocker_for(imp(38), "local", [render]),
                          "waiting for Render · ch 38, which works on the same chapter")
 
-        # Queue order: an import starts while a batch's cast waits ahead of it for a character pass, and while an
-        # import of the render's chapter waits ahead of it in its lane.
+        # Queue order: an import starts while a cast waits ahead of it for the character pass it needs, and while
+        # an import of the render's chapter waits ahead of it in its lane.
         stage = {"stage": 0, "stages": [{"class": "llm", "args": []}], "contact": "t"}
         passing = {"id": "c39", "seq": 2, "status": "running", "kind": "character-pass", "slug": "demo",
                    "heavy": True, "meta": {"chapters": [39]}, "args": ["character-pass", "demo", "39"],
@@ -536,10 +966,11 @@ class NodeChoiceTest(unittest.TestCase):
                 "meta": {"characters": []}, "args": ["cast", "demo"], "title": "Cast · everyone who needs a voice"}
         held, free = imp(38, id="i38", seq=4, status="queued"), imp(44, id="i44", seq=5, status="queued")
         self.m.jobs = {j["id"]: j for j in (render, passing, cast, held, free)}
+        wired(self.m)
         with mock.patch.object(self.m, "_launch_local", side_effect=lambda j: j.update(status="running")):
             self.m._schedule(0.0, [])
         self.assertEqual((cast["status"], held["status"], free["status"]), ("queued", "queued", "running"))
-        self.assertEqual(self.m.wait_reasons["cast"], "waiting for Character pass · ch 39, which changes the whole serial")
+        self.assertEqual(self.m.wait_reasons["cast"], "needs Character pass · ch 39")
         self.assertEqual(self.m.wait_reasons["i38"], "waiting for Render · ch 38, which works on the same chapter")
 
     def test_a_character_pass_starts_beside_a_render_of_another_chapter(self):
@@ -565,43 +996,43 @@ class NodeChoiceTest(unittest.TestCase):
         self.assertTrue(conflicts(job("character-pass"), job("render", chapters=[38])))
         self.assertTrue(conflicts(job("character-pass", chapters=[39]), job("screenplay")))
 
-        # Scheduling: a batch queued behind another batch's running render. Its first character pass starts beside
-        # the render. The next pass and chapter 39's screenplay wait for that pass, and the render waits for the
-        # cast, which gives its speakers their voices.
+        # Scheduling: the jobs of two chapters queued behind a running render of another one. The first character
+        # pass starts beside the render. The next pass and chapter 39's screenplay need that pass, and the render
+        # needs the pass, the cast, which gives its speakers their voices, and its screenplay.
         self.m.workers.append(worker("dev", ["llm"], "linux"))
         self.m.nomad_state["up"] = True
 
         def queued(jid, seq, kind, n=None):
             titles = {"character-pass": "Character pass", "screenplay": "Screenplay", "render": "Render"}
             return {"id": jid, "seq": seq, "status": "queued", "kind": kind, "slug": "demo", "heavy": True,
-                    "batch": "b2", "created": "2026-11-11T11:05:00", "meta": {"chapters": [n] if n else []},
+                    "created": "2026-11-11T11:05:00", "meta": {"chapters": [n] if n else []},
                     "title": f"{titles[kind]} · ch {n}" if n else "Cast · everyone who needs a voice",
                     "args": [kind, "demo"] + ([str(n)] if n else [])}
 
-        render = {**queued("r38", 1, "render", 38), "status": "running", "batch": "b1",
+        render = {**queued("r38", 1, "render", 38), "status": "running",
                   "nomad": {"target": "mac", "node": "mac", "stage": 0, "stages": [{"class": "breeze", "args": []}],
                             "contact": "t"}}
         batch = [queued("c39", 2, "character-pass", 39), queued("c40", 3, "character-pass", 40),
                  {**queued("cast", 4, "cast"), "title": "Cast · everyone who needs a voice"},
                  queued("s39", 5, "screenplay", 39), queued("r39", 6, "render", 39)]
         self.m.jobs = {j["id"]: j for j in [render] + batch}
+        self.assertEqual({jid: j["needs"] for jid, j in wired(self.m).items() if j["status"] == "queued"},
+                         {"c39": [], "c40": ["c39"], "cast": ["c40"], "s39": ["c39"], "r39": ["c39", "cast", "s39"]})
         dispatch = []
         self.m._schedule(0.0, dispatch)
         self.assertEqual(dispatch, ["c39"])
-        self.assertEqual(self.m.wait_reasons["c40"], "waiting for Character pass · ch 39, which changes the whole serial")
-        self.assertEqual(self.m.wait_reasons["s39"], "waiting for Character pass · ch 39, which works on the same chapter")
-        self.assertEqual(self.m.wait_reasons["r39"],
-                         "waiting for Cast · everyone who needs a voice, queued ahead of it on the same serial")
+        self.assertEqual(self.m.wait_reasons["c40"], "needs Character pass · ch 39")
+        self.assertEqual(self.m.wait_reasons["s39"], "needs Character pass · ch 39")
+        self.assertEqual(self.m.wait_reasons["r39"], "needs Character pass · ch 39 and 2 more jobs")
         self.assertEqual({j["id"]: j["status"] for j in batch},
                          {"c39": "running", "c40": "queued", "cast": "queued", "s39": "queued", "r39": "queued"})
         # Once chapter 39's pass is done, its screenplay starts beside chapter 40's pass and passes the cast, which
-        # waits for that pass. The render still waits for the cast.
+        # needs that pass. The render still needs the cast.
         batch[0]["status"] = "done"
         self.m._schedule(0.0, dispatch)
         self.assertEqual(dispatch, ["c39", "c40", "s39"])
-        self.assertEqual(self.m.wait_reasons["cast"], "waiting for Character pass · ch 40, which changes the whole serial")
-        self.assertEqual(self.m.wait_reasons["r39"],
-                         "waiting for Cast · everyone who needs a voice, queued ahead of it on the same serial")
+        self.assertEqual(self.m.wait_reasons["cast"], "needs Character pass · ch 40")
+        self.assertEqual(self.m.wait_reasons["r39"], "needs Cast · everyone who needs a voice and 1 more job")
 
         # Bundles and its own chapter: a character pass waits until a running render has fetched its bundle, and a
         # character pass on the render's chapter waits for the render.
@@ -612,14 +1043,14 @@ class NodeChoiceTest(unittest.TestCase):
         self.assertEqual(self.m._blocker_for(queued("c38", 9, "character-pass", 38), "llm", [render]),
                          "waiting for Render · ch 38, which works on the same chapter")
 
-    def test_a_batch_job_waits_only_for_the_jobs_it_needs(self):
+    def test_a_job_waits_only_for_the_jobs_it_needs(self):
         self.m.workers.append(worker("dev", ["llm"], "linux"))
         self.m.nomad_state["up"] = True
 
         def queued(jid, seq, kind, n):
             label = "Screenplay" if kind == "screenplay" else "Render"
             return {"id": jid, "seq": seq, "status": "queued", "kind": kind, "slug": "demo", "heavy": True,
-                    "batch": "b1", "created": "2026-11-09T23:08:32", "title": f"{label} · ch {n}",
+                    "created": "2026-11-09T23:08:32", "title": f"{label} · ch {n}",
                     "meta": {"chapters": [n], "lines": 200}, "args": [kind, "demo", str(n)]}
 
         first = {**queued("s18", 1, "screenplay", 18), "status": "running",
@@ -628,24 +1059,54 @@ class NodeChoiceTest(unittest.TestCase):
                                             queued("s20", 3, "screenplay", 20), queued("s21", 4, "screenplay", 21),
                                             queued("r18", 5, "render", 18), queued("r19", 6, "render", 19),
                                             queued("r21", 7, "render", 21))}
+        wired(self.m)
         dispatch = []
-        # While chapter 18's screenplay runs, its render waits for it. The screenplays of chapters 19 and 20 start
+        # While chapter 18's screenplay runs, its render needs it. The screenplays of chapters 19 and 20 start
         # beside it, and chapter 21's jobs wait their turn, because three Claude jobs run at once.
         self.m._schedule(0.0, dispatch)
         self.assertEqual(dispatch, ["s19", "s20"])
-        self.assertEqual(self.m.wait_reasons["r18"], "waiting for Screenplay · ch 18, which works on the same chapter")
-        self.assertEqual(self.m.wait_reasons["r19"], "waiting for Screenplay · ch 19, which works on the same chapter")
+        self.assertEqual(self.m.wait_reasons["r18"], "needs Screenplay · ch 18")
+        self.assertEqual(self.m.wait_reasons["r19"], "needs Screenplay · ch 19")
         self.assertEqual(self.m.wait_reasons["s21"], "waiting for a running Claude job to finish, 3 run at once")
-        self.assertEqual(self.m.wait_reasons["r21"],
-                         "waiting for Screenplay · ch 21, queued ahead of it on the same serial")
+        self.assertEqual(self.m.wait_reasons["r21"], "needs Screenplay · ch 21")
         # Once it is written, chapter 18 renders beside the screenplays of chapters 19 and 20, which are earlier in
-        # the batch, and chapter 21's screenplay starts in its place.
+        # the queue, and chapter 21's screenplay starts in its place.
         first["status"] = "done"
         self.m._schedule(0.0, dispatch)
         self.assertEqual(dispatch, ["s19", "s20", "s21", "r18"])
         self.assertEqual(self.m.jobs["r18"]["nomad"]["target"], "laptop")
-        self.assertEqual(self.m.wait_reasons["r19"], "waiting for Screenplay · ch 19, which works on the same chapter")
-        self.assertEqual(self.m.wait_reasons["r21"], "waiting for Screenplay · ch 21, which works on the same chapter")
+        self.assertEqual(self.m.wait_reasons["r19"], "needs Screenplay · ch 19")
+        self.assertEqual(self.m.wait_reasons["r21"], "needs Screenplay · ch 21")
+        # A job that has started needs nothing from then on, and the ones that wait keep their needs.
+        self.assertEqual((self.m.jobs["r18"]["needs"], self.m.jobs["r19"]["needs"]), ([], ["s19"]))
+
+    def test_a_job_does_not_wait_for_a_job_that_needs_it(self):
+        self.m.workers.append(worker("dev", ["llm"], "linux"))
+        self.m.nomad_state["up"] = True
+        # A render stands ahead of the screenplay it needs, as after a move that the queue did not check. The two
+        # work on one chapter, and the screenplay still starts: it doesn't wait for a job that waits for it.
+        script = {"id": "s2", "seq": 5, "status": "queued", "kind": "screenplay", "slug": "demo", "heavy": True,
+                  "title": "Screenplay · ch 2", "meta": {"chapters": [2]}, "args": ["screenplay", "demo", "2"],
+                  "created": "2026-11-23T19:00:00"}
+        render = {"id": "r2", "seq": 3, "status": "queued", "kind": "render", "slug": "demo", "heavy": True,
+                  "title": "Render · ch 2", "meta": {"chapters": [2], "lines": 200}, "args": ["render", "demo", "2"],
+                  "needs": ["s2"], "created": "2026-11-23T19:00:00"}
+        self.assertTrue(conflicts(script, render))
+        self.m.jobs = {"r2": render, "s2": script}
+        dispatch = []
+        self.m._schedule(0.0, dispatch)
+        self.assertEqual((dispatch, self.m.wait_reasons), (["s2"], {"r2": "needs Screenplay · ch 2"}))
+        # The forecast places the render after the screenplay too.
+        script["nomad"]["contact"] = "t"
+        outlook = self.m._forecast(0.0)
+        self.assertGreaterEqual(outlook["r2"]["start_in"], outlook["s2"]["end_in"])
+        # Without the need, the two are only jobs on one chapter: the render, which is ahead, starts, and the
+        # screenplay waits for it.
+        script.update({"status": "queued", "nomad": None})
+        render["needs"] = []
+        self.m._schedule(0.0, dispatch)
+        self.assertEqual((dispatch, self.m.wait_reasons["s2"]),
+                         (["s2", "r2"], "waiting for Render · ch 2, which works on the same chapter"))
 
     def test_a_screenplay_passes_a_claude_job_that_waits_ahead_of_it(self):
         self.m.workers.append(worker("dev", ["llm"], "linux"))
@@ -685,7 +1146,7 @@ class NodeChoiceTest(unittest.TestCase):
         self.assertEqual(self.m.jobs["cast"]["nomad"]["stages"][0]["class"], "llm")
         self.assertEqual(self.m.wait_reasons["o3"], "waiting for a running Claude job to finish, 3 run at once")
 
-    def test_a_batch_that_imports_chapters_and_processes_them_runs_in_order(self):
+    def test_a_request_that_imports_chapters_and_processes_them_runs_in_order(self):
         from unittest import mock
         from serial_audio import library as lib
         from serial_audio.web import jobs
@@ -724,34 +1185,33 @@ class NodeChoiceTest(unittest.TestCase):
             return dispatch
 
         # Queued behind the import of its chapter, a character pass or a screenplay names the chapter before it is
-        # on disk. Queued alone, it names only chapters on disk.
+        # on disk. Queued alone, it names only chapters on disk. Each job needs the jobs whose work it reads.
         batch = self.m.submit(requests(7))
         imp, chars, cast, script, render = batch
         self.assertEqual([j["meta"].get("chapters") for j in batch], [[7], [7], None, [7], [7]])
-        self.assertEqual(len({j["batch"] for j in batch}), 1)
+        self.assertEqual([j["needs"] for j in batch],
+                         [[], [imp["id"]], [chars["id"]], [imp["id"], chars["id"]],
+                          [imp["id"], chars["id"], cast["id"], script["id"]]])
         self.assertEqual(jobs.build("screenplay", {"slug": "demo", "chapters": "7"})["meta"]["chapters"], [])
         self.assertEqual(jobs.build("character-pass", {"slug": "demo", "chapters": "all"}, coming={"demo": {7}})
                          ["meta"]["chapters"], [1, 7])
 
-        # The import starts on the app's machine, and the rest of the batch waits for it in order.
+        # The import starts on the app's machine, and the other jobs wait for it in order.
         self.assertEqual(schedule(), [])
         self.assertEqual(imp["status"], "running")
-        self.assertIn("Import saved page · ch 7", self.m.wait_reasons[chars["id"]])
-        self.assertEqual(self.m.wait_reasons[render["id"]],
-                         "waiting for Character pass · ch 7, queued ahead of it on the same serial")
+        self.assertEqual(self.m.wait_reasons[chars["id"]], "needs Import saved page · ch 7")
+        self.assertEqual(self.m.wait_reasons[render["id"]], "needs Import saved page · ch 7 and 3 more jobs")
         # The character pass follows the import. The cast and the chapter's screenplay follow the character pass
         # together, because a screenplay doesn't wait for a cast.
         imp["status"] = "done"
         self.assertEqual(schedule(), [chars["id"]])
         chars["status"] = "done"
         self.assertEqual(schedule(), [cast["id"], script["id"]])
-        self.assertEqual(self.m.wait_reasons[render["id"]],
-                         "waiting for Cast · everyone who needs a voice, which changes the whole serial")
+        self.assertEqual(self.m.wait_reasons[render["id"]], "needs Cast · everyone who needs a voice and 1 more job")
         # The render waits for the cast and for its chapter's screenplay.
         cast["status"] = "done"
         self.assertEqual(schedule(), [])
-        self.assertEqual(self.m.wait_reasons[render["id"]],
-                         "waiting for Screenplay · ch 7, which works on the same chapter")
+        self.assertEqual(self.m.wait_reasons[render["id"]], "needs Screenplay · ch 7")
 
         # A cast that has nobody to cast when its turn comes is skipped, and the render then waits only for its
         # chapter's screenplay.
@@ -761,12 +1221,11 @@ class NodeChoiceTest(unittest.TestCase):
         imp["status"] = chars["status"] = "done"
         self.assertEqual(schedule(), [script["id"]])
         self.assertEqual((cast["status"], cast["note"]), ("skipped", "nobody needs a voice, so there is nothing to cast"))
-        self.assertEqual(self.m.wait_reasons[render["id"]],
-                         "waiting for Screenplay · ch 7, which works on the same chapter")
+        self.assertEqual(self.m.wait_reasons[render["id"]], "needs Screenplay · ch 7")
 
-        # A failed import skips its chapter's character pass and the jobs that wait for that one: its chapter's
+        # A failed import skips its chapter's character pass and the jobs that need that one: its chapter's
         # cast, screenplay and render. The other import goes on, and so does every job of the earlier chapter,
-        # which waits for none of them.
+        # which needs none of them.
         self.m.jobs = {}
         batch = self.m.submit(requests(7, 8))
         self.m._finish(batch[1], "failed", "exit 1", 1)
@@ -775,8 +1234,34 @@ class NodeChoiceTest(unittest.TestCase):
                                                            "Character pass · ch 8", "Cast · ch 8"])
         self.assertEqual([j["status"] for j in batch], ["queued", "failed", "queued", "queued", "skipped", "skipped",
                                                         "queued", "skipped", "queued", "skipped"])
+        self.assertEqual((batch[4]["note"], batch[5]["note"], batch[9]["lacks"]),
+                         ("needs Import saved page · ch 8, which failed",
+                          "needs Character pass · ch 8, which was skipped", batch[1]["id"]))
 
-    def test_a_batch_casts_after_each_character_pass(self):
+        # The import runs again, and the jobs that were skipped for it come back behind it, in the order they had
+        # and with it in their needs. The jobs of chapter 7 are as they were.
+        back: list[dict] = []
+        again = self.m.retry(batch[1]["id"], back)
+        self.assertEqual([j["title"] for j in back],
+                         ["Character pass · ch 8", "Cast · ch 8", "Screenplay · ch 8", "Render · ch 8"])
+        self.assertEqual([j["status"] for j in batch], ["queued", "failed"] + ["queued"] * 8)
+        self.assertEqual((back[0]["needs"], [j["seq"] for j in back], "lacks" in back[3]),
+                         ([again["id"], batch[2]["id"]], [again["seq"] + i for i in range(1, 5)], False))
+        self.assertIn(again["id"], back[3]["needs"])
+        self.assertNotIn(batch[1]["id"], back[3]["needs"])
+
+        # An import that waits in the queue counts for a pass that is queued by itself afterwards, as it does for
+        # one that comes in its request: the pass names the chapter and needs the import.
+        self.m.jobs = {}
+        (base / "incoming" / "demo" / "ch9.html").write_text("<html>", encoding="utf-8")
+        [imp9] = self.m.submit([{"kind": "fetch", "params": {"slug": "demo", "chapter": 9, "html": "ch9.html"}}])
+        [script9] = self.m.submit([{"kind": "screenplay", "params": {"slug": "demo", "chapters": "9"}}])
+        self.assertEqual((script9["meta"]["chapters"], script9["needs"]), ([9], [imp9["id"]]))
+        imp9["status"] = "done"
+        [late9] = self.m.submit([{"kind": "screenplay", "params": {"slug": "demo", "chapters": "9"}}])
+        self.assertEqual(late9["meta"]["chapters"], [])
+
+    def test_a_cast_follows_each_character_pass(self):
         from unittest import mock
         from serial_audio import library as lib
         from serial_audio.web import jobs
@@ -817,7 +1302,9 @@ class NodeChoiceTest(unittest.TestCase):
         self.assertIsNone(self.m._already_done({**everyone, "meta": {"characters": [], "dry_run": True}}))
         lib.save_bible("demo", {"characters": {"ann": ann}, "pronunciations": {}})
 
-        # Scheduling: the batch of chapters 54 and 55. Chapter 54's pass starts alone.
+        # Scheduling: the jobs of chapters 54 and 55. A cast needs the pass of its chapter, which needs the pass
+        # before it, and a render needs the cast of its own chapter, the last one that is for it. Chapter 54's pass
+        # starts alone.
         self.m.workers.append(worker("dev", ["llm"], "linux"))
         self.m.nomad_state["up"] = True
 
@@ -826,24 +1313,26 @@ class NodeChoiceTest(unittest.TestCase):
             meta = {"characters": [], **({"from_chapter": first} if first else {})} if kind == "cast" else {"chapters": [n]}
             who = f"ch {n or first}" if n or first else "everyone who needs a voice"
             return {"id": jid, "seq": seq, "status": "queued", "kind": kind, "slug": "demo", "heavy": True,
-                    "batch": "b1", "created": "2026-11-13T22:30:00", "meta": meta, "title": f"{titles[kind]} · {who}",
+                    "created": "2026-11-13T22:30:00", "meta": meta, "title": f"{titles[kind]} · {who}",
                     "args": [kind, "demo"] + ([str(n)] if n else [])}
 
-        def batch():
+        def batch(*more):
             jobs_ = [queued("c54", 1, "character-pass", 54), queued("k54", 2, "cast"),
                      queued("c55", 3, "character-pass", 55), queued("k55", 4, "cast", first=55),
                      queued("s54", 5, "screenplay", 54), queued("s55", 6, "screenplay", 55),
-                     queued("r54", 7, "render", 54), queued("r55", 8, "render", 55)]
+                     queued("r54", 7, "render", 54), queued("r55", 8, "render", 55), *more]
             self.m.jobs = {j["id"]: j for j in jobs_}
-            return self.m.jobs
+            return wired(self.m)
 
         b = batch()
+        self.assertEqual({jid: j["needs"] for jid, j in b.items()},
+                         {"c54": [], "k54": ["c54"], "c55": ["c54"], "k55": ["c55"], "s54": ["c54"],
+                          "s55": ["c55"], "r54": ["c54", "k54", "s54"], "r55": ["c55", "k55", "s55"]})
         dispatch = []
         self.m._schedule(0.0, dispatch)
         self.assertEqual(dispatch, ["c54"])
-        self.assertEqual(self.m.wait_reasons["k54"], "waiting for Character pass · ch 54, which changes the whole serial")
-        self.assertEqual(self.m.wait_reasons["r54"],
-                         "waiting for Cast · everyone who needs a voice, queued ahead of it on the same serial")
+        self.assertEqual(self.m.wait_reasons["k54"], "needs Character pass · ch 54")
+        self.assertEqual(self.m.wait_reasons["r54"], "needs Character pass · ch 54 and 2 more jobs")
         # After the pass, the first cast and chapter 54's screenplay start together, and chapter 55's pass waits
         # for the cast.
         b["c54"]["status"] = "done"
@@ -859,7 +1348,7 @@ class NodeChoiceTest(unittest.TestCase):
         b["s54"]["nomad"]["contact"] = "t"
         self.m._schedule(0.0, dispatch)
         self.assertEqual(dispatch, ["c54", "k54", "s54", "c55"])
-        self.assertEqual(self.m.wait_reasons["r54"], "waiting for Screenplay · ch 54, which works on the same chapter")
+        self.assertEqual(self.m.wait_reasons["r54"], "needs Screenplay · ch 54")
         # Chapter 55's cast starts when its pass ends. Once chapter 54's screenplay ends, chapter 54 renders beside
         # that cast, and chapter 55's render waits for it.
         b["c55"]["status"] = "done"
@@ -870,23 +1359,23 @@ class NodeChoiceTest(unittest.TestCase):
         self.m._schedule(0.0, dispatch)
         self.assertEqual(dispatch, ["c54", "k54", "s54", "c55", "k55", "s55", "r54"])
         self.assertEqual(b["k55"]["status"], "running")
-        self.assertEqual(self.m.wait_reasons["r55"], "waiting for Cast · ch 55, which changes the whole serial")
+        self.assertEqual(self.m.wait_reasons["r55"], "needs Cast · ch 55 and 1 more job")
 
-        # A failed cast skips the casts after it and the renders from its chapter on. The next chapter's pass
-        # goes on, because it reads nothing a cast files, and so do the screenplays and the render of the chapter
-        # before.
-        b = batch()
-        b["c56"] = queued("c56", 4.5, "character-pass", 56)
-        b["k56"] = queued("k56", 4.7, "cast", first=56)
-        b["s56"] = queued("s56", 6.5, "screenplay", 56)
-        b["r56"] = queued("r56", 9, "render", 56)
+        # A failed cast skips the render of its chapter, which needs it. The cast after it goes on, because it
+        # casts everyone who needs a voice by then, and so does the render of that cast's chapter. The next
+        # chapter's pass goes on, because it reads nothing a cast files, and so do the screenplays and the render
+        # of the chapter before.
+        b = batch(queued("c56", 4.5, "character-pass", 56), queued("k56", 4.7, "cast", first=56),
+                  queued("s56", 6.5, "screenplay", 56), queued("r56", 9, "render", 56))
+        self.assertEqual(b["r56"]["needs"], ["c56", "k56", "s56"])
         for jid in ("c54", "k54", "c55"):
             b[jid]["status"] = "done"
         self.m._finish(b["k55"], "failed", "exit 1 on laptop", 1)
         self.assertEqual({jid: j["status"] for jid, j in b.items() if j["status"] != "done"},
-                         {"k55": "failed", "c56": "queued", "k56": "skipped", "s54": "queued", "s55": "queued",
-                          "s56": "queued", "r54": "queued", "r55": "skipped", "r56": "skipped"})
-        # A failed pass still skips the cast that follows it.
+                         {"k55": "failed", "c56": "queued", "k56": "queued", "s54": "queued", "s55": "queued",
+                          "s56": "queued", "r54": "queued", "r55": "skipped", "r56": "queued"})
+        self.assertEqual(b["r55"]["note"], "needs Cast · ch 55, which failed")
+        # A failed pass still skips the cast that follows it, the next chapter's pass and that chapter's screenplay.
         b = batch()
         self.m._finish(b["c54"], "failed", "exit 1 on dev", 1)
         self.assertEqual((b["k54"]["status"], b["c55"]["status"], b["s55"]["status"]), ("skipped",) * 3)
@@ -897,93 +1386,103 @@ class NodeChoiceTest(unittest.TestCase):
         self.assertEqual(_cast_units({"candidates": 3, "characters": [], "from_chapter": 55}), 3)
         self.assertEqual(_cast_units({"candidates": 4, "characters": ["ann", "bob"], "from_chapter": None}), 8)
 
-    def test_a_failed_batch_job_skips_only_the_jobs_that_wait_for_it(self):
-        def queued(jid, seq, kind, n=None, batch="b1"):
-            return {"id": jid, "seq": seq, "status": "queued", "kind": kind, "slug": "demo", "batch": batch,
+    def test_a_job_that_ends_badly_skips_only_the_jobs_that_need_it(self):
+        def queued(jid, seq, kind, n=None):
+            return {"id": jid, "seq": seq, "status": "queued", "kind": kind, "slug": "demo",
                     "created": "2026-11-09T23:08:32", "title": jid, "meta": {"chapters": [n] if n else []},
                     "args": [kind, "demo"]}
 
-        def batch():
+        def batch(*more):
             jobs = [queued("s20", 1, "screenplay", 20), queued("s21", 2, "screenplay", 21),
                     queued("r18", 3, "render", 18), queued("r20", 4, "render", 20), queued("r21", 5, "render", 21),
-                    queued("other", 6, "render", 20, batch="b2")]
+                    queued("other", 6, "render", 20), *more]
             self.m.jobs = {j["id"]: j for j in jobs}
-            return self.m.jobs
+            return wired(self.m)
 
         def statuses():
             return {jid: j["status"] for jid, j in self.m.jobs.items()}
 
-        # A failed screenplay skips its chapter's render. The other chapters and the other batch go on.
+        # A failed screenplay skips each render of its chapter, however the two came to be queued. The other
+        # chapters go on.
         jobs = batch()
         self.m._finish(jobs["s20"], "failed", "exit 1 on dev", 1)
         self.assertEqual(statuses(), {"s20": "failed", "s21": "queued", "r18": "queued", "r20": "skipped",
-                                      "r21": "queued", "other": "queued"})
-        self.assertEqual(jobs["r20"]["note"], "an earlier job in the batch failed")
-        # A lost render skips nothing, because no other job of the batch waits for it.
+                                      "r21": "queued", "other": "skipped"})
+        self.assertEqual((jobs["r20"]["note"], jobs["r20"]["lacks"]), ("needs s20, which failed", "s20"))
+        # A lost render skips nothing, because no other job needs it.
         jobs = batch()
         self.m._finish(jobs["r18"], "lost", "the Nomad allocation on laptop ended lost without a result")
         self.assertEqual([jid for jid, status in statuses().items() if status == "skipped"], [])
-        # A render that was moved ahead of its screenplay in the queue waited for it too, so it is skipped.
+        # A render that was moved ahead of its screenplay in the queue needs it all the same, so it is skipped.
         jobs = batch()
         jobs["r20"]["seq"] = 0.5
         self.m._finish(jobs["s20"], "failed", "exit 1 on dev", 1)
         self.assertEqual(jobs["r20"]["status"], "skipped")
-        # A failed job that changes the whole serial skips every queued job of the batch that waits for it. A fetch
-        # from the site skips them all. A cast skips the renders and not the screenplays, which don't wait for it.
-        jobs = batch()
-        jobs["fetch"] = queued("fetch", 0.5, "fetch")
+        # A failed fetch from the site skips no job that names its chapter. The fetch's record names none, so
+        # nothing says that the job reads what it brings. A failed cast skips the renders and not the screenplays,
+        # which don't read what it files.
+        jobs = batch(queued("fetch", 0.5, "fetch"))
         self.m._finish(jobs["fetch"], "failed", "exit 1", 1)
-        self.assertEqual(statuses(), {"s20": "skipped", "s21": "skipped", "r18": "skipped", "r20": "skipped",
-                                      "r21": "skipped", "other": "queued", "fetch": "failed"})
-        jobs = batch()
-        jobs["cast"] = queued("cast", 0.5, "cast")
+        self.assertEqual(statuses(), {"s20": "queued", "s21": "queued", "r18": "queued", "r20": "queued",
+                                      "r21": "queued", "other": "queued", "fetch": "failed"})
+        jobs = batch(queued("cast", 0.5, "cast"))
         self.m._finish(jobs["cast"], "failed", "exit 1 on laptop", 1)
         self.assertEqual(statuses(), {"s20": "queued", "s21": "queued", "r18": "skipped", "r20": "skipped",
-                                      "r21": "skipped", "other": "queued", "cast": "failed"})
-        # A job skipped with the failed one skips the later jobs that wait for it, and not the earlier ones. The
-        # character pass is on the failed render's chapter, because one on another chapter doesn't wait for a render.
-        # The passes of chapters 19 and 22 wait for it as any two passes do. Chapter 21's render doesn't, because it
-        # waits for a character pass only on its own chapter.
-        jobs = batch()
+                                      "r21": "skipped", "other": "skipped", "cast": "failed"})
+        # A failed render skips no character pass, also one on its chapter, which reads nothing a render makes.
+        jobs = batch(queued("c19", 2.5, "character-pass", 19), queued("c20", 4.5, "character-pass", 20),
+                     queued("c22", 4.7, "character-pass", 22))
         jobs["s20"]["status"] = "done"
-        jobs["c19"] = queued("c19", 2.5, "character-pass", 19)
-        jobs["c20"] = queued("c20", 4.5, "character-pass", 20)
-        jobs["c22"] = queued("c22", 4.7, "character-pass", 22)
         self.m._finish(jobs["r20"], "failed", "exit 1 on laptop", 1)
-        self.assertEqual(statuses(), {"s20": "done", "s21": "queued", "r18": "queued", "r20": "failed",
-                                      "r21": "queued", "other": "queued", "c19": "queued", "c20": "skipped",
+        self.assertEqual([jid for jid, status in statuses().items() if status == "skipped"], [])
+        # A job skipped with the failed one skips the later jobs that need it, and not the earlier ones. The pass
+        # of chapter 20 needs the pass of chapter 19, and the pass of chapter 22 needs the pass of chapter 20.
+        # The render of chapter 20 that is queued after chapter 20's pass needs that pass, and the one queued before
+        # it doesn't. Chapter 21's render needs a character pass only on its own chapter.
+        jobs = batch(queued("c19", 2.5, "character-pass", 19), queued("c20", 4.5, "character-pass", 20),
+                     queued("c22", 4.7, "character-pass", 22))
+        self.m._finish(jobs["c19"], "failed", "exit 1 on dev", 1)
+        self.assertEqual(statuses(), {"s20": "queued", "s21": "queued", "r18": "queued", "r20": "queued",
+                                      "r21": "queued", "other": "skipped", "c19": "failed", "c20": "skipped",
                                       "c22": "skipped"})
-        # A stopped job still skips every queued job of the batch.
+        self.assertEqual((jobs["c22"]["lacks"], jobs["other"]["note"]), ("c20", "needs c20, which was skipped"))
+        # A stopped job skips the jobs that need it, as a failed one does, and no other job.
         jobs = batch()
         self.m._finish(jobs["r18"], "stopped", "stopped from the web app")
-        self.assertEqual(statuses(), {"s20": "skipped", "s21": "skipped", "r18": "stopped", "r20": "skipped",
+        self.assertEqual([jid for jid, status in statuses().items() if status == "skipped"], [])
+        self.m._finish(jobs["s21"], "stopped", "stopped from the web app")
+        self.assertEqual(statuses(), {"s20": "queued", "s21": "stopped", "r18": "stopped", "r20": "queued",
                                       "r21": "skipped", "other": "queued"})
 
-    def test_a_stop_request_skips_the_batch_s_queued_jobs_before_the_worker_confirms(self):
+    def test_a_stop_request_skips_nothing_until_the_job_has_ended(self):
         self.m.workers.append(worker("dev", ["llm"], "linux"))
         self.m.nomad_state["up"] = True
 
         def queued(jid, seq, kind, n):
             return {"id": jid, "seq": seq, "status": "queued", "kind": kind, "slug": "demo", "heavy": True,
-                    "batch": "b1", "created": "2026-11-09T23:08:32", "title": jid,
+                    "created": "2026-11-09T23:08:32", "title": jid,
                     "meta": {"chapters": [n], "lines": 200}, "args": [kind, "demo", str(n)]}
 
         render = {**queued("r18", 1, "render", 18), "status": "running",
                   "nomad": {"key": "k", "target": "laptop", "node": "laptop", "stage": 0,
                             "stages": [{"class": "breeze", "args": []}], "contact": "t"}}
-        self.m.jobs = {j["id"]: j for j in (render, queued("s19", 2, "screenplay", 19), queued("r19", 3, "render", 19))}
-        # The request skips the queued jobs at once, so the next scheduling pass starts none of them while the
-        # worker still runs.
+        self.m.jobs = {j["id"]: j for j in (render, queued("t18", 2, "check-takes", 18),
+                                            queued("s19", 3, "screenplay", 19), queued("r19", 4, "render", 19))}
+        wired(self.m)
+        # The request skips no job. The take check that needs the render can't start while the worker still runs,
+        # and the next scheduling pass starts the screenplay of another chapter, which needs nothing of it.
         self.m.cancel("r18")
         self.assertEqual({jid: j["status"] for jid, j in self.m.jobs.items()},
-                         {"r18": "running", "s19": "skipped", "r19": "skipped"})
+                         {"r18": "running", "t18": "queued", "s19": "queued", "r19": "queued"})
         dispatch = []
         self.m._schedule(0.0, dispatch)
-        self.assertEqual(dispatch, [])
-        # A worker that is lost before it confirms the stop changes nothing for the batch.
+        self.assertEqual(dispatch, ["s19"])
+        self.assertEqual((self.m.wait_reasons["t18"], self.m.wait_reasons["r19"]), ("needs r18", "needs s19"))
+        # A worker that is lost before it confirms the stop ends the job, and the take check is skipped then.
         self.m._finish(render, "lost", "the Nomad allocation on laptop ended lost without a result")
         self.assertEqual({jid: j["status"] for jid, j in self.m.jobs.items()},
-                         {"r18": "lost", "s19": "skipped", "r19": "skipped"})
+                         {"r18": "lost", "t18": "skipped", "s19": "running", "r19": "queued"})
+        self.assertEqual(self.m.jobs["t18"]["note"], "needs r18, which was lost")
 
     def test_a_breeze_cast_takes_the_nvidia_node_first(self):
         cast = job("cast", args=["cast", "demo", "--engine", "breeze"])
@@ -1398,7 +1897,7 @@ class ClusterJobsCase(unittest.TestCase):
         job = {"id": jid, "seq": seq, "kind": "render", "slug": "demo", "status": "queued", "heavy": True, "gpu": True,
                "comfy": comfy, "title": f"Render · ch {n}", "args": ["render", "demo", str(n)],
                "meta": {"chapters": [n], "lines": 100, "engine": "drama3" if comfy else "breeze"},
-               "batch": None, "backlog": False, "started": None}
+               "needs": [], "backlog": False, "started": None}
         self.m.jobs[jid] = job
         return job
 
@@ -1435,9 +1934,9 @@ class NodeAwayTest(ClusterJobsCase):
 
     def test_a_job_whose_node_went_away_is_queued_again(self):
         a, b = self.running("a", 1, 1), self.render("b", 2, 1)
-        # b waits for a: the take check of the chapter that a renders, in the same batch
+        # b needs a: the take check of the chapter that a renders
         b.update({"kind": "check-takes", "title": "Check takes · ch 1", "args": ["check-takes", "demo", "1"]})
-        a["batch"] = b["batch"] = "batch-1"
+        self.assertEqual(wired(self.m)["b"]["needs"], ["a"])
         unknown = {"polled": 1.0, "allocs": [{"ID": "alloc-1", "NodeName": "laptop", "ClientStatus": "unknown",
                                               "CreateTime": 1}]}
 
@@ -1452,8 +1951,7 @@ class NodeAwayTest(ClusterJobsCase):
         self.assertIn(f'lost_after = "{self.nomad.LOST_AFTER_MINUTES}m"', spec)
 
         # Nomad gives the allocation up. The job waits out the grace for a late result and is then as it was before
-        # it started, but for the count. The batch job that waits for it is not skipped, as it is when a job ends
-        # as lost.
+        # it started, but for the count. The job that needs it is not skipped, as it is when a job ends as lost.
         self.ends(a, "lost", 2.0)
         self.assertEqual((a["status"], a.get("nomad"), a["started"], a["lost_node"]), ("queued", None, None, 1))
         self.assertEqual(a["note"], "laptop went away while it ran this job, so it is queued again")
@@ -1685,9 +2183,9 @@ class PauseTest(ClusterJobsCase):
 
     def test_a_paused_job_waits_in_its_place_until_it_is_resumed(self):
         a, b, c = self.running("a", 1, 1), self.checks("b", 2, 1), self.render("c", 3, 3)
-        a["batch"] = b["batch"] = "batch-1"
+        self.assertEqual(wired(self.m)["b"]["needs"], ["a"])
 
-        # The pause asks the worker to stop, and nothing of the batch is skipped. A second request is refused.
+        # The pause asks the worker to stop, and the job that needs it is not skipped. A second request is refused.
         self.assertIs(self.m.pause("a"), a)
         n = a["nomad"]
         self.assertEqual((a["status"], n["cancel"], n["requeue"], a["stopping"], b["status"]),
@@ -1708,12 +2206,12 @@ class PauseTest(ClusterJobsCase):
         again = self.m.worker_result("a", "key-a", "0", json.dumps({"exit_code": 1, "cancelled": True}).encode())
         self.assertEqual(again, report)
 
-        # A pass starts neither the paused job nor the batch job that waits for it, and each says why. A job of
-        # another chapter runs.
+        # A pass starts neither the paused job nor the job that needs it, and each says why. A job of another
+        # chapter runs.
         self.m._schedule(10.0, [])
         self.assertEqual((a["status"], b["status"], c["status"]), ("queued", "queued", "running"))
         self.assertEqual(self.m.wait_reasons["a"], "paused until you resume it")
-        self.assertEqual(self.m.wait_reasons["b"], "waiting for Render · ch 1, queued ahead of it on the same serial")
+        self.assertEqual(self.m.wait_reasons["b"], "needs Render · ch 1, which is paused")
 
         # Resumed, it starts by the scheduler's rules, on the node that is free, under another key.
         self.assertIs(self.m.resume("a"), a)
@@ -1726,9 +2224,9 @@ class PauseTest(ClusterJobsCase):
 
     def test_a_stop_can_queue_the_job_again_at_once(self):
         a, b = self.running("a", 1, 1), self.checks("b", 2, 1)
-        a["batch"] = b["batch"] = "batch-1"
+        wired(self.m)
 
-        # The stop is asked for with the job's way back, and the batch stays as it is.
+        # The stop is asked for with the job's way back, and the job that needs it stays queued.
         self.m.cancel("a", requeue=True)
         self.assertEqual((a["nomad"]["requeue"], a["nomad"]["cancel"], a["stopping"], b["status"]),
                          ("now", True, True, "queued"))
@@ -1791,15 +2289,17 @@ class PauseTest(ClusterJobsCase):
         self.assertEqual((f["status"], f["nomad"]["dispatched"], f["nomad"]["dispatching"]), ("running", None, True))
 
     def test_a_plain_stop_still_wins_and_a_job_that_ends_by_itself_is_done(self):
-        # A stop after a pause: the job ends as stopped and its batch is skipped, as for any stop.
+        # A stop after a pause: the job ends as stopped, and the job that needs it is skipped then, as for any
+        # stop. Until the worker confirms, that job waits.
         a, b = self.running("a", 1, 1), self.checks("b", 2, 1)
-        a["batch"] = b["batch"] = "batch-1"
+        wired(self.m)
         self.m.pause("a")
         self.m.cancel("a")
-        self.assertEqual((a["nomad"].get("requeue"), a["nomad"]["cancel"], b["status"]), (None, True, "skipped"))
+        self.assertEqual((a["nomad"].get("requeue"), a["nomad"]["cancel"], b["status"]), (None, True, "queued"))
         self.assertIn("on its way back into the queue, so it is not queued again", self.logged["a"][-1])
         self.answers(a)
-        self.assertEqual((a["status"], a.get("paused")), ("stopped", None))
+        self.assertEqual((a["status"], a.get("paused"), b["status"], b["note"]),
+                         ("stopped", None, "skipped", "needs Render · ch 1, which was stopped"))
 
         # A job that finishes before the pause reaches its worker is done.
         c = self.running("c", 3, 3)
@@ -1814,10 +2314,10 @@ class PauseTest(ClusterJobsCase):
         self.assertEqual((d["status"], d["paused"], d.get("nomad")), ("queued", True, None))
         self.assertIn("no worker sent a result for the stopped run", self.logged["d"][-1])
 
-        # A worker that never confirms: the job ends as stopped, because its task may still run, and its batch is
-        # skipped as for a stop.
+        # A worker that never confirms: the job ends as stopped, because its task may still run, and the job that
+        # needs it is skipped as for a stop.
         e, f = self.running("e", 5, 5), self.checks("f", 6, 5)
-        e["batch"] = f["batch"] = "batch-2"
+        wired(self.m)
         self.m.pause("e")
         self.m._check_stop(e, e["nomad"]["stop_at"] + self.nomad.STOP_GRACE + 1)
         self.assertEqual((e["status"], f["status"]), ("stopped", "skipped"))
@@ -1927,7 +2427,7 @@ class EstimateTest(unittest.TestCase):
     def queued(self, jid, seq, kind, n, **more):
         title = {"render": "Render", "screenplay": "Screenplay", "check-takes": "Check takes"}.get(kind, kind)
         job = {"id": jid, "seq": seq, "status": "queued", "kind": kind, "slug": "demo", "heavy": True, "backlog": False,
-               "batch": None, "created": "2026-11-13T19:00:00", "started": None, "finished": None,
+               "needs": [], "created": "2026-11-13T19:00:00", "started": None, "finished": None,
                "title": f"{title} · ch {n}", "args": [kind, "demo", str(n)], "meta": {"chapters": [n]}, **more}
         self.m.jobs[jid] = job
         return job
@@ -2437,18 +2937,20 @@ class EstimateTest(unittest.TestCase):
             self.assertEqual(self.m.cancel_queued(["b", "nope"]), 0)
         save.assert_not_called()
 
-    def test_a_moved_job_stays_behind_the_jobs_of_its_batch_it_waits_for(self):
+    def test_a_moved_job_stays_behind_the_jobs_it_needs(self):
         from serial_audio.web.jobs import JobManager
 
         def batch():
             self.m.jobs = {}
             self.render("a", 1, 1)
-            self.queued("s2", 2, "screenplay", 2, batch="B")
-            self.render("r2", 3, 2, batch="B")
-            self.render("r9", 4, 9, batch="B")
+            self.queued("s2", 2, "screenplay", 2)
+            self.render("r2", 3, 2)
+            self.render("r9", 4, 9)
+            self.assertEqual({jid: j["needs"] for jid, j in wired(self.m).items()},
+                             {"a": [], "s2": [], "r2": ["s2"], "r9": []})
 
-        # Chapter 2's render was queued with its screenplay. Moved to the top it stops behind the screenplay,
-        # and chapter 9's render, which waits for neither, goes all the way.
+        # Chapter 2's render needs its screenplay. Moved to the top it stops behind the screenplay, and chapter
+        # 9's render, which needs neither, goes all the way.
         batch()
         self.m.reorder(["r2", "r9"], "top")
         self.assertEqual(self.order(), ["r9", "a", "s2", "r2"])
@@ -2456,22 +2958,25 @@ class EstimateTest(unittest.TestCase):
         batch()
         self.m.reorder(["s2"], "bottom")
         self.assertEqual(self.order(), ["a", "r9", "s2", "r2"])
-        # Two jobs that were not queued together move past each other freely.
+        # A job that needs no job of the queue moves past every one of them. Here chapter 2's render no longer
+        # needs the screenplay.
         batch()
-        self.m.jobs["r2"]["batch"] = None
+        self.m.jobs["r2"]["needs"] = []
         self.m.reorder(["r2"], "top")
         self.assertEqual(self.order(), ["r2", "a", "s2", "r9"])
 
-        # On one machine every job of a batch keeps its place among them.
+        # On one machine a job stays behind the jobs it needs in the same way, and moves past the others.
         one = JobManager(state_dir=Path(self.tmp.name) / "one", autostart=False)
         try:
             batch()
             one.jobs = self.m.jobs
             one.reorder(["r9"], "top")
-            self.assertEqual(self.order(), ["a", "s2", "r2", "r9"])
+            self.assertEqual(self.order(), ["r9", "a", "s2", "r2"])
+            one.reorder(["r2"], "top")
+            self.assertEqual(self.order(), ["r9", "a", "s2", "r2"])
             # The old way to move one job by one place still works.
             one.move("a", "down")
-            self.assertEqual(self.order(), ["s2", "a", "r2", "r9"])
+            self.assertEqual(self.order(), ["r9", "s2", "a", "r2"])
         finally:
             one._lock_file.close()
 
@@ -2884,7 +3389,7 @@ class LoopHealthTest(unittest.TestCase):
     def record(self, jid, seq, status="queued", slug="demo"):
         return {"id": jid, "kind": "screenplay", "status": status, "seq": seq, "heavy": True, "gpu": False,
                 "comfy": False, "title": f"Screenplay · ch {seq}", "slug": slug, "args": ["screenplay", slug, str(seq)],
-                "meta": {"chapters": [seq]}, "params": {}, "batch": None, "backlog": False,
+                "meta": {"chapters": [seq]}, "params": {}, "needs": [], "backlog": False,
                 "created": f"2026-01-01T00:00:{seq:02d}+00:00", "started": None, "finished": None, "note": None}
 
     def test_a_pass_that_fails_shows_in_the_snapshot_until_one_completes(self):
@@ -3165,8 +3670,8 @@ class LoopHealthTest(unittest.TestCase):
 
         # The record without the later fields has them, and what is no job record is left out and counted.
         job = m.jobs[self.A]
-        self.assertEqual((job["seq"], job["heavy"], job["args"], job["meta"], job["title"], job["batch"]),
-                         (0, False, [], {}, "screenplay", None))
+        self.assertEqual((job["seq"], job["heavy"], job["args"], job["meta"], job["title"], job["needs"]),
+                         (0, False, [], {}, "screenplay", []))
         self.assertEqual(list(m.jobs), [self.A])
         self.assertEqual(m.notices, ["2 record(s) in jobs.json are not jobs and were left out"])
 
@@ -3570,7 +4075,7 @@ class RecordFieldsTest(unittest.TestCase):
         for seq, jid in enumerate(("a", "b"), 1):
             m.jobs[jid] = {"id": jid, "kind": "screenplay", "status": "queued", "seq": seq, "heavy": True,
                            "gpu": False, "comfy": False, "title": jid, "slug": f"s{seq}", "meta": {"chapters": [1]},
-                           "args": ["screenplay", f"s{seq}", "1"], "params": {}, "batch": None, "backlog": False,
+                           "args": ["screenplay", f"s{seq}", "1"], "params": {}, "needs": [], "backlog": False,
                            "created": "2026-01-01T00:00:00+00:00", "started": None, "finished": None, "note": None}
         m._schedule(1.0, [])
 
@@ -3796,8 +4301,7 @@ class BacklogTest(unittest.TestCase):
 
         # Only "backlog": true in the params makes a job backlog work, and a job queued again keeps it.
         marked, plain, odd = self.m.submit([{"kind": "check-takes", "params": {"slug": "demo", "chapter": n, **extra}}
-                                            for n, extra in ((1, {"backlog": True}), (2, {}), (3, {"backlog": "yes"}))],
-                                           stop_on_failure=False)
+                                            for n, extra in ((1, {"backlog": True}), (2, {}), (3, {"backlog": "yes"}))])
         self.assertEqual((marked["backlog"], plain["backlog"], odd["backlog"]), (True, False, False))
         self.assertTrue(self.m.retry(marked["id"])["backlog"])
 
@@ -3840,7 +4344,7 @@ class BacklogTest(unittest.TestCase):
         # Two backlog jobs are queued ahead of a job that is not backlog work.
         first, second, plain = self.m.submit(
             [{"kind": "check-takes", "params": {"slug": "demo", "chapter": n, **extra}}
-             for n, extra in ((1, {"backlog": True}), (2, {"backlog": True}), (3, {}))], stop_on_failure=False)
+             for n, extra in ((1, {"backlog": True}), (2, {"backlog": True}), (3, {}))])
         self.m.last_busy = -1000.0
 
         # The other job starts first, and both backlog jobs wait for it.
@@ -3866,9 +4370,9 @@ class BacklogTest(unittest.TestCase):
     def test_a_backlog_render_is_not_queued_while_the_same_render_waits(self):
         # Chapters 1 and 2 wait as backlog work. A request for 2 and 3 queues 3 only, and names the job that
         # stands in for 2.
-        one, two = self.m.submit([self.render(1), self.render(2)], stop_on_failure=False)
+        one, two = self.m.submit([self.render(1), self.render(2)])
         covered: list[dict] = []
-        [three] = self.m.submit([self.render(2), self.render(3)], stop_on_failure=False, covered=covered)
+        [three] = self.m.submit([self.render(2), self.render(3)], covered=covered)
         self.assertEqual((three["title"], covered), ("Render · ch 3", [two]))
         self.assertEqual(self.m.submit([self.render(1), self.render(2), self.render(3)]), [])
 
@@ -3895,9 +4399,31 @@ class BacklogTest(unittest.TestCase):
         one["status"] = "failed"
         self.assertIs(self.m.retry(one["id"]), again)
 
-        # A render in a batch doesn't stand in, because a failure ahead of it in the batch would skip it.
+        # Two renders that come in one request are no more to each other than two that come apart, so each stands
+        # in for the next request for its chapter.
         self.m.submit([self.render(8), self.render(9)])
-        self.assertEqual(len(self.m.submit([self.render(9)])), 1)
+        self.assertEqual(self.m.submit([self.render(9)]), [])
+        # A render that stands in counts as queued at the new request, so it gets the needs a render queued then
+        # would have: here the screenplay of its chapter that was queued after it.
+        from serial_audio import library as lib
+        for n in (11, 12):
+            lib.chapter_dir("demo", n).mkdir(parents=True)
+
+        def script(n):
+            return self.m.submit([{"kind": "screenplay", "params": {"slug": "demo", "chapters": str(n)}}])[0]
+
+        [twelve] = self.m.submit([self.render(12)])
+        later = script(12)
+        covered = []
+        self.assertEqual((self.m.submit([self.render(12)], covered=covered), covered, twelve["needs"]),
+                         ([], [twelve], [later["id"]]))
+        # A render that needs a job which the new one would not need doesn't stand in. Here it needs the first of
+        # two screenplays, and a render queued now needs the second, which writes the script again.
+        first = script(11)
+        [eleven] = self.m.submit([self.render(11)])
+        second = script(11)
+        [again11] = self.m.submit([self.render(11)])
+        self.assertEqual((eleven["needs"], again11["needs"]), ([first["id"]], [second["id"]]))
 
     def test_a_render_that_stands_in_for_a_later_request_counts_as_queued_then(self):
         import datetime

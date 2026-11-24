@@ -294,6 +294,25 @@ def inside(slug: str) -> int:
     check(job["status"] == "failed" and job.get("exit_code") not in (0, None),
           f"failing step failed (status {job['status']}, exit {job.get('exit_code')}, note {job.get('note')})")
 
+    # A job that needs a failed job is skipped, and queueing the failed job again brings it back behind it
+    script, render = m.submit([{"kind": "screenplay", "params": {"slug": slug, "chapters": "1"}},
+                               {"kind": "render", "params": {"slug": slug, "chapter": 1}}])
+    script["args"], render["args"] = ["no-such-command"], ["chapters", slug]
+    check(render["needs"] == [script["id"]], f"a render needs its chapter's screenplay ({render['needs']})")
+    check(run_until(lambda: finished(script)() and finished(render)()), "the failing screenplay and its render ended")
+    check((script["status"], render["status"], render.get("lacks"), render.get("started")) ==
+          ("failed", "skipped", script["id"], None),
+          f"the render was skipped for the failed screenplay ({script['status']}, {render['status']}, {render.get('note')})")
+    back: list = []
+    again = m.retry(script["id"], back)
+    again["args"] = ["chapters", slug]
+    check(back == [render] and render["status"] == "queued" and render["needs"] == [again["id"]],
+          f"the render is queued again behind the new screenplay ({render['status']}, {render['needs']})")
+    check(run_until(lambda: finished(again)() and finished(render)()), "the new screenplay and the render finished")
+    check(again["status"] == "done" and render["status"] == "done"
+          and again["finished"] <= (render["nomad"].get("dispatched_at") or ""),
+          f"the render ran after the screenplay had ended ({again['status']}, {render['status']})")
+
     # Two stages run one after the other in one job
     job = submit("screenplay", {"slug": slug, "chapters": "1"}, stages=[
         {"class": "llm", "args": ["chapters", slug], "label": "first"},
@@ -306,7 +325,7 @@ def inside(slug: str) -> int:
     # Backlog work queued ahead of another job runs after it, one job at a time
     trio = m.submit([{"kind": "render", "params": {"slug": slug, "chapter": 2, "backlog": True}},
                      {"kind": "render", "params": {"slug": slug, "chapter": 3, "backlog": True}},
-                     {"kind": "render", "params": {"slug": slug, "chapter": 4}}], stop_on_failure=False)
+                     {"kind": "render", "params": {"slug": slug, "chapter": 4}}])
     for job in trio:
         job["args"] = ["chapters", slug]
     check(run_until(lambda: all(finished(j)() for j in trio)), "the backlog jobs and the other job finished")
@@ -473,7 +492,7 @@ def inside(slug: str) -> int:
     # Two breeze jobs queued together run in one task: the worker of the first is handed the second with its result
     dispatched = len(fake.children)
     pair = m.submit([{"kind": "render", "params": {"slug": slug, "chapter": 5}},
-                     {"kind": "render", "params": {"slug": slug, "chapter": 6}}], stop_on_failure=False)
+                     {"kind": "render", "params": {"slug": slug, "chapter": 6}}])
     for job in pair:
         job["args"] = ["chapters", slug]
     check(run_until(lambda: all(finished(j)() for j in pair)), "the two renders finished")
@@ -584,8 +603,7 @@ def inside(slug: str) -> int:
                                   "dummy", "1"])
         try:
             pair = m.submit([{"kind": "render", "params": {"slug": slug, "chapter": 2, "backlog": True}},
-                             {"kind": "render", "params": {"slug": slug, "chapter": 3, "backlog": True}}],
-                            stop_on_failure=False)
+                             {"kind": "render", "params": {"slug": slug, "chapter": 3, "backlog": True}}])
             for job in pair:
                 job["args"] = ["chapters", slug]
             check(run_until(lambda: all((j.get("nomad") or {}).get("contact") for j in pair), 90),

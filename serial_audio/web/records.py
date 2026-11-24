@@ -62,7 +62,9 @@ class Job(TypedDict, total=False):
     title: str
     slug: str | None        # the serial, or None for a job on no serial
     meta: dict              # what the rules read of the request: chapters, lines, engine, characters and the like
-    batch: str | None       # the batch whose queued jobs are skipped when this one fails
+    needs: list             # the ids of the jobs that have to end well before this one starts. One that did is taken off
+    lacks: str              # the needed job that did not end well, on a job that was skipped for it
+    again: str              # the job that this one was queued again as
     seq: int                # the job's place in the queue
     backlog: bool           # backlog work, which starts on an empty queue
     status: str             # queued, running, or one of jobs.FINISHED

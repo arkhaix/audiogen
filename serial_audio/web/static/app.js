@@ -161,8 +161,8 @@ async function upload(slug, file) {
   return data;
 }
 
-async function queue(jobs, stopOnFailure = true) {
-  const res = await post("/api/jobs", { jobs, stop_on_failure: stopOnFailure });
+async function queue(jobs) {
+  const res = await post("/api/jobs", { jobs });
   const made = res.jobs.length === 1 ? `Queued: ${res.jobs[0].title}` : `Queued ${res.jobs.length} jobs`;
   const had = res.already ? `${res.already === 1 ? "1 render was" : `${res.already} renders were`} in the queue already` : "";
   toast(!had ? made : res.jobs.length ? `${made}. ${had}` : `Nothing new to queue: ${had}`);
@@ -525,6 +525,24 @@ function externalFor(slug, n) {
 function chapterBusy(slug, n, kind) {
   const ext = externalFor(slug, n);
   return activeJobs(slug, n, kind).length > 0 || (!!ext && (!kind || ext.kind === kind));
+}
+
+// The queued jobs that need the job with this id, directly or through other queued jobs. They are skipped when it
+// doesn't end well.
+function needing(id) {
+  const queued = (S.state?.jobs || []).filter((j) => j.status === "queued");
+  const out = new Set([id]);
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const j of queued) {
+      if (!out.has(j.id) && (j.needs || []).some((n) => out.has(n))) {
+        out.add(j.id);
+        grew = true;
+      }
+    }
+  }
+  out.delete(id);
+  return queued.filter((j) => out.has(j.id));
 }
 
 function progressBits(p) {
@@ -1116,8 +1134,8 @@ async function openProcess(slug) {
       <div class="why">${why}</div>${opts ? `<div class="opts">${opts}</div>` : ""}</div>`;
   const body = `
     <p class="small muted">Chapters ${esc(rangeText(sel))}. ${S.state?.executor === "nomad"
-      ? "Each chapter's jobs run in this order. A job waits only for the jobs it needs, so a chapter renders once its voices are cast and its screenplay is written. If a job fails, only the jobs that need it are skipped."
-      : "The jobs run one at a time, in this order. If one fails, the rest of the batch is skipped."}</p>
+      ? "Each chapter's jobs run in this order. A job waits only for the jobs it needs, so a chapter renders once its voices are cast and its screenplay is written. If a job fails, only the jobs that need it are skipped, and Run again on it brings them back."
+      : "The jobs run one at a time, in this order. If one fails, the jobs that need it are skipped, and Run again on it brings them back."}</p>
     ${stage("characters", "Character pass", needChars.length, `${plural(needChars.length, "chapter")} still need it. It updates the bible with who appears.`,
       `<label class="inline"><input type="checkbox" name="redo_characters"> redo chapters that have one</label>`)}
     ${stage("cast", "Cast new voices", castLikely, "Designs a voice for each major or recurring character who has spoken and has none, after each chapter's character pass. Runs on a GPU node.",
@@ -2171,7 +2189,7 @@ function jobRow(j) {
   let btns = "";
   if (j.status === "running") {
     const pause = j.pausable && !j.stopping ? `<button class="sm" data-act="job-pause" data-id="${id}" title="Stop this job where it is and keep it in the queue until you resume it. It keeps what it has made.">Pause</button>` : "";
-    btns = log + pause + `<button class="sm danger" data-act="job-stop" data-id="${id}" data-title="${esc(j.title)}" data-kind="${esc(j.kind)}" data-comfy="${j.comfy ? 1 : 0}" data-engine="${esc(j.meta?.engine || "")}" data-nomad="${j.nomad ? 1 : 0}" data-batch="${j.batch ? 1 : 0}" data-stopping="${j.stopping ? 1 : 0}">Stop</button>`;
+    btns = log + pause + `<button class="sm danger" data-act="job-stop" data-id="${id}" data-title="${esc(j.title)}" data-kind="${esc(j.kind)}" data-comfy="${j.comfy ? 1 : 0}" data-engine="${esc(j.meta?.engine || "")}" data-nomad="${j.nomad ? 1 : 0}" data-stopping="${j.stopping ? 1 : 0}">Stop</button>`;
   } else if (j.status === "queued") {
     const move = (to, label, icon) => `<button class="icon" data-act="queue-move" data-to="${to}" data-id="${id}" title="${label}" aria-label="${label}">${icon}</button>`;
     btns = (paused ? `<button class="sm primary" data-act="job-resume" data-id="${id}">Resume</button>` : "")
@@ -2341,7 +2359,7 @@ const ACT = {
     const all = JSON.parse(el.dataset.chapters);
     const order = [...all.filter((n) => n >= at), ...all.filter((n) => n < at)];
     const jobs = order.map((n) => ({ kind: "render", params: { slug: S.route.slug, chapter: n, backlog: true } }));
-    await queue(jobs, false);
+    await queue(jobs);
     delete S.namePicks[S.route.slug];
     paint();
   },
@@ -2414,14 +2432,8 @@ const ACT = {
     } finally {
       el.disabled = false;
     }
-    if (!processing.length) {
-      await queue(jobs, false);
-    } else {
-      // An import of a chapter on disk fails without the replace box, so it stays out of the batch it would stop.
-      const fails = (j) => !force && sd.chapters.some((c) => c.number === j.params.chapter);
-      if (jobs.some(fails)) await queue(jobs.filter(fails), false);
-      await queue([...jobs.filter((j) => !fails(j)), ...processing], true);
-    }
+    // An import that fails skips only the jobs that need it, so the imports and the processing go in one request.
+    await queue([...jobs, ...processing]);
     S.imports[slug] = [];
     paint();
   },
@@ -2434,8 +2446,9 @@ const ACT = {
     // An app without the flag would take the request for a plain stop, and a job that is stopping can't be asked
     // back a second time.
     const again = d.nomad === "1" && d.stopping !== "1" && !!S.state?.requeue;
-    if (d.batch === "1") extra.push("Stop also skips the queued jobs of its batch.");
-    if (again) extra.push("Stop and queue again keeps the job's place in the queue.");
+    const held = needing(d.id).length;
+    if (held) extra.push(`Stop also skips the ${plural(held, "queued job")} that ${held === 1 ? "needs" : "need"} it. Run again on it brings ${held === 1 ? "it" : "them"} back.`);
+    if (again) extra.push(`Stop and queue again keeps the job's place in the queue${held ? ", and nothing is skipped" : ""}.`);
     openDialog({
       title: "Stop this job?",
       body: `<p><b>${esc(d.title)}</b></p>${extra.length ? `<p class="small muted">${esc(extra.join(" "))}</p>` : ""}`,
@@ -2449,7 +2462,12 @@ const ACT = {
   },
   "job-pause": async (el) => { await post(`/api/jobs/${el.dataset.id}/pause`); await poll(); },
   "job-resume": async (el) => { await post(`/api/jobs/${el.dataset.id}/resume`); await poll(); },
-  "job-cancel": async (el) => { await post(`/api/jobs/${el.dataset.id}/cancel`); await poll(); },
+  "job-cancel": async (el) => {
+    const held = needing(el.dataset.id);
+    if (held.length && !confirm(`${plural(held.length, "queued job")} ${held.length === 1 ? "needs" : "need"} this one and ${held.length === 1 ? "is" : "are"} skipped with it:\n${held.slice(0, 8).map((j) => j.title).join("\n")}${held.length > 8 ? "\n..." : ""}\n\nCancel it anyway?`)) return;
+    await post(`/api/jobs/${el.dataset.id}/cancel`);
+    await poll();
+  },
   // A row's button moves that job, and a button of the selection bar moves every selected job.
   "queue-move": async (el) => {
     const ids = el.dataset.id ? [el.dataset.id] : [...S.qsel];
@@ -2459,7 +2477,9 @@ const ACT = {
   },
   "queue-cancel": async () => {
     const ids = [...S.qsel];
-    if (!ids.length || !confirm(`Cancel the ${plural(ids.length, "selected job")}?`)) return;
+    const held = new Set(ids.flatMap((id) => needing(id).map((j) => j.id)).filter((id) => !S.qsel.has(id))).size;
+    const more = held ? `\n\n${plural(held, "other queued job")} ${held === 1 ? "needs" : "need"} them and ${held === 1 ? "is" : "are"} skipped with them.` : "";
+    if (!ids.length || !confirm(`Cancel the ${plural(ids.length, "selected job")}?${more}`)) return;
     const res = await post("/api/queue/cancel", { ids });
     S.qsel.clear();
     toast(`Cancelled ${plural(res.cancelled, "job")}`);
@@ -2468,7 +2488,8 @@ const ACT = {
   "job-retry": async (el) => {
     const res = await post(`/api/jobs/${el.dataset.id}/retry`);
     const had = (S.state?.jobs || []).some((j) => j.id === res.job.id);
-    toast(`${had ? "In the queue already" : "Queued"}: ${res.job.title}`);
+    const back = res.revived ? `, with the ${plural(res.revived, "job")} that ${res.revived === 1 ? "was" : "were"} skipped for it` : "";
+    toast(`${had ? "In the queue already" : "Queued"}: ${res.job.title}${back}`);
     await poll();
   },
   "jobs-clear": async () => { await post("/api/jobs/clear"); await poll(); },

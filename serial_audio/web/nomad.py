@@ -1,14 +1,15 @@
 """Runs the web app's jobs on the Nomad cluster.
 
-NomadJobManager keeps JobManager's queue, batches, records and progress parsing, and changes where a job runs. Jobs
+NomadJobManager keeps JobManager's queue, records, needs and progress parsing, and changes where a job runs. Jobs
 that need a GPU, ComfyUI or Claude are dispatched as Nomad jobs (deploy/nomad/serial-audio.nomad.hcl) to a node
 whose client meta offers their class. Quick library jobs (fetch, add a serial, reset the bible) run on the app's
 own machine. A worker fetches its job's bundle from the app, streams its log back and returns the files it changed,
 which the app writes into the library unless they changed there meanwhile.
 
-Jobs on different chapters, serials or nodes run at the same time. Jobs on the same chapter wait for each other,
-and conflicts() says which job waits for a job that rewrites a serial's bible or voices. A node runs one GPU job at
-a time, and LLM_SLOTS Claude jobs run at once.
+Jobs on different chapters, serials or nodes run at the same time. A job waits for the jobs it needs, which
+deps.needs() names. Jobs on the same chapter also wait for each other, and conflicts() says which job waits for a
+job that rewrites a serial's bible or voices. A node runs one GPU job at a time, and LLM_SLOTS Claude jobs run at
+once.
 
 The app's media mirror holds a copy of every take and cast candidate a worker sent it, so a join, a take check and
 a render that reuses takes run on any breeze node, and picking a voice runs on the app's machine. A chapter whose
@@ -38,7 +39,7 @@ from pathlib import Path
 from .. import library as lib
 from .. import machine
 from ..breeze import render_changes, reusable_takes
-from . import exchange, kinds
+from . import deps, exchange, kinds
 from .jobs import (BACKLOG_BESIDE, CHECK_HEAD_RE, LOG_MARKS, OVERRUN_SHARE, PAUSED_WAIT, PRECHECK_RE,
                    QUICK_SETUP_SECONDS, RENDER_COST, RENDER_HEAD_RE, ROOT, TAKES_HEAD_RE, WORDS_PER_LINE,
                    JobManager, _slug, _ts, backlog_wait, between_stages, now_iso, read_state, read_tail, said,
@@ -271,7 +272,7 @@ def expected(samples, units: float, fixed: float, per: float) -> float:
 
 def _is_import(job: dict) -> bool:
     """Whether a job imports one saved chapter page. It writes only that chapter's files, on the app's machine."""
-    return job["kind"] == "fetch" and "--html" in (job.get("args") or [])
+    return deps.is_import(job)
 
 
 def _chapters(job: dict) -> set[int]:
@@ -499,9 +500,6 @@ class NomadJobManager(JobManager):
             return st["class"]
         return "local-heavy" if job["heavy"] else "local"
 
-    def _keeps_ahead(self, first: dict, job: dict) -> bool:
-        return conflicts(job, first)
-
     def _build(self, kind, params, coming) -> dict:
         if kind != SYNC_KIND:
             return super()._build(kind, params, coming)
@@ -689,9 +687,10 @@ class NomadJobManager(JobManager):
 
         jid: the job.
         requeue: True asks a job that runs on the cluster to stop and to go back into the queue at once, in its
-            place. The queued jobs of its batch then stay queued.
-        Returns the job. Raises KeyError for an unknown job, and ValueError when requeue is asked for a job that
-        doesn't run on the cluster or that is stopping already.
+            place. The queued jobs that need it then stay queued.
+        Returns the job. A job that is cancelled or stopped skips the queued jobs that need it, once it has
+        ended. Until then they wait for it. Raises KeyError for an unknown job, and ValueError when requeue is
+        asked for a job that doesn't run on the cluster or that is stopping already.
         """
         with self.lock:
             job = self.jobs.get(jid)
@@ -711,19 +710,17 @@ class NomadJobManager(JobManager):
                                     else f"; Nomad job {n['dispatched']} exits as soon as a node starts it"
                                     if n.get("dispatched") else "")})
                     self._append_log(job, f"\n[web] {job['note']}\n")
-                    self._skip_batch(job, "an earlier job in the batch was stopped")
+                    self._settle_needs()
                 elif not n.get("cancel"):
                     n["cancel"] = True
                     n["stop_at"] = time.time()
                     job["stopping"] = True
                     self._append_log(job, "\n[web] stop requested; the worker stops within a few seconds\n")
-                    self._skip_batch(job, "an earlier job in the batch was stopped")
                 elif n.get("requeue") or (n.get("evict") and not n.get("by_user")):
                     how = "on its way back into the queue" if n.pop("requeue", None) else "pausing for another"
                     n["by_user"] = bool(n.get("evict"))
                     self._append_log(job, f"\n[web] stop requested while the job was {how}, so it is not queued "
                                           f"again\n")
-                    self._skip_batch(job, "an earlier job in the batch was stopped")
                 self._save()
                 return job
         if not local:
@@ -742,7 +739,7 @@ class NomadJobManager(JobManager):
                 threading.Thread(target=proc.wait, name="reap", daemon=True).start()
             job.update({"status": "stopped", "finished": now_iso(), "note": "stopped from the web app"})
             self._append_log(job, f"\n[web] {job['note']}\n")
-            self._skip_batch(job, "an earlier job in the batch was stopped")
+            self._settle_needs()
             self._save()
         return job
 
@@ -1054,41 +1051,18 @@ class NomadJobManager(JobManager):
         self._mirror_cache.clear()
         self._append_log(job, f"\n[web] {note}\n")
         if status != "done":
-            self._skip_batch(job, f"an earlier job in the batch {status}")
+            self._settle_needs()
         self._save()
-
-    def _skip_batch(self, job: dict, why: str) -> None:
-        """Skips the queued jobs of a batch that can't go on after job ended early.
-
-        job: the batch job that failed, was lost, was cancelled, or was stopped or asked to stop.
-        why: the note each skipped job gets.
-        Returns nothing. A stop, a stop request or a cancel skips every queued job of the batch. A failure or a
-        loss skips only the queued jobs that wait for the job, or for a job skipped with it, so the batch's
-        other chapters still run. A character pass is not skipped for a cast.
-        """
-        if not job.get("batch") or job["status"] not in ("failed", "lost"):
-            super()._skip_batch(job, why)
-            return
-        gone = [job]
-        queued = sorted((j for j in self.jobs.values() if j.get("batch") == job["batch"] and j["status"] == "queued"),
-                        key=lambda j: j["seq"])
-        for other in queued:
-            # the job ran, so every queued job that conflicts with it waited for it, whatever their order.
-            # A character pass waits for a cast only to write the bible after it, and reads nothing the cast files
-            if any(conflicts(other, g) and (g is job or g["seq"] < other["seq"])
-                   and not (other["kind"] == "character-pass" and g["kind"] == "cast") for g in gone):
-                other.update({"status": "skipped", "finished": now_iso(), "note": why})
-                gone.append(other)
 
     # Scheduling
 
     def _schedule(self, now: float, dispatch: list[str]) -> bool:
+        changed = bool(self._settle_needs())
         running = [j for j in self.jobs.values() if j["status"] == "running"]
         queued = sorted((j for j in self.jobs.values() if j["status"] == "queued"), key=start_order)
         self.wait_reasons = {}
         self._plan = {}
         blocked: dict[str, dict] = {}
-        changed = False
         trouble = None
         for job in queued:
             try:
@@ -1131,6 +1105,7 @@ class NomadJobManager(JobManager):
             self.wait_reasons[job["id"]] = reason
             blocked.setdefault(lane, job)
             return False
+        job["needs"] = []
         if not job.get("nomad"):
             stale = self._already_done(job)
             if stale:
@@ -1245,10 +1220,15 @@ class NomadJobManager(JobManager):
             return PAUSED_WAIT
         if self.paused and (lane in CLASSES or job["heavy"]):
             return "the queue is on hold"
-        # a job that is not backlog work never waits for backlog work that has not started, which waits for it
+        needed = deps.waits_for(job, self.jobs)
+        if needed:
+            return needed
+        # a job that is not backlog work never waits for backlog work that has not started, which waits for it.
+        # Nor does a job wait for one that needs it, wherever the two are in the queue
         earlier = next((j for j in self.jobs.values() if j["status"] == "queued" and j["seq"] < job["seq"]
                         and conflicts(job, j)
-                        and (job.get("backlog") or not j.get("backlog") or between_stages(j))), None)
+                        and (job.get("backlog") or not j.get("backlog") or between_stages(j))
+                        and not deps.leans_on(j, job, self.jobs)), None)
         if earlier:
             return f"waiting for {earlier['title']}, queued ahead of it on the same serial"
         for other in running:
@@ -1449,7 +1429,7 @@ class NomadJobManager(JobManager):
         how: "hold" when the job then waits for resume(), "now" when it starts again by the scheduler's rules.
         Returns nothing. A job whose worker has its bundle is queued again when the worker confirms the stop, or
         when its task ends without a result. When the worker does not confirm within STOP_GRACE, the job ends as
-        stopped and its batch is skipped, as for a stop. A job that no worker has started, or whose node is
+        stopped and the jobs that need it are skipped, as for a stop. A job that no worker has started, or whose node is
         disconnected, is queued again at once. Raises ValueError for a job that doesn't run on the cluster or
         that was asked to stop already.
         """
@@ -1505,7 +1485,7 @@ class NomadJobManager(JobManager):
 
         jid: the job.
         Returns the job. When its worker has stopped, the job is queued again in its place and marked as paused,
-        and the queued jobs of its batch stay queued. Raises KeyError for an unknown job, and ValueError for a
+        and the queued jobs that need it stay queued. Raises KeyError for an unknown job, and ValueError for a
         job that is not running, that is stopping already, or that _pausable refuses.
         """
         with self.lock:
@@ -1792,7 +1772,8 @@ class NomadJobManager(JobManager):
         missing for a job that can't be placed: the queue is on hold, no ready node offers its class, its takes
         are not counted yet, or it waits for such a job. A node whose running job has no end in sight takes no
         queued job. Follows the scheduler's rules in outline: one GPU job a node, LLM_SLOTS Claude jobs, a job
-        after the running and the earlier queued jobs it conflicts with, backlog work as backlog_wait holds it,
+        after the jobs it needs and after the running and the earlier queued jobs it conflicts with, backlog work
+        as backlog_wait holds it,
         a GPU job on the node where it ends first, and a backlog render that gives its node to a job that is not
         backlog work and goes on when every such job has ended. It does not start or stop a job, and it does not
         count a take.
@@ -1883,8 +1864,10 @@ class NomadJobManager(JobManager):
             n = job.get("nomad")
             stages = (n["stages"][n["stage"]:] if n else job_stages(job)) or []
             staged = between_stages(job)
-            waits = [o for o in done if conflicts(job, o) and (o["status"] == "running" or job.get("backlog")
-                                                                or not o.get("backlog") or between_stages(o))]
+            needed = set(job.get("needs") or ())
+            waits = [o for o in done if o["id"] in needed
+                     or (conflicts(job, o) and (o["status"] == "running" or job.get("backlog")
+                                                or not o.get("backlog") or between_stages(o)))]
             if job.get("backlog") and not staged:
                 beside = job["kind"] in BACKLOG_BESIDE
                 waits += [o for o in done if not o.get("paused")
@@ -2065,7 +2048,7 @@ class NomadJobManager(JobManager):
                                     stderr=subprocess.DEVNULL, close_fds=True, start_new_session=True)
         except OSError as e:
             job.update({"status": "failed", "finished": now_iso(), "note": f"could not start: {e}"})
-            self._skip_batch(job, "an earlier job in the batch failed")
+            self._settle_needs()
             return
         self._local[job["id"]] = proc
         job.update({"status": "running", "pid": proc.pid, "started": now_iso(), "note": None})
@@ -2094,7 +2077,7 @@ class NomadJobManager(JobManager):
             job.update({"status": "lost", "finished": now_iso(),
                         "note": "the job's process ended without recording an exit code"})
         if job["status"] != "done":
-            self._skip_batch(job, f"an earlier job in the batch {job['status']}")
+            self._settle_needs()
         self._save()
 
     # The worker API

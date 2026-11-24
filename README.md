@@ -111,8 +111,10 @@ while ComfyUI is busy with a prompt the app did not queue. A render or cast that
 for ComfyUI to answer. A Breeze render under `breeze-server` does not, so it runs with ComfyUI down. A render job is
 queued with the engine and runner `serial.yaml` names at that moment, as explicit `--engine` and `--runner` flags.
 Quick jobs (pick a voice, import a saved page, add a serial) run straight away, except beside a job that rewrites
-the bible. A batch from the Process dialog skips its
-remaining jobs when one fails. A queued render is skipped when the chapter was rendered after it was queued.
+the bible. A job waits for the jobs it needs, such as a render for its chapter's screenplay and its voices, and it is
+skipped when one of them fails, is stopped or is cancelled. Which job needs which follows from what each kind reads
+and writes (`serial_audio/web/deps.py`), not from which jobs were queued together. Run again on the job that failed
+queues it again and brings back the jobs that were skipped for it. A queued render is skipped when the chapter was rendered after it was queued.
 A job whose request has `"backlog": true` in its params is backlog work, and the job list marks it. It starts only
 when no job that is not backlog work is running or queued, on either executor. Backlog renders and take checks run
 beside each other, one on each `breeze` node, each on the node where it ends soonest, and a backlog job of any other kind runs alone. A job that is not backlog work never waits for queued backlog work, and a backlog job that is already
@@ -141,14 +143,15 @@ has been away and is back, for a machine that is about to be turned off. The nod
 A job whose node goes away before it ends is queued again (`deploy/README.md`, How a job runs, point 7).
 
 A running job that loses no work by it has a Pause button: a Breeze render before its join, and a draw that is not a
-redraw. Pause stops the job where it is and keeps it in the queue, in its place, until Resume, and the queued jobs of
-its batch stay queued. Stop asks first. For a job on the cluster its dialog offers Stop and queue again, which stops
-the job and puts it back in its place at once. A plain Stop ends the job and skips the queued jobs of its batch.
+redraw. Pause stops the job where it is and keeps it in the queue, in its place, until Resume, and the queued jobs
+that need it stay queued. Stop asks first. For a job on the cluster its dialog offers Stop and queue again, which stops
+the job and puts it back in its place at once. A plain Stop ends the job and skips the queued jobs that need it, and
+the dialog says how many. Cancel on a queued job does the same, and asks first when another job needs it.
 
 A queued job has buttons that move it to the top, up, down and to the bottom, and a handle to drag it. Select several
 jobs to move or cancel them together, and drag one of them to move them all. Backlog work stays behind every other
-job, so a job moves among its own kind of work. A job stays behind the jobs of its batch that it waits for, so a
-render moved to the top stops behind its screenplay.
+job, so a job moves among its own kind of work. A job stays behind the jobs it needs, so a render moved to the top
+stops behind its screenplay.
 
 The chapter page shows the take check, with each flagged or out-of-range take's script line, transcript and a
 play button, and a Check takes button that runs it as a job.
@@ -156,7 +159,7 @@ Every chapter with audio has a download button on the serial page and the chapte
 sends the file as an attachment named `<serial> - <NNN> - <chapter title>.opus`, so an audiobook reader on a phone
 sorts the chapters in order.
 On a Royal Road serial, Import saved pages has a box named process the chapters after import. With it ticked, the
-import queues one batch: the imports, then each imported chapter's character pass with a cast of new voices and a
+import queues the imports, then each imported chapter's character pass with a cast of new voices and a
 look pass after it, then the screenplays and the renders, with the Process dialog's defaults and the LLM settings last chosen in a dialog. Only a
 chapter that nothing has been made from yet is processed: a new chapter, or one on disk at status `fetched` whose text
 is replaced. A replaced chapter that has a character pass, a script or audio from its old text is left for the Process
@@ -176,7 +179,7 @@ same way, the ones with the most chapters first. An image opens large on the pag
 candidates a step away. The Image filter keeps the rows without an image, with an image that is not approved, or
 with details newer than the image. The search reads names, aliases, roles and places, and with its box ticked the
 facts, looks and descriptions too, which the browser's own search doesn't find in a row that has not been opened. The Process dialog has a Look pass stage. It is ticked when the
-batch has a character pass to run, and it reads the chapters that get one, with Sonnet unless the stage names
+selection has a character pass to run, and it reads the chapters that get one, with Sonnet unless the stage names
 another model. Two boxes add the selected chapters that have a character pass already: the ones without a look
 pass, and the ones to read again.
 The bible page lists the pronunciations with their say-as overrides first. Edit, Override and Add an override queue a
@@ -220,8 +223,8 @@ checks it again.
 
 ## Pipeline per chapter
 
-1. `add-epub` or `add-royalroad`/`fetch` writes `text.md`; status `fetched`. Royal Road pages are read
-   with a browser user agent, one request every two seconds; the per-page hidden decoy paragraph and
+1. `add-epub` or `add-royalroad`/`fetch` writes `text.md`; status `fetched`. Royal Road pages are fetched over
+   HTTP/2 with a Chrome TLS fingerprint (`curl_cffi`), one request every two seconds; the per-page hidden decoy paragraph and
    ads are dropped, blockquotes (LitRPG system text, letters) become `> ` blocks, and the author's
    notes go to `author_notes.md`. Both parsers keep italics inside a paragraph as `*...*`, and an EPUB chapter
    ingested before 2026-11-12 doesn't have them.
